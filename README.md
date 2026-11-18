@@ -97,6 +97,8 @@ bash scripts/publish-release.sh --assets-dir dist
 
 发布工具要求已有的 Git 标签与 Cargo 版本一致，并且 Windows ZIP 及其校验文件已生成；网络或权限错误会中止发布。上传失败会保留未完成的草稿；GitHub 构建完成邮件与附件发布是独立的状态。
 
+Windows 构建成功、仅 Release 发布失败时，可复用原构建重试：在 `.github/release-retry.json` 指定版本标签、原工作流运行 ID 和完整提交 SHA，推送到 `flashtool`，或手动运行 `Retry verified release`。流程会核对来源仓库、工作流、提交及 Windows 任务的成功状态，然后下载原产物、校验并续传草稿；不会移动标签或覆盖已发布附件。构建产物已过期时，使用原 Windows 工作流重新构建该标签。
+
 ### 只读命令行
 
 ```sh

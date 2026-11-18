@@ -29,7 +29,16 @@ if args[0] == 'api':
     if '/git/tags/' in endpoint:
         respond({'object': {'type':'commit','sha':state.get('remote_commit',state['commit'])}})
     if '/releases/tags/' in endpoint:
-        if state.get('deny_release_api'): fail('Forbidden',403)
+        if state.get('deny_release_api'): fail(state.get('denial_message','Forbidden'),403)
+        if state.get('release') is None or state['release']['draft']: fail('Not Found',404)
+        respond(state['release'])
+    if '/releases?per_page=100&page=' in endpoint:
+        page=int(endpoint.rsplit('=',1)[1])
+        target_page=state.get('draft_page',1)
+        if page<target_page:
+            respond([{'id':1000+i,'tag_name':'v9.0.'+str(i),'draft':False} for i in range(100)])
+        respond([state['release']] if state.get('release') is not None else [])
+    if endpoint.endswith('/releases/123'):
         if state.get('release') is None: fail('Not Found',404)
         respond(state['release'])
     if endpoint.endswith('/releases/latest'):
@@ -151,7 +160,7 @@ class PublishReleaseTests(unittest.TestCase):
         publish=next(i for i,c in enumerate(commands) if "--draft=false" in c)
         self.assertEqual(len(uploads),3)
         self.assertLess(max(uploads),publish)
-        self.assertTrue(any(c[0]=="api" and "/releases/tags/" in c[1] for c in commands[max(uploads)+1:publish]))
+        self.assertTrue(any(c[0]=="api" and c[1].endswith("/releases/123") for c in commands[max(uploads)+1:publish]))
         mutations=[c for c in commands if c[0]=="release"]
         result=self.invoke()
         self.assertEqual(result.returncode,0,result.stderr)
@@ -162,6 +171,24 @@ class PublishReleaseTests(unittest.TestCase):
         result=self.invoke()
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(sum(c[:2]==["release","download"] for c in self.load()["commands"]),3)
+
+    def test_resumes_an_existing_paginated_draft_without_duplicate_creation(self):
+        state=self.load();state["fail_upload"]="FlashTool-v0.3.0-source.zip";self.save(state)
+        result=self.invoke()
+        self.assertNotEqual(result.returncode,0)
+        state=self.load()
+        self.assertTrue(state["release"]["draft"])
+        self.assertEqual([a["name"] for a in state["release"]["assets"]],[self.windows_name])
+        del state["fail_upload"]
+        state["draft_page"]=2
+        self.save(state)
+        result=self.invoke()
+        self.assertEqual(result.returncode,0,result.stderr)
+        state=self.load()
+        self.assertFalse(state["release"]["draft"])
+        self.assertEqual(sum(c[:2]==["release","create"] for c in state["commands"]),1)
+        self.assertTrue(any(c[0]=="api" and c[1].endswith("page=2") for c in state["commands"]))
+        self.assertEqual(sum(c[:2]==["release","upload"] and Path(c[3]).name==self.windows_name for c in state["commands"]),1)
 
     def test_backfilling_an_older_release_does_not_downgrade_latest(self):
         state=self.load()
@@ -218,6 +245,25 @@ class PublishReleaseTests(unittest.TestCase):
         result=self.invoke()
         self.assertNotEqual(result.returncode,0)
         self.assertIn("HTTP 403",result.stderr)
+        self.assertFalse(any(c[0]=="release" for c in self.load()["commands"]))
+
+    def test_github_actions_failure_annotation_is_escaped_and_sanitized(self):
+        self.environment["GITHUB_ACTIONS"]="true"
+        state=self.load()
+        state["deny_release_api"]=True
+        state["denial_message"]="\x1b[31mForbidden 100% token=ghp_FAKE_TEST_ONLY\npermission denied"
+        self.save(state)
+        result=self.invoke()
+        self.assertEqual(result.returncode,1)
+        annotation=next(line for line in result.stdout.splitlines() if line.startswith("::error"))
+        self.assertIn("api repos/acme/flashtool/releases/tags/v0.3.0",annotation)
+        self.assertIn("HTTP 403",annotation)
+        self.assertIn("100%25",annotation)
+        self.assertIn("%0A",annotation)
+        self.assertNotIn("ghp_FAKE_TEST_ONLY",annotation)
+        self.assertNotIn("\x1b",annotation)
+        self.assertIn("Release failed:",result.stderr)
+        self.assertNotIn("ghp_FAKE_TEST_ONLY",result.stderr)
         self.assertFalse(any(c[0]=="release" for c in self.load()["commands"]))
 
     def test_upload_failure_or_checksum_failure_never_publishes(self):

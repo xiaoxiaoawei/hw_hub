@@ -1,0 +1,164 @@
+name: Retry verified release
+
+on:
+  push:
+    branches: [flashtool]
+    paths: [.github/release-retry.json]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Publish existing verified Windows artifact
+    runs-on: ubuntu-latest
+    concurrency:
+      group: publish-flashtool
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Check out trusted publisher and explicit retry request
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          lfs: false
+          path: release-tools
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate exact source run, successful Windows job and artifact
+        id: request
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+          def unique_object(pairs):
+              value = {}
+              for key, item in pairs:
+                  require(key not in value, f"Duplicate retry request key: {key}")
+                  value[key] = item
+              return value
+
+          def api(endpoint, *, pages=False):
+              command = ["gh", "api"]
+              if pages:
+                  command += ["--paginate", "--slurp"]
+              result = subprocess.run(command + [endpoint], capture_output=True, text=True)
+              if result.returncode:
+                  raise RuntimeError(
+                      f"GitHub API {endpoint} failed ({result.returncode}): {result.stderr.strip()[:1200]}"
+                  )
+              return json.loads(result.stdout)
+
+          def diagnostic(error):
+              text = str(error)
+              text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+              text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+              text = re.sub(r"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+", "[redacted-token]", text)
+              text = re.sub(r"(https?://)[^/\s@]+@", r"\1[redacted]@", text)
+              text = re.sub(r"\b(authorization|password|secret|token|api[_-]?key)\s*[:=]\s*\S+", r"\1=[redacted]", text, flags=re.I)
+              return text[:2400].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+          try:
+              request_file = Path("release-tools/.github/release-retry.json")
+              require(request_file.stat().st_size <= 4096, "Retry request exceeds 4 KiB")
+              request = json.loads(request_file.read_text(), object_pairs_hook=unique_object)
+              require(isinstance(request, dict) and set(request) == {"tag", "run_id", "commit"}, "Retry request requires exactly tag, run_id and commit")
+              tag, run_id, commit = (request[key] for key in ("tag", "run_id", "commit"))
+              require(isinstance(tag, str) and re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag), "Tag must be stable vMAJOR.MINOR.PATCH")
+              require(type(run_id) is int and run_id > 0, "run_id must be a positive integer")
+              require(isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit), "commit must be a full lowercase SHA-1")
+              repository = os.environ["GH_REPO"]
+              repository_id = int(os.environ["EXPECTED_REPOSITORY_ID"])
+              prefix = f"repos/{repository}/actions"
+              source = api(f"{prefix}/runs/{run_id}")
+              require(source.get("id") == run_id, "Source run ID mismatch")
+              require(source.get("repository", {}).get("id") == repository_id, "Source run belongs to another repository")
+              require(source.get("head_repository", {}).get("id") == repository_id, "Source run head belongs to another repository")
+              require(source.get("head_sha") == commit, "Source run commit does not match retry request")
+              require(source.get("head_branch") == tag, "Source run was not built from the requested release tag")
+              require(source.get("status") == "completed", "Source run has not completed")
+              require(source.get("conclusion") in {"success", "failure"}, "Source run was cancelled or has no usable outcome")
+              workflow = api(f"{prefix}/workflows/{int(source['workflow_id'])}")
+              require(workflow.get("path") == ".github/workflows/windows.yml", "Source run is not the Windows build workflow")
+              require(source.get("path", "").split("@", 1)[0] == ".github/workflows/windows.yml", "Source run workflow path mismatch")
+              jobs = [job for page in api(f"{prefix}/runs/{run_id}/jobs?filter=latest&per_page=100", pages=True) for job in page["jobs"]]
+              windows_jobs = [job for job in jobs if job.get("name") == f"Windows x64 ({tag})"]
+              require(len(windows_jobs) == 1, "Expected exactly one Windows x64 job for this tag")
+              require(windows_jobs[0].get("status") == "completed" and windows_jobs[0].get("conclusion") == "success", "The Windows x64 build did not succeed")
+              unsuccessful = [job for job in jobs if job.get("status") != "completed" or job.get("conclusion") != "success"]
+              require(all(job.get("name") == "release" and job.get("status") == "completed" and job.get("conclusion") == "failure" for job in unsuccessful), "A source job other than release failed or did not complete successfully")
+              if source["conclusion"] == "failure":
+                  require(bool(unsuccessful), "Failed source run has no identifiable release-only failure")
+              artifact_name = f"FlashTool-{tag}-windows-x64"
+              artifacts = [artifact for page in api(f"{prefix}/runs/{run_id}/artifacts?per_page=100", pages=True) for artifact in page["artifacts"] if artifact.get("name") == artifact_name]
+              require(len(artifacts) == 1, "Expected exactly one matching Windows artifact in the source run")
+              artifact = artifacts[0]
+              require(artifact.get("expired") is False, "The Windows artifact has expired")
+              provenance = artifact.get("workflow_run", {})
+              require(provenance.get("id") == run_id and provenance.get("repository_id") == repository_id and provenance.get("head_repository_id") == repository_id and provenance.get("head_sha") == commit, "Artifact provenance does not match the source run and commit")
+              with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+                  for key, value in {"tag": tag, "run_id": run_id, "commit": commit, "artifact": artifact_name}.items():
+                      output.write(f"{key}={value}\n")
+              print(f"Verified {tag}: source run {run_id}, commit {commit}, artifact {artifact_name}; no rebuild requested.")
+          except Exception as error:
+              print(f"::error title=Release retry validation failed::{diagnostic(error)}", flush=True)
+              sys.exit(1)
+          PY
+      - name: Check out the existing release tag
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ steps.request.outputs.tag }}
+          fetch-depth: 0
+          lfs: false
+          path: project
+      - name: Confirm checkout still resolves to the exact built commit
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ steps.request.outputs.commit }}
+        run: |
+          set -euo pipefail
+          actual_commit="$(git -C project rev-parse --verify HEAD^{commit})"
+          if [[ "$actual_commit" != "$EXPECTED_COMMIT" ]]; then
+            echo '::error::The existing release tag no longer matches the verified build commit; refusing publication.'
+            exit 1
+          fi
+      - name: Download the exact successful Windows artifact without rebuilding
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.request.outputs.run_id }}
+          name: ${{ steps.request.outputs.artifact }}
+          path: project/dist
+      - name: Test the trusted publisher's ordering and failure behavior
+        run: python -m unittest discover -s release-tools/tests -p test_publish_release.py -v
+      - name: Verify tagged assets, resume the draft and publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.request.outputs.tag }}
+        run: |
+          set -euo pipefail
+          bash release-tools/scripts/publish-release.sh --root project --assets-dir project/dist --tag "$RELEASE_TAG" --check
+          bash release-tools/scripts/publish-release.sh --root project --assets-dir project/dist --tag "$RELEASE_TAG"

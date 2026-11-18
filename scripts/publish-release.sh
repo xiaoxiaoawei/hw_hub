@@ -29,7 +29,7 @@ assets_dir = args.assets_dir.resolve() if args.assets_dir else root / "dist"
 def run(command, *, ok=False):
     result = subprocess.run(command, cwd=root, capture_output=True, text=True)
     if result.returncode and not ok:
-        raise RuntimeError(f"{command[0]} failed ({result.returncode}): {result.stderr.strip()[:1500]}")
+        raise RuntimeError(f"{' '.join(command[:3])} failed ({result.returncode}): {result.stderr.strip()[:1500]}")
     return result
 
 def digest(data):
@@ -41,7 +41,8 @@ def gh(*arguments, missing_ok=False):
         # Permission/network failures are never evidence that a release is absent.
         if missing_ok and re.search(r"\(HTTP 404\)", result.stderr):
             return None
-        raise RuntimeError(f"GitHub operation failed ({result.returncode}): {result.stderr.strip()[:1500]}")
+        context = ' '.join(arguments[:2])
+        raise RuntimeError(f"GitHub {context} failed ({result.returncode}): {result.stderr.strip()[:1500]}")
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 def api(endpoint, *, missing_ok=False):
@@ -52,6 +53,19 @@ def stable_tag_version(value):
     if not match:
         raise ValueError("Existing Latest release does not use a stable vMAJOR.MINOR.PATCH tag")
     return tuple(map(int, match.groups()))
+
+def safe_error_message(message):
+    message = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", message)
+    message = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", message)
+    message = re.sub(r"(https?://)[^/\s@]+@", r"\1[redacted]@", message, flags=re.I)
+    message = re.sub(r"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+", "[redacted-token]", message)
+    message = re.sub(r"\b(authorization|password|secret|(?:api[_-]?)?token|api[_-]?key)\s*[:=]\s*\S+", r"\1=[redacted]", message, flags=re.I)
+    if len(message) > 6000:
+        message = message[:2000] + "\n[bounded diagnostic]\n" + message[-3900:]
+    return message
+
+def github_diagnostic(message):
+    return safe_error_message(message).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 try:
     manifest = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
@@ -132,6 +146,25 @@ try:
         sys.exit(0)
 
     prefix = "repos/" + repository
+    def find_release():
+        # GitHub's tag endpoint only finds published releases. An authenticated
+        # list includes drafts; fetch a matching draft by its immutable ID.
+        found = api(f"{prefix}/releases/tags/{tag}", missing_ok=True)
+        if found is not None:
+            return found
+        for page in range(1, 101):
+            releases = api(f"{prefix}/releases?per_page=100&page={page}")
+            if not isinstance(releases, list):
+                raise ValueError("GitHub release listing did not return an array")
+            matches = [item for item in releases if item.get("tag_name") == tag]
+            if len(matches) > 1:
+                raise ValueError("Multiple releases use the requested tag; no draft was selected")
+            if matches:
+                return api(f"{prefix}/releases/{matches[0]['id']}")
+            if len(releases) < 100:
+                return None
+        raise ValueError("Release lookup exceeded 100 pages; absence is unconfirmed")
+
     def verify_remote_tag():
         obj = api(f"{prefix}/git/ref/tags/{tag}")["object"]
         for _ in range(8):
@@ -167,12 +200,18 @@ try:
         notes_text += "\n\n驱动包状态：" + json.dumps(metadata.get("driver_packages", {}), ensure_ascii=False)
         notes_path.write_text(notes_text, encoding="utf-8")
         verify_remote_tag()
-        release = api(f"{prefix}/releases/tags/{tag}", missing_ok=True)
+        release = find_release()
         if release is None:
             run(["gh", "release", "create", tag, "--repo", repository, "--draft", "--verify-tag",
                  "--target", commit, "--title", title, "--notes-file", str(notes_path)])
-            release = api(f"{prefix}/releases/tags/{tag}")
+            release = find_release()
+            if release is None:
+                raise ValueError("GitHub created a draft but its release ID could not be found")
         validate_release(release)
+        release_id = release.get("id")
+        if not isinstance(release_id, int) or release_id <= 0:
+            raise ValueError("GitHub did not return a valid release ID")
+        release_endpoint = f"{prefix}/releases/{release_id}"
         published = not release.get("draft", False)
         existing = {asset["name"]: asset for asset in release.get("assets", [])}
         for name in payloads:
@@ -181,7 +220,7 @@ try:
             if published:
                 raise ValueError(f"Published release is missing {name}; published assets are never changed")
             run(["gh", "release", "upload", tag, str(temporary / name), "--repo", repository])
-        release = api(f"{prefix}/releases/tags/{tag}")
+        release = api(release_endpoint)
         validate_release(release)
         actual = {asset["name"]: asset for asset in release.get("assets", [])}
         for name, expected in expected_assets.items():
@@ -208,7 +247,7 @@ try:
             run(["gh", "release", "edit", tag, "--repo", repository, "--draft=false", latest_flag])
         elif make_latest and (previous_latest is None or previous_latest.get("id") != release["id"]):
             run(["gh", "release", "edit", tag, "--repo", repository, "--latest"])
-        final = api(f"{prefix}/releases/tags/{tag}")
+        final = api(release_endpoint)
         latest = api(f"{prefix}/releases/latest")
         validate_release(final)
         latest_version = stable_tag_version(latest.get("tag_name"))
@@ -220,6 +259,12 @@ try:
             raise ValueError("GitHub Latest has the same version but a different release identity")
         print("Published and verified: " + final.get("html_url", tag) + " (Latest: " + latest["tag_name"] + ")")
 except (ValueError, KeyError, OSError, RuntimeError, subprocess.CalledProcessError, zipfile.BadZipFile) as error:
-    print("Release failed: " + str(error), file=sys.stderr)
+    detail = str(error)
+    if isinstance(error, subprocess.CalledProcessError) and error.stderr:
+        detail += "\n" + (error.stderr.decode("utf-8", errors="replace") if isinstance(error.stderr, bytes) else error.stderr)
+    detail = safe_error_message(detail)
+    if os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
+        print("::error title=FlashTool release failed::" + github_diagnostic(detail), flush=True)
+    print("Release failed: " + detail, file=sys.stderr)
     sys.exit(1)
 PYTHON
