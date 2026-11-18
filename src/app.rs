@@ -14,6 +14,7 @@ use esp32c3_flashtool::{
     batch::{Batch, BatchEvent, JobState},
     chip::ChipModel,
     device_scan::DeviceScanner,
+    device_watch::DeviceWatcher,
     drivers::{self, DriverKind},
     firmware::{FirmwareInput, prepare_firmware},
     updater::{self, CheckResult, ReleaseUpdate, UpdateSettings},
@@ -68,6 +69,60 @@ struct JobRow {
     duration_secs: Option<f64>,
 }
 
+#[derive(Default)]
+struct ScanSchedule {
+    manual_pending: bool,
+    event_deadlines: VecDeque<Instant>,
+}
+
+impl ScanSchedule {
+    fn request_manual(&mut self) {
+        self.manual_pending = true;
+    }
+
+    fn device_event(&mut self, now: Instant) {
+        // A bounded settling burst follows a real device event. Once consumed,
+        // this queue stays empty until another event or a manual refresh.
+        self.event_deadlines = [200, 750, 1_500]
+            .into_iter()
+            .map(|millis| now + Duration::from_millis(millis))
+            .collect();
+    }
+
+    fn disable_auto(&mut self) {
+        self.event_deadlines.clear();
+    }
+
+    fn is_due(&self, now: Instant) -> bool {
+        self.manual_pending
+            || self
+                .event_deadlines
+                .front()
+                .is_some_and(|deadline| *deadline <= now)
+    }
+
+    fn scan_started(&mut self, now: Instant) {
+        self.manual_pending = false;
+        while self
+            .event_deadlines
+            .front()
+            .is_some_and(|deadline| *deadline <= now)
+        {
+            self.event_deadlines.pop_front();
+        }
+    }
+
+    fn repaint_delay(&self, now: Instant) -> Option<Duration> {
+        if self.manual_pending {
+            Some(Duration::ZERO)
+        } else {
+            self.event_deadlines
+                .front()
+                .map(|deadline| deadline.saturating_duration_since(now))
+        }
+    }
+}
+
 pub struct FlashApp {
     selected_chip: ChipModel,
     pending_chip: ChipModel,
@@ -79,8 +134,10 @@ pub struct FlashApp {
     firmware: Vec<FirmwareRow>,
     ports: Vec<PortRow>,
     scanner: DeviceScanner,
+    watcher: Option<DeviceWatcher>,
+    watcher_error: Option<String>,
     auto_refresh: bool,
-    next_scan_at: Instant,
+    scan_schedule: ScanSchedule,
     scan_error: Option<String>,
     baud: u32,
     concurrency: usize,
@@ -156,6 +213,13 @@ impl FlashApp {
             ),
         };
         let repaint = cc.egui_ctx.clone();
+        let watcher_repaint = cc.egui_ctx.clone();
+        let (watcher, watcher_error) =
+            match DeviceWatcher::new(move || watcher_repaint.request_repaint()) {
+                Ok(watcher) => (Some(watcher), None),
+                Err(error) => (None, Some(format!("设备插拔监听不可用：{error:#}"))),
+            };
+        let auto_refresh = watcher.is_some();
         let mut app = Self {
             selected_chip: ChipModel::default(),
             pending_chip: ChipModel::default(),
@@ -167,8 +231,10 @@ impl FlashApp {
             firmware: vec![FirmwareRow::empty("合并固件", "0x0")],
             ports: Vec::new(),
             scanner: DeviceScanner::new(move || repaint.request_repaint()),
-            auto_refresh: true,
-            next_scan_at: Instant::now(),
+            watcher,
+            watcher_error,
+            auto_refresh,
+            scan_schedule: ScanSchedule::default(),
             scan_error: None,
             baud: 460_800,
             concurrency: 4,
@@ -482,12 +548,26 @@ impl FlashApp {
     }
 
     fn scan_ports(&mut self) {
-        if self.scanner.request_scan() {
-            self.next_scan_at = Instant::now() + Duration::from_secs(2);
+        self.scan_schedule.request_manual();
+        self.start_scheduled_scan();
+    }
+
+    fn start_scheduled_scan(&mut self) {
+        let now = Instant::now();
+        if self.scan_schedule.is_due(now) && self.scanner.request_scan() {
+            self.scan_schedule.scan_started(now);
         }
     }
 
     fn poll_ports(&mut self) {
+        if self
+            .watcher
+            .as_ref()
+            .is_some_and(DeviceWatcher::take_pending)
+            && self.auto_refresh
+        {
+            self.scan_schedule.device_event(Instant::now());
+        }
         if let Some(result) = self.scanner.poll() {
             if let (Ok(observed), Some(batch)) = (&result, &self.batch) {
                 for (name, identity) in &self.batch_port_identities {
@@ -513,11 +593,8 @@ impl FlashApp {
             if success {
                 self.last_scan = Local::now().format("%H:%M:%S").to_string();
             }
-            self.next_scan_at = Instant::now() + Duration::from_secs(2);
         }
-        if self.auto_refresh && Instant::now() >= self.next_scan_at {
-            self.scan_ports();
-        }
+        self.start_scheduled_scan();
     }
 
     fn start_batch(&mut self) {
@@ -1255,24 +1332,26 @@ impl FlashApp {
                     .color(MUTED),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled_ui(!self.scanner.is_scanning(), |ui| {
-                        secondary_button(ui, "刷新串口", [88.0, 31.0])
-                    })
-                    .inner
-                    .clicked()
-                {
+                if secondary_button(ui, "刷新串口", [88.0, 31.0]).clicked() {
                     self.scan_ports();
                 }
                 if ui
-                    .checkbox(
-                        &mut self.auto_refresh,
-                        RichText::new("自动识别 · 2 秒").size(11.0),
+                    .add_enabled(
+                        self.watcher.is_some(),
+                        egui::Checkbox::new(
+                            &mut self.auto_refresh,
+                            RichText::new("设备插拔自动识别").size(11.0),
+                        ),
                     )
                     .changed()
-                    && self.auto_refresh
                 {
-                    self.scan_ports();
+                    self.scan_schedule.disable_auto();
+                    if self.auto_refresh {
+                        if let Some(watcher) = &self.watcher {
+                            watcher.take_pending();
+                        }
+                        self.scan_ports();
+                    }
                 }
             });
         });
@@ -1300,6 +1379,17 @@ impl FlashApp {
                 );
             }
         });
+        if let Some(error) = &self.watcher_error {
+            ui.add(
+                egui::Label::new(
+                    RichText::new("手动刷新模式：设备插拔监听不可用，请使用“刷新串口”。")
+                        .size(10.0)
+                        .color(MUTED),
+                )
+                .wrap(),
+            )
+            .on_hover_text(error);
+        }
         if let Some(error) = &self.scan_error {
             ui.add(
                 egui::Label::new(
@@ -1330,9 +1420,11 @@ impl FlashApp {
                                 .strong(),
                             );
                             ui.label(
-                                RichText::new(
-                                    "连接 USB Hub 与设备后会自动识别；首次使用可先安装串口驱动。",
-                                )
+                                RichText::new(if self.auto_refresh {
+                                    "连接 USB Hub 与设备后即可识别；首次使用可先安装串口驱动。"
+                                } else {
+                                    "连接设备后点击“刷新串口”；首次使用可先安装串口驱动。"
+                                })
                                 .size(11.0)
                                 .color(MUTED),
                             );
@@ -1765,8 +1857,8 @@ impl eframe::App for FlashApp {
         self.update_dialog(ctx);
         if self.busy() || self.update_checking || self.scanner.is_scanning() {
             ctx.request_repaint_after(Duration::from_millis(100));
-        } else if self.auto_refresh {
-            ctx.request_repaint_after(self.next_scan_at.saturating_duration_since(Instant::now()));
+        } else if let Some(delay) = self.scan_schedule.repaint_delay(Instant::now()) {
+            ctx.request_repaint_after(delay);
         }
     }
 }
@@ -2359,8 +2451,96 @@ fn install_fonts(ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Port, PortRow, append_csv, reconcile_ports, reconcile_scan_result};
+    use super::{Port, PortRow, ScanSchedule, append_csv, reconcile_ports, reconcile_scan_result};
     use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn idle_device_schedule_never_requests_periodic_enumeration() {
+        let schedule = ScanSchedule::default();
+        let now = Instant::now();
+        for seconds in [0, 2, 60, 86_400] {
+            assert!(!schedule.is_due(now + Duration::from_secs(seconds)));
+            assert!(
+                schedule
+                    .repaint_delay(now + Duration::from_secs(seconds))
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn real_device_event_has_only_a_bounded_settling_burst() {
+        let mut schedule = ScanSchedule::default();
+        let now = Instant::now();
+        schedule.device_event(now);
+        assert!(!schedule.is_due(now + Duration::from_millis(199)));
+        for millis in [200, 750, 1_500] {
+            let time = now + Duration::from_millis(millis);
+            assert!(schedule.is_due(time));
+            schedule.scan_started(time);
+            assert!(!schedule.is_due(time));
+        }
+        assert!(
+            schedule
+                .repaint_delay(now + Duration::from_secs(60))
+                .is_none()
+        );
+        assert!(!schedule.is_due(now + Duration::from_secs(86_400)));
+    }
+
+    #[test]
+    fn event_during_active_scan_remains_dirty_until_follow_up_can_start() {
+        let mut schedule = ScanSchedule::default();
+        let now = Instant::now();
+        schedule.request_manual();
+        schedule.scan_started(now);
+        schedule.device_event(now + Duration::from_millis(10));
+        let active_finishes = now + Duration::from_millis(600);
+        assert!(schedule.is_due(active_finishes));
+        // A busy scanner does not call scan_started, so another UI frame cannot lose the event.
+        assert!(schedule.is_due(active_finishes + Duration::from_millis(5)));
+        schedule.scan_started(active_finishes);
+        assert!(!schedule.is_due(active_finishes));
+        assert!(schedule.is_due(now + Duration::from_millis(760)));
+    }
+
+    #[test]
+    fn manual_refresh_does_not_drop_later_device_settling() {
+        let mut schedule = ScanSchedule::default();
+        let now = Instant::now();
+        schedule.device_event(now);
+        schedule.request_manual();
+        assert!(schedule.is_due(now));
+        schedule.scan_started(now);
+        assert!(schedule.is_due(now + Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn disabling_event_recognition_preserves_explicit_manual_refresh() {
+        let mut schedule = ScanSchedule::default();
+        let now = Instant::now();
+        schedule.device_event(now);
+        schedule.request_manual();
+        schedule.disable_auto();
+        assert!(schedule.is_due(now));
+        schedule.scan_started(now);
+        assert!(
+            schedule
+                .repaint_delay(now + Duration::from_secs(60))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn successive_device_events_debounce_from_the_latest_event() {
+        let mut schedule = ScanSchedule::default();
+        let now = Instant::now();
+        schedule.device_event(now);
+        schedule.device_event(now + Duration::from_millis(150));
+        assert!(!schedule.is_due(now + Duration::from_millis(200)));
+        assert!(schedule.is_due(now + Duration::from_millis(350)));
+    }
 
     fn port(name: &str, description: &str) -> Port {
         Port {
