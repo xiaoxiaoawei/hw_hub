@@ -12,10 +12,39 @@ $ErrorActionPreference = 'Stop'
 $script:NativeExitCode = 0
 $FailureCode = 0
 $Staging = $null
+$script:CurrentStage = 'Validate Windows host'
+$script:NativeCommand = ''
+$script:NativeTail = [Collections.Generic.Queue[string]]::new()
+
+function Add-NativeTail {
+    param([string]$Text)
+    foreach ($Line in ($Text -split '\r?\n')) {
+        $script:NativeTail.Enqueue($Line)
+        if ($script:NativeTail.Count -gt 30) { [void]$script:NativeTail.Dequeue() }
+    }
+}
+
+function ConvertTo-GitHubDiagnostic {
+    param([string]$Text)
+    $Text = $Text -replace '\x1b\[[0-?]*[ -/]*[@-~]', ''
+    $Text = $Text -replace '[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ''
+    $Text = $Text -replace '(?i)(https?://)[^/\s@]+@', '$1[redacted]@'
+    $Text = $Text -replace '\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+', '[redacted-token]'
+    $Text = $Text -replace '(?i)\b(authorization|password|secret|(?:api[_-]?)?token|api[_-]?key)\s*[:=]\s*\S+', '$1=[redacted]'
+    if ($Text.Length -gt 7000) { $Text = $Text.Substring(0, 2000) + "`n[bounded diagnostic]`n" + $Text.Substring($Text.Length - 4900) }
+    return $Text.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+}
 
 function Invoke-Checked {
     param([string]$Command, [string[]]$Arguments)
-    & $Command @Arguments
+    $script:NativeCommand = "$Command $($Arguments -join ' ')"
+    $script:CurrentStage = $script:NativeCommand
+    $script:NativeTail.Clear()
+    & $Command @Arguments 2>&1 | ForEach-Object {
+        $Text = $_.ToString()
+        Add-NativeTail $Text
+        Write-Host $Text
+    }
     $Code = $LASTEXITCODE
     if ($Code -ne 0) {
         $script:NativeExitCode = $Code
@@ -31,6 +60,7 @@ try {
     if ($RequireDrivers -and $AllowMissingDrivers) {
         throw '-RequireDrivers and -AllowMissingDrivers cannot be combined.'
     }
+    $script:CurrentStage = 'Read cargo metadata'
     $MetadataText = & cargo metadata --locked --format-version 1 --filter-platform x86_64-pc-windows-msvc
     if ($LASTEXITCODE -ne 0) {
         $script:NativeExitCode = $LASTEXITCODE
@@ -57,6 +87,7 @@ try {
     if ($DriversRequired -and $AllowMissingDrivers) {
         throw 'This release requires both embedded driver ZIPs; -AllowMissingDrivers is only for historical versions before 0.4.0.'
     }
+    $script:CurrentStage = 'Validate embedded driver packages'
     $DriverStatus = [ordered]@{}
     $DriverPackageFiles = [ordered]@{}
     foreach ($Name in @('ch343', 'cp210x')) {
@@ -87,8 +118,12 @@ try {
     Invoke-Checked cargo @('clippy', '--locked', '--all-targets', '--target', 'x86_64-pc-windows-msvc', '--', '-D', 'warnings')
     Invoke-Checked cargo @('test', '--locked', '--all-targets', '--target', 'x86_64-pc-windows-msvc')
     Invoke-Checked cargo @('build', '--locked', '--release', '--target', 'x86_64-pc-windows-msvc')
+    $script:CurrentStage = 'Check executable --version'
     $Binary = Join-Path 'target\x86_64-pc-windows-msvc\release' ($Application[0].name + '.exe')
-    $ReportedVersion = & $Binary --version
+    $script:NativeCommand = "$Binary --version"
+    $script:NativeTail.Clear()
+    $ReportedVersion = & $Binary --version 2>&1
+    foreach ($Line in $ReportedVersion) { Add-NativeTail $Line.ToString() }
     if ($LASTEXITCODE -ne 0) {
         $script:NativeExitCode = $LASTEXITCODE
         throw 'The built executable failed its --version check.'
@@ -97,6 +132,7 @@ try {
         throw "The executable did not report the Cargo.toml version $Version."
     }
 
+    $script:CurrentStage = 'Assemble release package'
     # Package an explicit allowlist, never the checkout, attachments, firmware or logs.
     $Staging = Join-Path ([IO.Path]::GetTempPath()) ('flashtool-package-' + [Guid]::NewGuid().ToString('N'))
     [void][IO.Directory]::CreateDirectory($Staging)
@@ -139,6 +175,7 @@ try {
     $DependencyRecords = @()
     foreach ($Package in $Metadata.packages) {
         if ($Package.id -eq $Application[0].id) { continue }
+        $script:CurrentStage = "Collect third-party notices: $($Package.name) $($Package.version)"
         $Source = Split-Path -Parent $Package.manifest_path
         $Target = Join-Path $Licences ($Package.name + '-' + $Package.version)
         $Files = @(Get-ChildItem -LiteralPath $Source -File -Recurse | Where-Object {
@@ -163,6 +200,7 @@ try {
     }
     $DependencyRecords | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $Licences 'dependencies.json') -Encoding UTF8
 
+    $script:CurrentStage = 'Create release ZIP and SHA256SUMS'
     [void][IO.Directory]::CreateDirectory((Join-Path (Get-Location) 'dist'))
     $ArchiveName = "FlashTool-v$Version-windows-x64.zip"
     $ArchivePath = Join-Path 'dist' $ArchiveName
@@ -173,7 +211,14 @@ try {
     Write-Host 'No device was flashed and no driver was installed by this script.'
 }
 catch {
-    Write-Error -ErrorRecord $_ -ErrorAction Continue
+    $Failure = $_
+    $Location = ($Failure.ScriptStackTrace -split '\r?\n')[0]
+    $Diagnostic = "Stage: $script:CurrentStage`n$($Failure.Exception.Message)`n$Location`n$($Failure.InvocationInfo.PositionMessage)"
+    if ($script:NativeTail.Count -gt 0) {
+        $Diagnostic += "`nNative command: $script:NativeCommand`nLast native output (up to 30 lines):`n" + ($script:NativeTail.ToArray() -join "`n")
+    }
+    Write-Host ("::error title=FlashTool Windows build failed::" + (ConvertTo-GitHubDiagnostic $Diagnostic))
+    Write-Error -ErrorRecord $Failure -ErrorAction Continue
     $FailureCode = if ($script:NativeExitCode -ne 0) { $script:NativeExitCode } else { 1 }
 }
 finally {
