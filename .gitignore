@@ -1,0 +1,8 @@
+/target/
+/dist/
+*.log
+/assets/drivers/*.zip
+/assets/drivers/manifest.json
+__pycache__/
+/assets/drivers/*.source.json
+/assets/drivers/*.sha256
