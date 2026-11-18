@@ -4,7 +4,9 @@ param(
     [switch]$RequireDrivers,
     # Retained for compatibility; missing driver packages are allowed by default.
     [switch]$AllowMissingDrivers,
-    [string]$ExpectedTag = ''
+    [string]$ExpectedTag = '',
+    [ValidateRange(1, 300)]
+    [int]$VersionTimeoutSeconds = 30
 )
 
 Set-StrictMode -Version Latest
@@ -122,11 +124,43 @@ try {
     $Binary = Join-Path 'target\x86_64-pc-windows-msvc\release' ($Application[0].name + '.exe')
     $script:NativeCommand = "$Binary --version"
     $script:NativeTail.Clear()
-    $ReportedVersion = & $Binary --version 2>&1
-    foreach ($Line in $ReportedVersion) { Add-NativeTail $Line.ToString() }
-    if ($LASTEXITCODE -ne 0) {
-        $script:NativeExitCode = $LASTEXITCODE
-        throw 'The built executable failed its --version check.'
+    # PowerShell's native invocation may not capture GUI-subsystem stdout.
+    # Explicit redirected handles also let the CLI retain its inherited pipes.
+    $VersionStartInfo = [Diagnostics.ProcessStartInfo]::new()
+    $VersionStartInfo.FileName = (Resolve-Path -LiteralPath $Binary).ProviderPath
+    $VersionStartInfo.UseShellExecute = $false
+    $VersionStartInfo.RedirectStandardOutput = $true
+    $VersionStartInfo.RedirectStandardError = $true
+    $VersionStartInfo.CreateNoWindow = $true
+    [void]$VersionStartInfo.ArgumentList.Add('--version')
+    $VersionProcess = [Diagnostics.Process]::new()
+    $VersionProcess.StartInfo = $VersionStartInfo
+    try {
+        if (-not $VersionProcess.Start()) { throw 'Could not start the executable version check.' }
+        $VersionOutputTask = $VersionProcess.StandardOutput.ReadToEndAsync()
+        $VersionErrorTask = $VersionProcess.StandardError.ReadToEndAsync()
+        $VersionTimedOut = -not $VersionProcess.WaitForExit($VersionTimeoutSeconds * 1000)
+        if ($VersionTimedOut) {
+            if (-not $VersionProcess.HasExited) { $VersionProcess.Kill($true) }
+            if (-not $VersionProcess.WaitForExit(5000)) { throw 'The timed-out version-check process could not be stopped.' }
+        }
+        $VersionReadTasks = [Threading.Tasks.Task[]]@($VersionOutputTask, $VersionErrorTask)
+        if (-not [Threading.Tasks.Task]::WaitAll($VersionReadTasks, 5000)) {
+            throw 'The executable version-check output streams did not close.'
+        }
+        $ReportedVersion = $VersionOutputTask.GetAwaiter().GetResult()
+        $VersionError = $VersionErrorTask.GetAwaiter().GetResult()
+        foreach ($Text in @($ReportedVersion, $VersionError)) {
+            if ($Text) { Add-NativeTail $Text; Write-Host $Text.TrimEnd() }
+        }
+        if ($VersionTimedOut) { throw "The executable --version exceeded $VersionTimeoutSeconds seconds and was stopped." }
+        if ($VersionProcess.ExitCode -ne 0) {
+            $script:NativeExitCode = $VersionProcess.ExitCode
+            throw "The executable --version failed with exit code $($VersionProcess.ExitCode)."
+        }
+    }
+    finally {
+        $VersionProcess.Dispose()
     }
     if (($ReportedVersion -join "`n") -notmatch ('(?<![0-9.])v?' + [regex]::Escape($Version) + '(?![0-9.])')) {
         throw "The executable did not report the Cargo.toml version $Version."
