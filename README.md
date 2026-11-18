@@ -88,6 +88,8 @@ python3 scripts/bump-version.py 0.5.0
 
 GitHub Actions 验证 `vX.Y.Z` 标签与 Cargo 版本一致，通过格式、静态检查和测试后在 Windows 构建。正式 Release 统一使用 `FlashTool vX.Y.Z` 标题，上传版本 ZIP、源码 ZIP 和 SHA256 校验文件，验证成功后才发布并标记 Latest。已发布标签及附件保持不变；可手动选择只构建或发布一个已存在的版本标签。Latest 保持指向较高的正式版本，补发旧版本时保留更新版本的 Latest 标记。
 
+从 v0.4.2 起，`FlashTool-vX.Y.Z-source.zip` 仅包含该标签中的 Rust 工程、测试、脚本、驱动资源及许可，排除仓库原有的旧软件安装包。已发布版本的附件及校验和保持不变；GitHub 自动生成的 “Source code” 归档仍由 GitHub 管理。
+
 发布工具也可从本地验证过的标签和构建产物完成相同流程：
 
 ```sh

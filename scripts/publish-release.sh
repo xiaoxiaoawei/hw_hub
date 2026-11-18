@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+from urllib.parse import urlencode
 import zipfile
 
 parser = argparse.ArgumentParser(description="Validate a FlashTool release; publish draft assets before sending GitHub's published event.")
@@ -114,10 +115,31 @@ try:
             raise ValueError("The Windows ZIP records a different source commit")
         if archive.read("FlashTool.exe")[:2] != b"MZ":
             raise ValueError("The Windows ZIP does not contain a PE executable")
-    # Archive the immutable tag, never the current working tree or private attachments.
+    # Preserve already-published legacy archive bytes. New versions package only
+    # the immutable commit's development inputs, not the legacy root installer.
+    archive_command = ["git", "archive", "--format=zip", "--prefix", f"FlashTool-{tag}/", commit]
+    source_policy = "legacy-full-tree"
+    if stable_tag_version(tag) >= (0, 4, 2):
+        source_policy = "build-source-allowlist"
+        allowed = {
+            "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "build.rs", "README.md", "CHANGELOG.md",
+            ".gitattributes", ".gitignore", "src", "assets", "scripts", "tests", ".github",
+        }
+        entries = subprocess.run(["git", "ls-tree", "-z", commit], cwd=root, capture_output=True, check=True).stdout
+        paths = []
+        for entry in entries.split(b"\0"):
+            if not entry:
+                continue
+            attributes, encoded_name = entry.split(b"\t", 1)
+            name = encoded_name.decode("utf-8")
+            is_notice = attributes.split()[1] == b"blob" and re.match(r"^(LICENSE|COPYING|NOTICE|THIRD_PARTY)", name)
+            if name in allowed or is_notice:
+                paths.append(name)
+        if "Cargo.toml" not in paths or "src" not in paths:
+            raise ValueError("The tagged source is missing required build inputs")
+        archive_command += ["--", *sorted(paths)]
     source_bytes = subprocess.run(
-        ["git", "archive", "--format=zip", "--prefix", f"FlashTool-{tag}/", commit],
-        cwd=root, capture_output=True, check=True
+        archive_command, cwd=root, capture_output=True, check=True
     ).stdout
     source_hash = digest(source_bytes)
     checksum_bytes = f"{windows_hash}  {windows_name}\n{source_hash}  {source_name}\n".encode("ascii")
@@ -137,6 +159,7 @@ try:
         "repository": repository, "tag": tag, "title": title, "commit": commit,
         "assets": expected_assets, "target": metadata["target"],
         "driver_packages": metadata.get("driver_packages", {}),
+        "source_archive_policy": source_policy,
         "steps": ["verify remote tag commit", "create or resume draft", "upload and verify every asset",
                   "publish draft; advance Latest only for a non-older stable SemVer", "verify published release and Latest"],
         "build_notifications": "GitHub Actions completion emails follow the triggering user's Actions Email preferences, including the only-failed setting.",
@@ -194,19 +217,22 @@ try:
         temporary = Path(directory)
         for name, data in payloads.items():
             (temporary / name).write_bytes(data)
-        notes_path = temporary / "release-notes.md"
         notes_text = notes[1].strip()
         notes_text += "\n\nWindows x64 构建平台和验证范围见 ZIP 内 BUILD-METADATA.json；USB Hub 多设备烧录及驱动安装仍需实机验收。"
         notes_text += "\n\n驱动包状态：" + json.dumps(metadata.get("driver_packages", {}), ensure_ascii=False)
-        notes_path.write_text(notes_text, encoding="utf-8")
         verify_remote_tag()
         release = find_release()
         if release is None:
-            run(["gh", "release", "create", tag, "--repo", repository, "--draft", "--verify-tag",
-                 "--target", commit, "--title", title, "--notes-file", str(notes_path)])
-            release = find_release()
-            if release is None:
-                raise ValueError("GitHub created a draft but its release ID could not be found")
+            request_path = temporary / "create-release.json"
+            request_path.write_text(json.dumps({
+                "tag_name": tag, "target_commitish": commit, "name": title,
+                "body": notes_text, "draft": True, "prerelease": False,
+            }, ensure_ascii=False), encoding="utf-8")
+            # The POST response is authoritative immediately. Draft tag/list
+            # indexes can lag and must not be consulted again to rediscover it.
+            release = gh("api", f"{prefix}/releases", "--method", "POST", "--input", str(request_path))
+            if not isinstance(release, dict) or release.get("draft") is not True:
+                raise ValueError("GitHub did not return the newly created draft release object")
         validate_release(release)
         release_id = release.get("id")
         if not isinstance(release_id, int) or release_id <= 0:
@@ -219,7 +245,9 @@ try:
                 continue
             if published:
                 raise ValueError(f"Published release is missing {name}; published assets are never changed")
-            run(["gh", "release", "upload", tag, str(temporary / name), "--repo", repository])
+            upload_endpoint = f"https://uploads.github.com/repos/{repository}/releases/{release_id}/assets?" + urlencode({"name": name})
+            gh("api", upload_endpoint, "--method", "POST", "--header", "Content-Type: application/octet-stream",
+               "--header", f"Content-Length: {len(payloads[name])}", "--input", str(temporary / name))
         release = api(release_endpoint)
         validate_release(release)
         actual = {asset["name"]: asset for asset in release.get("assets", [])}
@@ -231,10 +259,14 @@ try:
             if isinstance(checksum, str) and re.fullmatch(r"sha256:[0-9a-fA-F]{64}", checksum):
                 actual_hash = checksum.split(":", 1)[1].lower()
             else:
-                download = temporary / ("verify-" + name.replace(".", "_"))
-                download.mkdir()
-                run(["gh", "release", "download", tag, "--repo", repository, "--pattern", name, "--dir", str(download)])
-                actual_hash = digest((download / name).read_bytes())
+                asset_id = asset.get("id")
+                if not isinstance(asset_id, int) or asset_id <= 0:
+                    raise ValueError(f"GitHub did not return a valid asset ID: {name}")
+                download = subprocess.run(["gh", "api", f"{prefix}/releases/assets/{asset_id}", "--header", "Accept: application/octet-stream"],
+                                          cwd=root, capture_output=True)
+                if download.returncode:
+                    raise RuntimeError(f"GitHub asset download failed ({download.returncode}): " + download.stderr.decode("utf-8", errors="replace")[:1500])
+                actual_hash = digest(download.stdout)
             if actual_hash != expected["sha256"]:
                 raise ValueError(f"Release asset checksum mismatch; release remains unchanged/draft: {name}")
         verify_remote_tag()
@@ -242,11 +274,15 @@ try:
         previous_latest = api(f"{prefix}/releases/latest", missing_ok=True)
         previous_version = stable_tag_version(previous_latest.get("tag_name")) if previous_latest else None
         make_latest = previous_version is None or current_version >= previous_version
+        patch = None
         if not published:
-            latest_flag = "--latest" if make_latest else "--latest=false"
-            run(["gh", "release", "edit", tag, "--repo", repository, "--draft=false", latest_flag])
+            patch = {"draft": False, "make_latest": "true" if make_latest else "false"}
         elif make_latest and (previous_latest is None or previous_latest.get("id") != release["id"]):
-            run(["gh", "release", "edit", tag, "--repo", repository, "--latest"])
+            patch = {"make_latest": "true"}
+        if patch is not None:
+            patch_path = temporary / "edit-release.json"
+            patch_path.write_text(json.dumps(patch), encoding="utf-8")
+            gh("api", release_endpoint, "--method", "PATCH", "--input", str(patch_path))
         final = api(release_endpoint)
         latest = api(f"{prefix}/releases/latest")
         validate_release(final)
