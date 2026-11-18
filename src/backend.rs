@@ -18,6 +18,10 @@ const SECTOR_SIZE: u64 = 4096;
 #[derive(Clone, Debug)]
 pub struct Port {
     pub name: String,
+    /// Stable metadata identity, including a USB serial number when available.
+    /// A port without a USB serial still needs observed-disconnect invalidation
+    /// before queued work may continue on the same OS port name.
+    pub identity: String,
     pub description: String,
     pub usb: bool,
     pub suggested: bool,
@@ -45,6 +49,7 @@ fn port_number(name: &str) -> Option<u32> {
 }
 
 fn describe_port(info: SerialPortInfo) -> Port {
+    let identity = identity_for_info(&info);
     let (description, usb, suggested) = match info.port_type {
         SerialPortType::UsbPort(ref usb) => {
             let known = match usb.vid {
@@ -71,10 +76,53 @@ fn describe_port(info: SerialPortInfo) -> Port {
     };
     Port {
         name: info.port_name,
+        identity,
         description,
         usb,
         suggested,
     }
+}
+
+pub(crate) fn port_name_key(name: &str) -> String {
+    if cfg!(windows) {
+        name.strip_prefix("\\\\.\\")
+            .unwrap_or(name)
+            .to_ascii_uppercase()
+    } else {
+        name.to_owned()
+    }
+}
+
+fn identity_for_info(info: &SerialPortInfo) -> String {
+    let name = port_name_key(&info.port_name);
+    match &info.port_type {
+        SerialPortType::UsbPort(usb) => serde_json::json!({
+            "kind": "usb", "port": name, "vid": usb.vid, "pid": usb.pid,
+            "serial": usb.serial_number.as_deref(),
+        }),
+        SerialPortType::BluetoothPort => serde_json::json!({"kind": "bluetooth", "port": name}),
+        SerialPortType::PciPort => serde_json::json!({"kind": "pci", "port": name}),
+        SerialPortType::Unknown => serde_json::json!({"kind": "unknown", "port": name}),
+    }
+    .to_string()
+}
+
+fn open_checked<T>(
+    expected: Option<&Port>,
+    actual: &SerialPortInfo,
+    open: impl FnOnce(&SerialPortInfo) -> Result<T>,
+) -> Result<T> {
+    if let Some(expected) = expected
+        && (expected.identity.is_empty()
+            || port_name_key(&expected.name) != port_name_key(&actual.port_name)
+            || expected.identity != identity_for_info(actual))
+    {
+        bail!(
+            "{} 的设备身份已变化；为避免烧录新接入设备，本任务已停止，请重新选择设备并启动新批次",
+            expected.name
+        );
+    }
+    open(actual)
 }
 
 #[derive(Clone, Debug)]
@@ -95,6 +143,27 @@ pub fn flash(
     firmware: &PreparedFirmware,
     callback: &mut dyn FnMut(FlashProgress),
 ) -> Result<()> {
+    flash_impl(port, None, baud, firmware, callback)
+}
+
+/// Production batch entry point: bind a queued task to its selected device
+/// snapshot before opening any native serial handle.
+pub fn flash_expected(
+    expected: &Port,
+    baud: u32,
+    firmware: &PreparedFirmware,
+    callback: &mut dyn FnMut(FlashProgress),
+) -> Result<()> {
+    flash_impl(&expected.name, Some(expected), baud, firmware, callback)
+}
+
+fn flash_impl(
+    port: &str,
+    expected: Option<&Port>,
+    baud: u32,
+    firmware: &PreparedFirmware,
+    callback: &mut dyn FnMut(FlashProgress),
+) -> Result<()> {
     if port.trim().is_empty() {
         bail!("未选择串口");
     }
@@ -109,8 +178,15 @@ pub fn flash(
     let info = serialport::available_ports()
         .context("连接前无法重新枚举串口")?
         .into_iter()
-        .find(|info| info.port_name.eq_ignore_ascii_case(port))
+        .find(|info| port_name_key(&info.port_name) == port_name_key(port))
         .with_context(|| format!("串口 {port} 已断开或不存在，请刷新设备列表"))?;
+    let serial = open_checked(expected, &info, |actual| {
+        serialport::new(&actual.port_name, 115_200)
+            .flow_control(FlowControl::None)
+            .timeout(Duration::from_secs(3))
+            .open_native()
+            .with_context(|| format!("无法打开 {port}，请检查驱动、连接及串口占用"))
+    })?;
     let usb = match info.port_type {
         SerialPortType::UsbPort(usb) => usb,
         _ => UsbPortInfo {
@@ -121,11 +197,6 @@ pub fn flash(
             product: None,
         },
     };
-    let serial = serialport::new(port, 115_200)
-        .flow_control(FlowControl::None)
-        .timeout(Duration::from_secs(3))
-        .open_native()
-        .with_context(|| format!("无法打开 {port}，请检查驱动、连接及串口占用"))?;
     let connection = Connection::new(
         serial,
         usb,
@@ -345,6 +416,86 @@ impl ProgressCallbacks for SessionProgress<'_> {
 mod tests {
     use super::*;
     use crate::firmware::FirmwareSegment;
+
+    fn usb_info(name: &str, serial: Option<&str>) -> SerialPortInfo {
+        SerialPortInfo {
+            port_name: name.into(),
+            port_type: SerialPortType::UsbPort(UsbPortInfo {
+                vid: 0x10c4,
+                pid: 0xea60,
+                serial_number: serial.map(str::to_owned),
+                manufacturer: Some("Silicon Labs".into()),
+                product: Some("CP210x".into()),
+            }),
+        }
+    }
+
+    #[test]
+    fn changed_usb_serial_is_rejected_before_any_port_open_operation() {
+        let expected = describe_port(usb_info("COM3", Some("device-A")));
+        let replacement = usb_info("COM3", Some("device-B"));
+        // Same COM name, product description and VID/PID must not hide that
+        // another physical USB-UART adapter has replaced the selected one.
+        assert_eq!(
+            expected.description,
+            describe_port(replacement.clone()).description
+        );
+        let mut opened = false;
+        let result = open_checked(Some(&expected), &replacement, |_| {
+            opened = true;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!opened);
+        let result = open_checked(Some(&expected), &usb_info("COM3", Some("device-A")), |_| {
+            opened = true;
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert!(opened);
+    }
+
+    #[test]
+    fn usb_identity_includes_port_vid_pid_and_optional_serial_but_not_labels() {
+        let original = usb_info("COM3", Some("A"));
+        let mut renamed = original.clone();
+        if let SerialPortType::UsbPort(usb) = &mut renamed.port_type {
+            usb.product = Some("a localized product label".into());
+        }
+        assert_eq!(identity_for_info(&original), identity_for_info(&renamed));
+        assert_ne!(
+            identity_for_info(&original),
+            identity_for_info(&usb_info("COM4", Some("A")))
+        );
+        assert_ne!(
+            identity_for_info(&original),
+            identity_for_info(&usb_info("COM3", None))
+        );
+        if let SerialPortType::UsbPort(usb) = &mut renamed.port_type {
+            usb.pid = 0xea70;
+        }
+        assert_ne!(identity_for_info(&original), identity_for_info(&renamed));
+    }
+
+    #[test]
+    fn non_usb_port_types_have_distinct_identities() {
+        let pci = SerialPortInfo {
+            port_name: "COM1".into(),
+            port_type: SerialPortType::PciPort,
+        };
+        let unknown = SerialPortInfo {
+            port_name: "COM1".into(),
+            port_type: SerialPortType::Unknown,
+        };
+        assert_ne!(identity_for_info(&pci), identity_for_info(&unknown));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win32_namespace_and_case_aliases_share_the_same_port_key() {
+        assert_eq!(port_name_key("\\\\.\\COM3"), port_name_key("COM3"));
+        assert_eq!(port_name_key("com3"), port_name_key("COM3"));
+    }
 
     fn firmware(segments: Vec<(u32, usize)>) -> PreparedFirmware {
         PreparedFirmware {

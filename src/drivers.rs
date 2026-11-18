@@ -94,6 +94,17 @@ pub fn package_source(kind: DriverKind) -> Option<&'static str> {
     }
 }
 
+/// The original bundled licence, for explicit acceptance before CP210x install.
+pub fn bundled_license_text(kind: DriverKind) -> Option<&'static str> {
+    match kind {
+        DriverKind::Cp210x => Some(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/drivers/cp210x-license.txt"
+        ))),
+        DriverKind::Ch343 => None,
+    }
+}
+
 pub fn install(kind: DriverKind) -> Result<String> {
     if let Some(bytes) = embedded_package(kind) {
         return install_reader(kind, Cursor::new(bytes));
@@ -219,17 +230,71 @@ fn unpack_and_validate(kind: DriverKind, reader: impl Read + Seek, root: &Path) 
             system_files += 1;
         }
     }
-    ensure!(
-        infs.len() == 1,
-        "驱动包必须包含且仅包含一个 {}，当前找到 {} 个",
-        kind.inf_name(),
-        infs.len()
-    );
     ensure!(system_files > 0, "驱动 ZIP 缺少非空 SYS 驱动文件");
-    let inf = infs.pop().unwrap();
+    let inf = choose_inf(kind, &infs, root)?;
     let text = read_inf(&fs::read(&inf)?);
     validate_inf(kind, &text, inf.parent().unwrap())?;
     Ok(inf)
+}
+
+fn find_file_case_insensitive(directory: &Path, name: &str) -> Result<PathBuf> {
+    fs::read_dir(directory)?
+        .filter_map(std::result::Result::ok)
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(name)
+        })
+        .map(|entry| entry.path())
+        .with_context(|| format!("驱动包缺少文件：{name}"))
+}
+
+fn choose_inf(kind: DriverKind, infs: &[PathBuf], root: &Path) -> Result<PathBuf> {
+    if infs.len() == 1 {
+        return Ok(infs[0].clone());
+    }
+    ensure!(
+        kind == DriverKind::Ch343 && infs.len() == 2,
+        "驱动包的 {} 选择不明确，当前找到 {} 个",
+        kind.inf_name(),
+        infs.len()
+    );
+    // The supplied WCH SFX has this exact two-directory layout. Do not pick an
+    // arbitrary first INF from other archives or guess between different drivers.
+    let known = |relative: &str| {
+        infs.iter().find(|path| {
+            path.strip_prefix(root).is_ok_and(|path| {
+                path.to_string_lossy()
+                    .replace('\\', "/")
+                    .eq_ignore_ascii_case(relative)
+            })
+        })
+    };
+    let base_inf = known("CH343SER.INF").context("CH343 多 INF 包不符合已知目录布局")?;
+    let preferred = known("WIN 1X/CH343SER.INF").context("CH343 多 INF 包缺少 WIN 1X 候选")?;
+    let preferred_directory = preferred.parent().context("CH343 INF 缺少父目录")?;
+    // Static inspection established these copies are byte-identical. Require
+    // that invariant at runtime, including catalog and every referenced payload.
+    for name in [
+        "CH343SER.INF",
+        "CH343SER.CAT",
+        "CH343SER.sys",
+        "CH343S64.sys",
+        "CH343M64.sys",
+        "CH343PT.DLL",
+        "CH343PTA64.DLL",
+        "CH343PORTS.dll",
+        "CH343PORTSA64.dll",
+    ] {
+        let original = find_file_case_insensitive(base_inf.parent().unwrap(), name)?;
+        let modern = find_file_case_insensitive(preferred_directory, name)?;
+        ensure!(
+            fs::read(original)? == fs::read(modern)?,
+            "CH343 的两个目录包含不同驱动文件，拒绝猜测安装版本：{name}"
+        );
+    }
+    Ok(preferred.clone())
 }
 
 fn read_inf(bytes: &[u8]) -> String {
@@ -292,11 +357,7 @@ fn validate_inf(kind: DriverKind, text: &str, directory: &Path) -> Result<()> {
                     .is_some_and(|e| e.eq_ignore_ascii_case("cat")),
             "INF 中的 CAT 引用无效"
         );
-        let path = fs::read_dir(directory)?
-            .filter_map(std::result::Result::ok)
-            .find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(name))
-            .map(|e| e.path())
-            .with_context(|| format!("缺少 INF 引用的 CAT 文件：{name}"))?;
+        let path = find_file_case_insensitive(directory, name)?;
         let metadata = fs::metadata(&path)?;
         ensure!(
             metadata.is_file() && metadata.len() <= 8 * 1024 * 1024,
@@ -306,6 +367,49 @@ fn validate_inf(kind: DriverKind, text: &str, directory: &Path) -> Result<()> {
         ensure!(
             valid_catalog_envelope(&data),
             "CAT 文件不是有效的 PKCS#7 SignedData 结构"
+        );
+    }
+    validate_source_files(text, directory)
+}
+
+fn validate_source_files(text: &str, directory: &Path) -> Result<()> {
+    let mut source_section = false;
+    for line in text
+        .lines()
+        .map(|line| line.split(';').next().unwrap_or("").trim())
+    {
+        if line.starts_with('[') && line.ends_with(']') {
+            let name = line[1..line.len() - 1].to_ascii_uppercase();
+            source_section = name == "SOURCEDISKSFILES" || name.starts_with("SOURCEDISKSFILES.");
+            continue;
+        }
+        if !source_section || line.is_empty() {
+            continue;
+        }
+        let (filename, fields) = line
+            .split_once('=')
+            .context("INF 的 SourceDisksFiles 条目无效")?;
+        let filename = filename.trim().trim_matches('"');
+        ensure!(
+            safe_relative_path(filename)?.components().count() == 1,
+            "INF 源文件名必须是安全的单个文件名"
+        );
+        let subdirectory = fields
+            .split(',')
+            .nth(1)
+            .unwrap_or("")
+            .trim()
+            .trim_matches('"')
+            .trim_start_matches(['\\', '/']);
+        let media = if subdirectory.is_empty() {
+            directory.to_path_buf()
+        } else {
+            directory.join(safe_relative_path(subdirectory)?)
+        };
+        let path = find_file_case_insensitive(&media, filename)?;
+        ensure!(
+            fs::metadata(path)?.is_file(),
+            "INF 引用的源文件不是普通文件：{filename}"
         );
     }
     Ok(())
@@ -417,7 +521,7 @@ fn run_installer(inf: &Path) -> Result<String> {
     }
     match code {
         0 => Ok(
-            "驱动包已由 Windows 安装/更新。请刷新串口列表；如设备未出现，请重新插拔 USB。".into(),
+            "Windows 已成功处理驱动包。请刷新串口列表确认设备；若未出现，请重新插拔 USB。".into(),
         ),
         3010 => Ok("驱动安装成功，需要重新启动 Windows 后生效（退出码 3010）。".into()),
         _ => bail!("Windows 驱动安装失败（退出码 {code}）。请检查安装窗口和系统驱动签名提示。"),
@@ -514,5 +618,75 @@ mod tests {
             bytes.extend(word.to_le_bytes());
         }
         assert_eq!(read_inf(&bytes), text);
+    }
+
+    #[test]
+    fn chooses_only_the_known_identical_ch343_layout() {
+        let directory = tempfile::tempdir().unwrap();
+        let modern = directory.path().join("WIN 1X");
+        fs::create_dir(&modern).unwrap();
+        for name in [
+            "CH343SER.INF",
+            "CH343SER.CAT",
+            "CH343SER.sys",
+            "CH343S64.sys",
+            "CH343M64.sys",
+            "CH343PT.DLL",
+            "CH343PTA64.DLL",
+            "CH343PORTS.dll",
+            "CH343PORTSA64.dll",
+        ] {
+            fs::write(directory.path().join(name), b"identical fixture").unwrap();
+            fs::write(modern.join(name), b"identical fixture").unwrap();
+        }
+        let infs = vec![
+            directory.path().join("CH343SER.INF"),
+            modern.join("CH343SER.INF"),
+        ];
+        assert_eq!(
+            choose_inf(DriverKind::Ch343, &infs, directory.path()).unwrap(),
+            modern.join("CH343SER.INF")
+        );
+        fs::write(modern.join("CH343S64.sys"), b"different candidate").unwrap();
+        assert!(choose_inf(DriverKind::Ch343, &infs, directory.path()).is_err());
+        assert!(choose_inf(DriverKind::Cp210x, &infs, directory.path()).is_err());
+    }
+
+    #[test]
+    fn validates_architecture_source_payloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let inf = "[SourceDisksFiles.amd64]\nsilabser.sys=1,\\x64\n";
+        assert!(validate_source_files(inf, directory.path()).is_err());
+        fs::create_dir(directory.path().join("x64")).unwrap();
+        fs::write(directory.path().join("x64/silabser.sys"), b"fixture").unwrap();
+        validate_source_files(inf, directory.path()).unwrap();
+        assert!(
+            validate_source_files("[SourceDisksFiles]\na.sys=1,../escape", directory.path())
+                .is_err()
+        );
+    }
+
+    #[cfg(all(has_ch343_driver, has_cp210x_driver))]
+    #[test]
+    fn supplied_embedded_driver_archives_validate_without_running_installers() {
+        for (kind, expected) in [
+            (DriverKind::Ch343, "WIN 1X/CH343SER.INF"),
+            (DriverKind::Cp210x, "silabser.inf"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let inf = unpack_and_validate(
+                kind,
+                Cursor::new(embedded_package(kind).unwrap()),
+                directory.path(),
+            )
+            .unwrap();
+            assert!(inf.ends_with(expected));
+            assert_eq!(package_source(kind), Some("内置驱动包"));
+        }
+        assert!(
+            bundled_license_text(DriverKind::Cp210x)
+                .unwrap()
+                .contains("SILICON LABS VCP DRIVER")
+        );
     }
 }

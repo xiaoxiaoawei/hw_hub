@@ -1,1 +1,5 @@
 Package-Tool-Setup-0.2.220.exe filter=lfs diff=lfs merge=lfs -text
+assets/drivers/*.zip -text
+assets/drivers/*.exe -text
+# Preserve the vendor licence's original CRLF and trailing spaces verbatim.
+assets/drivers/cp210x-license.txt -text -whitespace

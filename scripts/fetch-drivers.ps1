@@ -57,6 +57,25 @@ function Test-DriverArchive {
         $Infs = @($Archive.Entries | Where-Object {
             [IO.Path]::GetFileName($_.FullName.Replace('\', '/')).Equals($Package.Inf, [StringComparison]::OrdinalIgnoreCase)
         })
+        if ($Infs.Count -eq 2 -and $Package.Inf -eq 'CH343SER.INF') {
+            # The uploaded WCH SFX's known duplicate layout is safe to select
+            # only when all corresponding INF/CAT/SYS/DLL files are identical.
+            $KnownNames = @('CH343SER.INF', 'CH343SER.CAT', 'CH343SER.sys', 'CH343S64.sys', 'CH343M64.sys', 'CH343PT.DLL', 'CH343PTA64.DLL', 'CH343PORTS.dll', 'CH343PORTSA64.dll')
+            foreach ($Name in $KnownNames) {
+                $Original = @($Archive.Entries | Where-Object { $_.FullName.Replace('\', '/').Equals($Name, [StringComparison]::OrdinalIgnoreCase) })
+                $Modern = @($Archive.Entries | Where-Object { $_.FullName.Replace('\', '/').Equals(('WIN 1X/' + $Name), [StringComparison]::OrdinalIgnoreCase) })
+                if ($Original.Count -ne 1 -or $Modern.Count -ne 1) { throw 'The duplicate CH343 layout is not the known complete package.' }
+                $Copies = @()
+                foreach ($Entry in @($Original[0], $Modern[0])) {
+                    $Stream = $Entry.Open()
+                    $Memory = [IO.MemoryStream]::new()
+                    try { $Stream.CopyTo($Memory); $Copies += [Convert]::ToBase64String($Memory.ToArray()) }
+                    finally { $Stream.Dispose(); $Memory.Dispose() }
+                }
+                if ($Copies[0] -cne $Copies[1]) { throw "The two CH343 candidates differ: $Name" }
+            }
+            $Infs = @($Archive.Entries | Where-Object { $_.FullName.Replace('\', '/').Equals('WIN 1X/CH343SER.INF', [StringComparison]::OrdinalIgnoreCase) })
+        }
         if ($Infs.Count -ne 1) {
             throw "Expected exactly one $($Package.Inf); found $($Infs.Count)."
         }
@@ -82,7 +101,13 @@ foreach ($Name in $Selected) {
     $Package = $Packages[$Name]
     $Destination = Join-Path $OutputDirectory "$Name.zip"
     if ((Test-Path -LiteralPath $Destination) -and -not $Force) {
-        throw "$Destination already exists. Preserve it or explicitly use -Force to replace it."
+        [void](Test-DriverArchive -Path $Destination -Package $Package)
+        $Hash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($ExpectedSha256 -and $Hash -ne $ExpectedSha256.ToLowerInvariant()) {
+            throw "The existing $Name.zip does not match -ExpectedSha256; it was preserved."
+        }
+        Write-Host "Preserved existing $Name.zip (SHA256 $Hash); no download or installation was performed."
+        continue
     }
     $Temporary = Join-Path $OutputDirectory ('.' + $Name + '-' + [Guid]::NewGuid().ToString('N') + '.partial')
     try {

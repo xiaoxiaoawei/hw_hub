@@ -1,16 +1,16 @@
-//! A bounded, independent-device queue. Cancellation never interrupts an active write.
+//! A bounded device queue. Cancellation and invalidation never interrupt active writes.
 use crate::{
-    backend::{self, FlashProgress},
+    backend::{self, FlashProgress, Port},
     firmware::PreparedFirmware,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -35,15 +35,51 @@ pub struct BatchEvent {
     pub progress: f32,
 }
 
+struct QueueState {
+    pending: VecDeque<String>,
+    invalidated: HashMap<String, String>,
+    cancelled: bool,
+}
+
 pub struct Batch {
     pub receiver: Receiver<BatchEvent>,
-    cancelled: Arc<AtomicBool>,
+    queue: Arc<Mutex<QueueState>>,
     remaining: Arc<AtomicUsize>,
 }
 
 impl Batch {
+    /// Legacy name-only entry point. User-facing batch workflows should bind
+    /// tasks to selected device identities through start_guarded instead.
     pub fn start(
         ports: Vec<String>,
+        baud: u32,
+        concurrency: usize,
+        firmware: Arc<PreparedFirmware>,
+    ) -> Result<Self> {
+        Self::start_internal(ports, None, baud, concurrency, firmware)
+    }
+
+    pub fn start_guarded(
+        ports: Vec<Port>,
+        baud: u32,
+        concurrency: usize,
+        firmware: Arc<PreparedFirmware>,
+    ) -> Result<Self> {
+        ensure!(
+            ports.iter().all(|port| !port.identity.is_empty()),
+            "设备身份为空，请重新扫描后选择设备"
+        );
+        let names = ports.iter().map(|port| port.name.clone()).collect();
+        let expected = ports
+            .into_iter()
+            .map(|port| (backend::port_name_key(&port.name), port))
+            .collect();
+        Self::start_internal(names, Some(expected), baud, concurrency, firmware)
+    }
+
+    fn start_internal(
+        ports: Vec<String>,
+        expected: Option<HashMap<String, Port>>,
         baud: u32,
         concurrency: usize,
         firmware: Arc<PreparedFirmware>,
@@ -59,19 +95,13 @@ impl Batch {
         ensure!(
             ports
                 .iter()
-                .map(|p| {
-                    if cfg!(windows) {
-                        p.strip_prefix("\\\\.\\").unwrap_or(p).to_ascii_uppercase()
-                    } else {
-                        p.clone()
-                    }
-                })
+                .map(|port| backend::port_name_key(port))
                 .collect::<HashSet<_>>()
                 .len()
                 == ports.len(),
             "同一串口不能重复排队"
         );
-        let fw = firmware.clone();
+        let fw = firmware;
         Ok(start_workers(ports, concurrency, move |port, tx| {
             let chip_label = fw.chip.label();
             let mut last_state = JobState::Connecting;
@@ -102,13 +132,42 @@ impl Batch {
                     progress,
                 });
             };
-            backend::flash(port, baud, &fw, &mut callback)
+            if let Some(expected) = &expected {
+                let snapshot = expected
+                    .get(&backend::port_name_key(port))
+                    .context("本批设备身份快照丢失，已停止任务")?;
+                backend::flash_expected(snapshot, baud, &fw, &mut callback)
+            } else {
+                backend::flash(port, baud, &fw, &mut callback)
+            }
         }))
     }
 
     pub fn cancel_queued(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        self.queue
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .cancelled = true;
     }
+
+    /// Permanently reject a not-yet-started task after a successful scan
+    /// observes its selected device disappear or change identity. Reconnection
+    /// cannot restore this batch's eligibility. Active writes are untouched.
+    pub fn invalidate_queued_port(&self, port: &str, reason: impl Into<String>) {
+        let key = backend::port_name_key(port);
+        let mut queue = self.queue.lock().unwrap_or_else(|error| error.into_inner());
+        if queue
+            .pending
+            .iter()
+            .any(|pending| backend::port_name_key(pending) == key)
+        {
+            queue
+                .invalidated
+                .entry(key)
+                .or_insert_with(|| reason.into());
+        }
+    }
+
     pub fn is_running(&self) -> bool {
         self.remaining.load(Ordering::SeqCst) > 0
     }
@@ -129,26 +188,44 @@ where
     }
     let worker_count = concurrency.min(ports.len());
     let remaining = Arc::new(AtomicUsize::new(ports.len()));
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let queue = Arc::new(Mutex::new(VecDeque::from(ports)));
+    let queue = Arc::new(Mutex::new(QueueState {
+        pending: VecDeque::from(ports),
+        invalidated: HashMap::new(),
+        cancelled: false,
+    }));
     let operation = Arc::new(operation);
     for _ in 0..worker_count {
-        let (queue, remaining, cancelled, tx, operation) = (
+        let (queue, remaining, tx, operation) = (
             queue.clone(),
             remaining.clone(),
-            cancelled.clone(),
             tx.clone(),
             operation.clone(),
         );
         thread::spawn(move || {
             loop {
-                let port = queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
-                let Some(port) = port else { break };
-                let result = if cancelled.load(Ordering::SeqCst) {
+                // Claiming a task as active and reading its cancellation/identity
+                // guards share one lock with GUI invalidation. No invalidation can
+                // race between a pending-task check and its active transition.
+                let (port, rejection) = {
+                    let mut queue = queue.lock().unwrap_or_else(|error| error.into_inner());
+                    let Some(port) = queue.pending.pop_front() else {
+                        break;
+                    };
+                    let key = backend::port_name_key(&port);
+                    let rejection = if let Some(reason) = queue.invalidated.get(&key) {
+                        Some((JobState::Failed, reason.clone()))
+                    } else if queue.cancelled {
+                        Some((JobState::Cancelled, "已停止排队，未写入".into()))
+                    } else {
+                        None
+                    };
+                    (port, rejection)
+                };
+                let result = if let Some((state, message)) = rejection {
                     BatchEvent {
                         port,
-                        state: JobState::Cancelled,
-                        message: "已停止排队，未写入".into(),
+                        state,
+                        message,
                         progress: 0.0,
                     }
                 } else {
@@ -186,7 +263,7 @@ where
     }
     Batch {
         receiver,
-        cancelled,
+        queue,
         remaining,
     }
 }
@@ -278,5 +355,48 @@ mod tests {
             states,
             [JobState::Success, JobState::Cancelled, JobState::Cancelled]
         );
+    }
+
+    #[test]
+    fn invalidated_queued_device_never_opens_but_active_and_other_jobs_finish() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let barrier = Arc::new(Barrier::new(2));
+        let gate = barrier.clone();
+        let invoked = Arc::new(Mutex::new(Vec::new()));
+        let calls = invoked.clone();
+        let batch = start_workers(
+            vec!["COM1".into(), "COM2".into(), "COM3".into()],
+            1,
+            move |port, _| {
+                calls.lock().unwrap().push(port.to_owned());
+                if port == "COM1" {
+                    started_tx.send(()).unwrap();
+                    gate.wait();
+                }
+                Ok(())
+            },
+        );
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        batch.invalidate_queued_port("COM1", "active write must not be interrupted");
+        batch.invalidate_queued_port("COM2", "selected device disconnected before start");
+        // A later observation/reconnection cannot overwrite or restore this
+        // batch's first invalidation. A new batch and explicit selection are required.
+        batch.invalidate_queued_port("COM2", "later observation");
+        barrier.wait();
+        let mut results = HashMap::new();
+        while results.len() < 3 {
+            let event = batch.receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+            if terminal(&event.state) {
+                results.insert(event.port.clone(), event);
+            }
+        }
+        assert_eq!(results["COM1"].state, JobState::Success);
+        assert_eq!(results["COM2"].state, JobState::Failed);
+        assert_eq!(
+            results["COM2"].message,
+            "selected device disconnected before start"
+        );
+        assert_eq!(results["COM3"].state, JobState::Success);
+        assert_eq!(*invoked.lock().unwrap(), ["COM1", "COM3"]);
     }
 }

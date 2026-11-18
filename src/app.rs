@@ -10,9 +10,10 @@ use std::{
 use chrono::Local;
 use eframe::egui::{self, Color32, RichText};
 use esp32c3_flashtool::{
-    backend::{self, Port},
+    backend::Port,
     batch::{Batch, BatchEvent, JobState},
     chip::ChipModel,
+    device_scan::DeviceScanner,
     drivers::{self, DriverKind},
     firmware::{FirmwareInput, prepare_firmware},
     updater::{self, CheckResult, ReleaseUpdate, UpdateSettings},
@@ -54,6 +55,7 @@ impl FirmwareRow {
 struct PortRow {
     port: Port,
     selected: bool,
+    online: bool,
 }
 
 struct JobRow {
@@ -72,9 +74,14 @@ pub struct FlashApp {
     batch_chip: ChipModel,
     chip_picker_open: bool,
     driver_dialog_open: bool,
+    pending_driver_license: Option<DriverKind>,
     layout: FirmwareLayout,
     firmware: Vec<FirmwareRow>,
     ports: Vec<PortRow>,
+    scanner: DeviceScanner,
+    auto_refresh: bool,
+    next_scan_at: Instant,
+    scan_error: Option<String>,
     baud: u32,
     concurrency: usize,
     batch: Option<Batch>,
@@ -89,6 +96,7 @@ pub struct FlashApp {
     firmware_hash: String,
     batch_firmware: String,
     batch_started: String,
+    batch_port_identities: BTreeMap<String, String>,
     logs_visible: bool,
     update_dialog_open: bool,
     update_settings: UpdateSettings,
@@ -147,15 +155,21 @@ impl FlashApp {
                 Some(format!("无法读取更新设置：{error:#}")),
             ),
         };
+        let repaint = cc.egui_ctx.clone();
         let mut app = Self {
             selected_chip: ChipModel::default(),
             pending_chip: ChipModel::default(),
             batch_chip: ChipModel::default(),
             chip_picker_open: false,
             driver_dialog_open: false,
+            pending_driver_license: None,
             layout: FirmwareLayout::Merged,
             firmware: vec![FirmwareRow::empty("合并固件", "0x0")],
             ports: Vec::new(),
+            scanner: DeviceScanner::new(move || repaint.request_repaint()),
+            auto_refresh: true,
+            next_scan_at: Instant::now(),
+            scan_error: None,
             baud: 460_800,
             concurrency: 4,
             batch: None,
@@ -170,7 +184,8 @@ impl FlashApp {
             firmware_hash: String::new(),
             batch_firmware: String::new(),
             batch_started: String::new(),
-            logs_visible: false,
+            batch_port_identities: BTreeMap::new(),
+            logs_visible: true,
             update_dialog_open: false,
             update_settings,
             update_settings_error,
@@ -206,6 +221,7 @@ impl FlashApp {
     fn open_update_dialog(&mut self) {
         self.chip_picker_open = false;
         self.driver_dialog_open = false;
+        self.pending_driver_license = None;
         self.update_dialog_open = true;
     }
 
@@ -322,11 +338,10 @@ impl FlashApp {
                     });
                 });
                 ui.add_space(14.0);
-                // Keep the subscription controls outside the scrolling content.
-                // Reserve their full height even in the minimum 720px window.
+                // Keep the title and close action outside scrollable release details.
                 egui::ScrollArea::vertical()
                     .id_salt("update_dialog_content")
-                    .max_height((ctx.screen_rect().height() - 420.0).max(180.0))
+                    .max_height((ctx.screen_rect().height() - 200.0).max(300.0))
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         egui::Frame::new()
@@ -455,8 +470,6 @@ impl FlashApp {
                             });
                         }
                     });
-                ui.add_space(14.0);
-                mail_subscription_footer(ui, ctx);
             });
         if close || response.should_close() {
             self.update_dialog_open = false;
@@ -469,33 +482,41 @@ impl FlashApp {
     }
 
     fn scan_ports(&mut self) {
-        // A newly seen/replaced port must be explicitly selected before flashing.
-        let previous: HashMap<_, _> = self
-            .ports
-            .iter()
-            .map(|r| {
-                (
-                    (r.port.name.clone(), r.port.description.clone()),
-                    r.selected,
-                )
-            })
-            .collect();
-        match backend::list_ports() {
-            Ok(ports) => {
-                self.ports = ports
-                    .into_iter()
-                    .map(|port| {
-                        let selected = previous
-                            .get(&(port.name.clone(), port.description.clone()))
-                            .copied()
-                            .unwrap_or(false);
-                        PortRow { port, selected }
-                    })
-                    .collect();
-                self.last_scan = timestamp();
-                self.error = None;
+        if self.scanner.request_scan() {
+            self.next_scan_at = Instant::now() + Duration::from_secs(2);
+        }
+    }
+
+    fn poll_ports(&mut self) {
+        if let Some(result) = self.scanner.poll() {
+            if let (Ok(observed), Some(batch)) = (&result, &self.batch) {
+                for (name, identity) in &self.batch_port_identities {
+                    if !observed
+                        .iter()
+                        .any(|port| &port.name == name && &port.identity == identity)
+                    {
+                        batch.invalidate_queued_port(
+                            name,
+                            "原设备已离线或串口身份改变，取消本批排队任务；请重新勾选后启动新批次",
+                        );
+                    }
+                }
             }
-            Err(err) => self.error = Some(format!("读取串口失败：{err:#}")),
+            let success = result.is_ok();
+            let (ports, error) = reconcile_scan_result(
+                std::mem::take(&mut self.ports),
+                result.map_err(|error| format!("串口扫描失败：{error:#}")),
+                &self.batch_port_identities,
+            );
+            self.ports = ports;
+            self.scan_error = error;
+            if success {
+                self.last_scan = Local::now().format("%H:%M:%S").to_string();
+            }
+            self.next_scan_at = Instant::now() + Duration::from_secs(2);
+        }
+        if self.auto_refresh && Instant::now() >= self.next_scan_at {
+            self.scan_ports();
         }
     }
 
@@ -505,11 +526,11 @@ impl FlashApp {
         let ports: Vec<_> = self
             .ports
             .iter()
-            .filter(|r| r.selected)
-            .map(|r| r.port.name.clone())
+            .filter(|r| r.selected && r.online)
+            .map(|r| r.port.clone())
             .collect();
         if ports.is_empty() {
-            self.error = Some("请先勾选需要烧录的串口。".into());
+            self.error = Some("请先勾选在线的待烧录串口。".into());
             return;
         }
         let mut inputs = Vec::new();
@@ -549,7 +570,13 @@ impl FlashApp {
             .collect::<Vec<_>>()
             .join("; ");
         let expected_jobs = ports.len();
-        match Batch::start(ports, self.baud, self.concurrency, Arc::new(firmware)) {
+        let batch_port_identities = self
+            .ports
+            .iter()
+            .filter(|row| row.selected && row.online)
+            .map(|row| (row.port.name.clone(), row.port.identity.clone()))
+            .collect();
+        match Batch::start_guarded(ports, self.baud, self.concurrency, Arc::new(firmware)) {
             Ok(batch) => {
                 self.jobs.clear();
                 self.expected_jobs = expected_jobs;
@@ -557,6 +584,7 @@ impl FlashApp {
                 self.firmware_hash = firmware_hash;
                 self.batch_firmware = batch_firmware;
                 self.batch_chip = self.selected_chip;
+                self.batch_port_identities = batch_port_identities;
                 self.batch_started = timestamp();
                 self.batch = Some(batch);
                 self.log(
@@ -609,7 +637,12 @@ impl FlashApp {
                 row.duration_secs = row.elapsed.map(|start| start.elapsed().as_secs_f64());
             }
             row.state = state.clone();
-            row.progress = progress.clamp(0.0, 1.0);
+            let progress = progress.clamp(0.0, 1.0);
+            row.progress = if state == JobState::Failed {
+                row.progress.max(progress)
+            } else {
+                progress
+            };
             row.message = message.clone();
             if changed && state != JobState::Writing {
                 self.log(format!("[{port}] {}  {message}", state_label(&state)));
@@ -653,6 +686,68 @@ impl FlashApp {
             };
             let _ = sender.send(result.map_err(|err| format!("驱动安装失败：{err:#}")));
         });
+    }
+
+    fn request_bundled_driver(&mut self, kind: DriverKind) {
+        if drivers::bundled_license_text(kind).is_some() {
+            self.driver_dialog_open = false;
+            self.pending_driver_license = Some(kind);
+        } else {
+            self.install_driver(kind, None);
+        }
+    }
+
+    fn driver_license_dialog(&mut self, ctx: &egui::Context) {
+        let Some(kind) = self.pending_driver_license else {
+            return;
+        };
+        let Some(license) = drivers::bundled_license_text(kind) else {
+            self.pending_driver_license = None;
+            self.error = Some("内置驱动许可不可用，请重新打开驱动管理。".into());
+            return;
+        };
+        let mut accept = false;
+        let mut cancel = false;
+        let response = egui::Modal::new(egui::Id::new("driver_license"))
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::WHITE)
+                    .corner_radius(16.0)
+                    .inner_margin(24.0),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(640.0);
+                ui.label(RichText::new("CP210x 驱动许可").size(22.0).strong());
+                ui.label(
+                    RichText::new("安装前请阅读驱动包随附的原厂许可。")
+                        .size(12.0)
+                        .color(MUTED),
+                );
+                ui.add_space(10.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("driver_license_text")
+                    .max_height((ctx.screen_rect().height() - 300.0).max(200.0))
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(license).monospace().size(11.0)).wrap(),
+                        );
+                    });
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if primary_button(ui, "接受许可并安装", [166.0, 39.0]).clicked() {
+                        accept = true;
+                    }
+                    if secondary_button(ui, "取消", [84.0, 39.0]).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if accept {
+            self.pending_driver_license = None;
+            self.install_driver(kind, None);
+        } else if cancel || response.should_close() {
+            self.pending_driver_license = None;
+        }
     }
 
     fn apply_chip(&mut self, chip: ChipModel) {
@@ -847,16 +942,19 @@ impl FlashApp {
             );
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let color = if self.ports.is_empty() {
+                let color = if self.ports.iter().all(|row| !row.online) {
                     Color32::from_rgb(105, 123, 145)
                 } else {
                     Color32::from_rgb(76, 204, 173)
                 };
                 dot(ui, color, 6.0);
                 ui.label(
-                    RichText::new(format!("{} 个串口在线", self.ports.len()))
-                        .size(12.0)
-                        .color(Color32::from_rgb(168, 188, 207)),
+                    RichText::new(format!(
+                        "{} 个串口在线",
+                        self.ports.iter().filter(|row| row.online).count()
+                    ))
+                    .size(12.0)
+                    .color(Color32::from_rgb(168, 188, 207)),
                 );
             });
         });
@@ -866,14 +964,14 @@ impl FlashApp {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(
-                    RichText::new("批量烧录工作台")
+                    RichText::new("设备烧录工作台")
                         .size(27.0)
                         .strong()
                         .color(INK),
                 );
                 ui.add_space(3.0);
                 ui.label(
-                    RichText::new("连接设备，选择固件，一次完成整批烧录。")
+                    RichText::new("每个 COM 独立进度，整批设备一目了然。")
                         .size(13.0)
                         .color(MUTED),
                 );
@@ -894,7 +992,7 @@ impl FlashApp {
                     ("批次运行中", ACCENT)
                 } else if self.driver_busy {
                     ("驱动安装中", ACCENT)
-                } else if self.ports.is_empty() {
+                } else if self.ports.iter().all(|row| !row.online) {
                     ("等待连接设备", MUTED)
                 } else {
                     ("设备已就绪", ACCENT)
@@ -905,40 +1003,19 @@ impl FlashApp {
     }
 
     fn chip_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            egui::Frame::new()
-                .fill(ACCENT_LIGHT)
-                .corner_radius(12.0)
-                .inner_margin(15.0)
-                .show(ui, |ui| {
-                    icon(ui, Icon::Chip, 30.0, ACCENT);
-                });
-            ui.vertical(|ui| {
-                ui.label(RichText::new("目标芯片").size(12.0).color(MUTED));
-                ui.label(
-                    RichText::new(self.selected_chip.label())
-                        .size(23.0)
-                        .strong()
-                        .color(INK),
-                );
-                ui.label(
-                    RichText::new(format!(
-                        "分段 Bootloader 默认地址 0x{:X}",
-                        self.selected_chip.bootloader_address()
-                    ))
-                    .size(12.0)
-                    .color(MUTED),
-                );
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if secondary_button(ui, "选择芯片  >", [112.0, 38.0]).clicked() {
-                    self.pending_chip = self.selected_chip;
-                    self.driver_dialog_open = false;
-                    self.update_dialog_open = false;
-                    self.chip_picker_open = true;
-                }
-            });
-        });
+        ui.label(RichText::new("目标芯片").size(11.0).color(MUTED));
+        if secondary_button(
+            ui,
+            &format!("{}  >", self.selected_chip.label()),
+            [132.0, 32.0],
+        )
+        .clicked()
+        {
+            self.pending_chip = self.selected_chip;
+            self.driver_dialog_open = false;
+            self.update_dialog_open = false;
+            self.chip_picker_open = true;
+        }
     }
 
     fn chip_dialog(&mut self, ctx: &egui::Context) {
@@ -1048,9 +1125,15 @@ impl FlashApp {
     }
 
     fn firmware_panel(&mut self, ui: &mut egui::Ui) {
-        panel_title(ui, Icon::File, "固件配置", "01");
-        ui.add_space(12.0);
         ui.horizontal(|ui| {
+            panel_title(ui, Icon::File, "本批烧录配置", "01");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.chip_panel(ui)
+            });
+        });
+        ui.add_space(5.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
             for (layout, label) in [
                 (FirmwareLayout::Merged, "合并固件"),
                 (FirmwareLayout::Segments, "分段固件"),
@@ -1058,7 +1141,7 @@ impl FlashApp {
                 let selected = self.layout == layout;
                 if ui
                     .add(
-                        egui::Button::new(RichText::new(label).color(if selected {
+                        egui::Button::new(RichText::new(label).size(12.0).color(if selected {
                             ACCENT
                         } else {
                             MUTED
@@ -1069,196 +1152,227 @@ impl FlashApp {
                             Color32::WHITE
                         })
                         .stroke(egui::Stroke::NONE)
-                        .corner_radius(7.0)
-                        .min_size(egui::vec2(106.0, 33.0)),
+                        .corner_radius(6.0)
+                        .min_size(egui::vec2(84.0, 30.0)),
                     )
                     .clicked()
                 {
                     self.set_layout(layout);
                 }
             }
-        });
-        ui.add_space(5.0);
-        let mut remove = None;
-        let single = self.firmware.len() == 1 && self.layout == FirmwareLayout::Merged;
-        for (index, row) in self.firmware.iter_mut().enumerate() {
-            ui.push_id(index, |ui| {
-                if !single {
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut row.enabled, row.label);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if text_button(ui, "移除").clicked() {
-                                remove = Some(index);
-                            }
-                        });
-                    });
-                }
-                if file_picker(ui, &row.path, single).clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("固件 BIN", &["bin"])
-                        .add_filter("所有文件", &["*"])
-                        .pick_file()
-                {
-                    row.path = path;
-                }
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("写入地址").size(12.0).color(MUTED));
-                    ui.add_sized(
-                        [100.0, 30.0],
-                        egui::TextEdit::singleline(&mut row.address)
-                            .font(egui::TextStyle::Monospace)
-                            .margin(egui::vec2(9.0, 6.0)),
-                    );
-                    ui.label(RichText::new("HEX").monospace().size(10.0).color(MUTED));
-                    if single {
-                        ui.label(RichText::new("合并 BIN 通常为 0x0").size(11.0).color(MUTED));
+            ui.separator();
+            ui.label(RichText::new("波特率").size(11.0).color(MUTED));
+            egui::ComboBox::from_id_salt("baud")
+                .selected_text(self.baud.to_string())
+                .width(101.0)
+                .show_ui(ui, |ui| {
+                    for baud in [115_200, 460_800, 921_600] {
+                        ui.selectable_value(&mut self.baud, baud, baud.to_string());
                     }
                 });
-                if !single {
-                    ui.add_space(8.0);
-                }
+            ui.label(RichText::new("并发").size(11.0).color(MUTED));
+            ui.add_sized(
+                [76.0, 30.0],
+                egui::DragValue::new(&mut self.concurrency)
+                    .range(1..=16)
+                    .suffix(" 台"),
+            );
+            if self.layout == FirmwareLayout::Segments && text_button(ui, "+ 添加固件段").clicked()
+            {
+                self.firmware.push(FirmwareRow::empty("自定义固件", "0x0"));
+            }
+        });
+        ui.add_space(3.0);
+        let mut remove = None;
+        let segmented = self.layout == FirmwareLayout::Segments;
+        for (index, row) in self.firmware.iter_mut().enumerate() {
+            ui.push_id(index, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut row.enabled, "");
+                    if segmented {
+                        ui.add_sized(
+                            [75.0, 22.0],
+                            egui::Label::new(RichText::new(row.label).size(11.0)),
+                        );
+                    }
+                    let width =
+                        (ui.available_width() - if segmented { 190.0 } else { 160.0 }).max(160.0);
+                    if ui
+                        .allocate_ui_with_layout(
+                            egui::vec2(width, 48.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| file_picker(ui, &row.path, false),
+                        )
+                        .inner
+                        .clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .add_filter("固件 BIN", &["bin"])
+                            .add_filter("所有文件", &["*"])
+                            .pick_file()
+                    {
+                        row.path = path;
+                    }
+                    ui.label(RichText::new("地址").size(11.0).color(MUTED));
+                    ui.add_sized(
+                        [89.0, 30.0],
+                        egui::TextEdit::singleline(&mut row.address)
+                            .font(egui::TextStyle::Monospace)
+                            .margin(egui::vec2(7.0, 6.0)),
+                    );
+                    if segmented && text_button(ui, "移除").clicked() {
+                        remove = Some(index);
+                    }
+                });
             });
         }
         if let Some(index) = remove {
             self.firmware.remove(index);
         }
-        if self.layout == FirmwareLayout::Segments && text_button(ui, "+ 添加固件段").clicked()
-        {
-            self.firmware.push(FirmwareRow::empty("自定义固件", "0x0"));
-        }
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(6.0);
-        ui.columns(2, |columns| {
-            columns[0].label(RichText::new("波特率").size(12.0).color(MUTED));
-            egui::ComboBox::from_id_salt("baud")
-                .selected_text(self.baud.to_string())
-                .width(columns[0].available_width() - 10.0)
-                .show_ui(&mut columns[0], |ui| {
-                    for baud in [115_200, 460_800, 921_600] {
-                        ui.selectable_value(&mut self.baud, baud, baud.to_string());
-                    }
-                });
-            columns[1].label(RichText::new("并发设备数").size(12.0).color(MUTED));
-            let width = columns[1].available_width();
-            columns[1].add_sized(
-                [width, 32.0],
-                egui::DragValue::new(&mut self.concurrency)
-                    .range(1..=16)
-                    .suffix(" 台"),
-            );
-        });
-        ui.add_space(5.0);
         ui.label(
-            RichText::new("USB Hub 建议从 4 台并发开始。")
-                .size(11.0)
-                .color(MUTED),
+            RichText::new(format!(
+                "HEX 写入地址 · {} Bootloader 默认 0x{:X} · USB Hub 建议从 4 台并发开始",
+                self.selected_chip.label(),
+                self.selected_chip.bootloader_address()
+            ))
+            .size(10.0)
+            .color(MUTED),
         );
     }
 
     fn ports_panel(&mut self, ui: &mut egui::Ui) {
+        let locked = self.busy();
+        let online = self.ports.iter().filter(|row| row.online).count();
+        let selected = self
+            .ports
+            .iter()
+            .filter(|row| row.selected && row.online)
+            .count();
         ui.horizontal(|ui| {
-            panel_title(ui, Icon::Usb, "设备连接", "02");
+            panel_title(ui, Icon::Usb, "设备工位", "02");
+            ui.label(
+                RichText::new(format!("在线 {online}  /  已选 {selected}"))
+                    .size(11.0)
+                    .color(MUTED),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if secondary_button(ui, "刷新", [62.0, 30.0]).clicked() {
+                if ui
+                    .add_enabled_ui(!self.scanner.is_scanning(), |ui| {
+                        secondary_button(ui, "刷新串口", [88.0, 31.0])
+                    })
+                    .inner
+                    .clicked()
+                {
+                    self.scan_ports();
+                }
+                if ui
+                    .checkbox(
+                        &mut self.auto_refresh,
+                        RichText::new("自动识别 · 2 秒").size(11.0),
+                    )
+                    .changed()
+                    && self.auto_refresh
+                {
                     self.scan_ports();
                 }
             });
         });
-        if self.ports.is_empty() {
-            ui.add_space(24.0);
-            ui.vertical_centered(|ui| {
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 68.0),
-                    egui::Sense::hover(),
-                );
-                ui.painter().circle_filled(rect.center(), 33.0, BACKGROUND);
-                paint_icon(
-                    ui.painter(),
-                    rect.center(),
-                    30.0,
-                    Icon::Usb,
-                    Color32::from_rgb(144, 161, 180),
-                );
-                ui.add_space(5.0);
-                ui.label(RichText::new("等待设备连接").size(18.0).strong().color(INK));
-                ui.add_space(3.0);
-                ui.label(
-                    RichText::new("连接 USB Hub 与待烧录设备，\n然后刷新串口列表。")
-                        .size(13.0)
-                        .color(MUTED),
-                );
-                ui.add_space(20.0);
-                status_pill(ui, "尚未发现串口", MUTED);
-            });
-            ui.add_space(20.0);
-        } else {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if text_button(ui, "选择已识别 USB 串口").clicked() {
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled_ui(!locked, |ui| {
+                if text_button(ui, "选择已识别 USB").clicked() {
                     for row in &mut self.ports {
-                        row.selected = row.port.usb && row.port.suggested;
+                        row.selected = row.online && row.port.usb && row.port.suggested;
                     }
                 }
-                if text_button(ui, "清空").clicked() {
+                if text_button(ui, "清空选择").clicked() {
                     for row in &mut self.ports {
                         row.selected = false;
                     }
                 }
             });
-            egui::ScrollArea::vertical()
-                .id_salt("ports_scroll")
-                .max_height(255.0)
+            if self.scanner.is_scanning() {
+                ui.spinner();
+                ui.label(RichText::new("正在后台扫描").size(10.0).color(MUTED));
+            } else if !self.last_scan.is_empty() {
+                ui.label(
+                    RichText::new(format!("上次识别 {}", self.last_scan))
+                        .size(10.0)
+                        .color(MUTED),
+                );
+            }
+        });
+        if let Some(error) = &self.scan_error {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("{error}；保留上次设备状态。"))
+                        .size(11.0)
+                        .color(DANGER),
+                )
+                .wrap(),
+            );
+        }
+        if self.ports.is_empty() {
+            egui::Frame::new()
+                .fill(BACKGROUND)
+                .corner_radius(9.0)
+                .inner_margin(20.0)
                 .show(ui, |ui| {
-                    for row in &mut self.ports {
-                        egui::Frame::new()
-                            .fill(if row.selected {
-                                ACCENT_LIGHT
-                            } else {
-                                BACKGROUND
-                            })
-                            .corner_radius(8.0)
-                            .inner_margin(11.0)
-                            .show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-                                ui.horizontal(|ui| {
-                                    ui.checkbox(
-                                        &mut row.selected,
-                                        RichText::new(&row.port.name).strong().size(15.0),
-                                    );
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if row.port.usb {
-                                                ui.label(
-                                                    RichText::new("USB")
-                                                        .monospace()
-                                                        .size(10.0)
-                                                        .color(ACCENT),
-                                                );
-                                            }
-                                        },
-                                    );
-                                });
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&row.port.description)
-                                            .size(11.0)
-                                            .color(MUTED),
-                                    )
-                                    .wrap(),
-                                );
-                            });
-                        ui.add_space(5.0);
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        icon(ui, Icon::Usb, 29.0, Color32::from_rgb(137, 158, 180));
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(if self.scanner.is_scanning() {
+                                    "正在识别 COM 设备"
+                                } else {
+                                    "尚未发现 COM 设备"
+                                })
+                                .size(16.0)
+                                .strong(),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "连接 USB Hub 与设备后会自动识别；首次使用可先安装串口驱动。",
+                                )
+                                .size(11.0)
+                                .color(MUTED),
+                            );
+                        });
+                    });
+                });
+        } else {
+            let columns = if ui.available_width() >= 780.0 { 3 } else { 2 };
+            let jobs = &self.jobs;
+            let batch_ports = &self.batch_port_identities;
+            egui::ScrollArea::vertical()
+                .id_salt("device_workstations")
+                .max_height(360.0)
+                .show(ui, |ui| {
+                    for chunk in self.ports.chunks_mut(columns) {
+                        ui.columns(columns, |uis| {
+                            for (index, row) in chunk.iter_mut().enumerate() {
+                                let in_batch =
+                                    batch_ports.get(&row.port.name) == Some(&row.port.identity);
+                                let job = if in_batch {
+                                    jobs.get(&row.port.name)
+                                } else {
+                                    None
+                                };
+                                device_tile(&mut uis[index], row, job, in_batch, locked);
+                            }
+                        });
+                        ui.add_space(7.0);
                     }
                 });
         }
-        ui.separator();
-        ui.add_space(3.0);
+        ui.add_space(4.0);
         ui.label(
-            RichText::new("仅勾选本批待烧录设备，新接入串口不会自动选中。")
-                .size(11.0)
-                .color(MUTED),
+            RichText::new(if self.running() {
+                "本批端口已锁定。新接入设备不会加入当前批次；离线设备保留状态与进度。"
+            } else {
+                "新识别的端口不会自动勾选。勾选在线设备后开始烧录。"
+            })
+            .size(10.0)
+            .color(MUTED),
         );
     }
 
@@ -1293,7 +1407,7 @@ impl FlashApp {
                                     if available {
                                         if secondary_button(ui, "安装驱动", [86.0, 34.0]).clicked()
                                         {
-                                            self.install_driver(kind, None);
+                                            self.request_bundled_driver(kind);
                                         }
                                     } else if secondary_button(ui, "选择 ZIP", [86.0, 34.0])
                                         .on_hover_text(
@@ -1360,7 +1474,11 @@ impl FlashApp {
 
     fn actions_panel(&mut self, ui: &mut egui::Ui) {
         let running = self.running();
-        let selected = self.ports.iter().filter(|row| row.selected).count();
+        let selected = self
+            .ports
+            .iter()
+            .filter(|row| row.selected && row.online)
+            .count();
         let success = self
             .jobs
             .values()
@@ -1375,7 +1493,7 @@ impl FlashApp {
             ui.vertical(|ui| {
                 if self.jobs.is_empty() {
                     ui.label(
-                        RichText::new(format!("已选择 {selected} 台设备"))
+                        RichText::new(format!("已选择 {selected} 台在线设备"))
                             .size(16.0)
                             .strong(),
                     );
@@ -1437,129 +1555,88 @@ impl FlashApp {
         });
     }
 
-    fn results_panel(&mut self, ui: &mut egui::Ui) {
+    fn logs_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            panel_title(ui, Icon::Grid, "批次记录", "04");
-            ui.label(
-                RichText::new(format!(
-                    "{} · {}",
-                    self.batch_chip.label(),
-                    self.batch_started
-                ))
-                .size(11.0)
-                .color(MUTED),
-            );
-        });
-        ui.add_space(10.0);
-        egui::ScrollArea::vertical()
-            .id_salt("results_scroll")
-            .max_height(310.0)
-            .show(ui, |ui| {
-                for (port, row) in &self.jobs {
-                    let color = match row.state {
-                        JobState::Success => ACCENT,
-                        JobState::Failed => DANGER,
-                        _ => MUTED,
-                    };
-                    egui::Frame::new()
-                        .fill(BACKGROUND)
-                        .corner_radius(8.0)
-                        .inner_margin(12.0)
-                        .show(ui, |ui| {
-                            ui.set_min_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(port).monospace().size(15.0).strong());
-                                status_pill(ui, state_label(&row.state), color);
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        let elapsed = row.duration_secs.or_else(|| {
-                                            row.elapsed.map(|i| i.elapsed().as_secs_f64())
-                                        });
-                                        if let Some(elapsed) = elapsed {
-                                            ui.label(
-                                                RichText::new(format!("{elapsed:.1} s"))
-                                                    .size(11.0)
-                                                    .color(MUTED),
-                                            );
-                                        }
-                                    },
-                                );
-                            });
-                            ui.add(
-                                egui::ProgressBar::new(row.progress)
-                                    .desired_width(ui.available_width())
-                                    .desired_height(5.0)
-                                    .fill(color),
-                            );
-                            ui.add(
-                                egui::Label::new(RichText::new(&row.message).size(12.0).color(
-                                    if row.state == JobState::Failed {
-                                        DANGER
-                                    } else {
-                                        MUTED
-                                    },
-                                ))
-                                .wrap(),
-                            );
-                        });
-                    ui.add_space(5.0);
-                }
-            });
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if text_button(
-                ui,
-                if self.logs_visible {
-                    "收起运行日志"
-                } else {
-                    "查看运行日志"
-                },
-            )
-            .clicked()
-            {
-                self.logs_visible = !self.logs_visible;
-            }
+            panel_title(ui, Icon::Grid, "运行日志", "03");
             ui.label(
                 RichText::new(format!("{} 条", self.logs.len()))
-                    .size(11.0)
+                    .size(10.0)
                     .color(MUTED),
             );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled_ui(!self.logs.is_empty(), |ui| {
+                        secondary_button(ui, "清空日志", [88.0, 29.0])
+                    })
+                    .inner
+                    .clicked()
+                {
+                    self.logs.clear();
+                }
+                if text_button(
+                    ui,
+                    if self.logs_visible {
+                        "收起"
+                    } else {
+                        "展开"
+                    },
+                )
+                .clicked()
+                {
+                    self.logs_visible = !self.logs_visible;
+                }
+                if !self.jobs.is_empty() && text_button(ui, "导出本批 CSV").clicked() {
+                    self.export_csv();
+                }
+            });
         });
+        if !self.jobs.is_empty() {
+            ui.label(
+                RichText::new(format!(
+                    "本批 {} · {} · 固件 SHA256 {}…",
+                    self.batch_chip.label(),
+                    self.batch_started,
+                    self.firmware_hash.chars().take(12).collect::<String>()
+                ))
+                .size(10.0)
+                .color(MUTED),
+            )
+            .on_hover_text(&self.firmware_hash);
+        }
         if self.logs_visible {
+            ui.add_space(4.0);
             egui::Frame::new()
                 .fill(NAVY)
                 .corner_radius(8.0)
-                .inner_margin(13.0)
+                .inner_margin(11.0)
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
+                    ui.set_min_height(52.0);
                     egui::ScrollArea::vertical()
                         .id_salt("logs_scroll")
-                        .max_height(165.0)
+                        .max_height(145.0)
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
-                            for line in &self.logs {
+                            if self.logs.is_empty() {
                                 ui.label(
-                                    RichText::new(line)
-                                        .monospace()
+                                    RichText::new("暂无日志，新的任务事件会显示在这里。")
                                         .size(11.0)
-                                        .color(Color32::from_rgb(186, 210, 217)),
+                                        .color(Color32::from_rgb(126, 149, 172)),
+                                );
+                            }
+                            for line in &self.logs {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(line)
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(Color32::from_rgb(190, 215, 221)),
+                                    )
+                                    .wrap(),
                                 );
                             }
                         });
                 });
-        }
-        if !self.firmware_hash.is_empty() {
-            ui.add_space(5.0);
-            ui.add(
-                egui::Label::new(
-                    RichText::new(format!("SHA256  {}", self.firmware_hash))
-                        .monospace()
-                        .size(10.0)
-                        .color(MUTED),
-                )
-                .wrap(),
-            );
         }
     }
 
@@ -1624,6 +1701,7 @@ impl eframe::App for FlashApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.collect_events();
         self.collect_update_events();
+        self.poll_ports();
         let busy = self.busy();
         if ctx.input(|input| input.viewport().close_requested()) && busy {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1656,7 +1734,7 @@ impl eframe::App for FlashApp {
             )
             .show(ctx, |ui| {
                 self.heading(ui);
-                ui.add_space(21.0);
+                ui.add_space(15.0);
                 egui::ScrollArea::vertical()
                     .id_salt("workspace_content")
                     .auto_shrink([false, false])
@@ -1670,43 +1748,210 @@ impl eframe::App for FlashApp {
                             ui.add_space(12.0);
                         }
                         card(ui, |ui| {
-                            ui.add_enabled_ui(!busy, |ui| self.chip_panel(ui));
+                            ui.add_enabled_ui(!busy, |ui| self.firmware_panel(ui));
                         });
-                        ui.add_space(16.0);
-                        if ui.available_width() >= 800.0 {
-                            ui.columns(2, |columns| {
-                                card(&mut columns[0], |ui| {
-                                    ui.add_enabled_ui(!busy, |ui| self.firmware_panel(ui));
-                                });
-                                card(&mut columns[1], |ui| {
-                                    ui.add_enabled_ui(!busy, |ui| self.ports_panel(ui));
-                                });
-                            });
-                        } else {
-                            card(ui, |ui| {
-                                ui.add_enabled_ui(!busy, |ui| self.firmware_panel(ui));
-                            });
-                            ui.add_space(16.0);
-                            card(ui, |ui| {
-                                ui.add_enabled_ui(!busy, |ui| self.ports_panel(ui));
-                            });
-                        }
-                        if !self.jobs.is_empty() {
-                            ui.add_space(16.0);
-                            card(ui, |ui| self.results_panel(ui));
-                        }
+                        ui.add_space(12.0);
+                        card(ui, |ui| self.ports_panel(ui));
+                        ui.add_space(12.0);
+                        card(ui, |ui| self.logs_panel(ui));
                         ui.add_space(8.0);
                     });
             });
         if !busy {
             self.chip_dialog(ctx);
             self.driver_dialog(ctx);
+            self.driver_license_dialog(ctx);
         }
         self.update_dialog(ctx);
-        if self.busy() || self.update_checking {
+        if self.busy() || self.update_checking || self.scanner.is_scanning() {
             ctx.request_repaint_after(Duration::from_millis(100));
+        } else if self.auto_refresh {
+            ctx.request_repaint_after(self.next_scan_at.saturating_duration_since(Instant::now()));
         }
     }
+}
+
+fn reconcile_scan_result(
+    previous: Vec<PortRow>,
+    observed: Result<Vec<Port>, String>,
+    batch_ports: &BTreeMap<String, String>,
+) -> (Vec<PortRow>, Option<String>) {
+    match observed {
+        Ok(ports) => (reconcile_ports(previous, ports, batch_ports), None),
+        Err(error) => (previous, Some(error)),
+    }
+}
+
+fn reconcile_ports(
+    previous: Vec<PortRow>,
+    observed: Vec<Port>,
+    batch_ports: &BTreeMap<String, String>,
+) -> Vec<PortRow> {
+    let mut found: HashMap<_, _> = observed
+        .into_iter()
+        .map(|port| ((port.name.clone(), port.identity.clone()), port))
+        .collect();
+    let mut rows = Vec::new();
+    for mut row in previous {
+        let identity = (row.port.name.clone(), row.port.identity.clone());
+        if let Some(port) = found.remove(&identity) {
+            if !row.online {
+                row.selected = false;
+            }
+            row.port = port;
+            row.online = true;
+            rows.push(row);
+        } else if row.selected || batch_ports.get(&row.port.name) == Some(&row.port.identity) {
+            row.online = false;
+            rows.push(row);
+        }
+    }
+    rows.extend(found.into_values().map(|port| PortRow {
+        port,
+        selected: false,
+        online: true,
+    }));
+    rows.sort_by(|left, right| {
+        let number = |name: &str| {
+            name.strip_prefix("COM")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(u32::MAX)
+        };
+        number(&left.port.name)
+            .cmp(&number(&right.port.name))
+            .then_with(|| left.port.name.cmp(&right.port.name))
+            .then_with(|| left.port.description.cmp(&right.port.description))
+    });
+    rows
+}
+
+fn device_tile(
+    ui: &mut egui::Ui,
+    row: &mut PortRow,
+    job: Option<&JobRow>,
+    in_batch: bool,
+    locked: bool,
+) {
+    let progress = job.map_or(0.0, |job| job.progress);
+    let stage = job.map_or_else(
+        || {
+            if in_batch && locked {
+                "等待中"
+            } else if !row.online {
+                "设备已离线"
+            } else if row.selected {
+                "准备就绪"
+            } else {
+                "未选择"
+            }
+        },
+        |job| state_label(&job.state),
+    );
+    let color = match job.map(|job| &job.state) {
+        Some(JobState::Failed) => DANGER,
+        Some(JobState::Success | JobState::Writing | JobState::Verifying) => ACCENT,
+        _ => MUTED,
+    };
+    egui::Frame::new()
+        .fill(if row.selected || in_batch {
+            Color32::from_rgb(247, 252, 250)
+        } else {
+            BACKGROUND
+        })
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            if row.selected || in_batch {
+                Color32::from_rgb(189, 225, 213)
+            } else {
+                BORDER
+            },
+        ))
+        .corner_radius(9.0)
+        .inner_margin(12.0)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.add_enabled(
+                    !locked && (row.online || row.selected),
+                    egui::Checkbox::new(
+                        &mut row.selected,
+                        RichText::new(&row.port.name)
+                            .monospace()
+                            .size(15.0)
+                            .strong(),
+                    ),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(if row.online { "在线" } else { "离线" })
+                            .size(10.0)
+                            .color(if row.online { ACCENT } else { DANGER }),
+                    );
+                    dot(ui, if row.online { ACCENT } else { DANGER }, 4.0);
+                });
+            });
+            ui.add(
+                egui::Label::new(RichText::new(&row.port.description).size(10.0).color(MUTED))
+                    .truncate(),
+            )
+            .on_hover_text(&row.port.description);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(stage).size(12.0).strong().color(color));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("{:.0}%", progress * 100.0))
+                            .monospace()
+                            .size(13.0)
+                            .strong()
+                            .color(color),
+                    );
+                });
+            });
+            ui.add(
+                egui::ProgressBar::new(progress)
+                    .desired_width(ui.available_width())
+                    .desired_height(7.0)
+                    .fill(color),
+            );
+            ui.horizontal(|ui| {
+                let elapsed = job.and_then(|job| {
+                    job.duration_secs
+                        .or_else(|| job.elapsed.map(|start| start.elapsed().as_secs_f64()))
+                });
+                ui.label(
+                    RichText::new(
+                        elapsed
+                            .map(|seconds| format!("耗时 {seconds:.1} s"))
+                            .unwrap_or_else(|| "耗时 —".into()),
+                    )
+                    .size(10.0)
+                    .color(MUTED),
+                );
+                if in_batch {
+                    ui.label(RichText::new("本批任务").size(10.0).color(ACCENT));
+                }
+            });
+            let message = job
+                .map(|job| job.message.as_str())
+                .unwrap_or(if !row.online {
+                    "离线设备保留上次选择与结果"
+                } else if row.selected {
+                    "等待开始本批烧录"
+                } else {
+                    "勾选后加入下一批"
+                });
+            ui.add(
+                egui::Label::new(RichText::new(message).size(10.0).color(
+                    if job.is_some_and(|job| job.state == JobState::Failed) {
+                        DANGER
+                    } else {
+                        MUTED
+                    },
+                ))
+                .truncate(),
+            )
+            .on_hover_text(message);
+        });
 }
 
 #[derive(Clone, Copy)]
@@ -1875,7 +2120,7 @@ fn text_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
 
 fn file_picker(ui: &mut egui::Ui, path: &Path, large: bool) -> egui::Response {
     let empty = path.as_os_str().is_empty();
-    let height = if large { 111.0 } else { 63.0 };
+    let height = if large { 111.0 } else { 48.0 };
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), height),
         egui::Sense::click(),
@@ -2023,38 +2268,6 @@ fn banner(ui: &mut egui::Ui, message: &str, error: bool) {
         });
 }
 
-fn mail_subscription_footer(ui: &mut egui::Ui, ctx: &egui::Context) {
-    egui::Frame::new()
-        .fill(ACCENT_LIGHT)
-        .corner_radius(10.0)
-        .inner_margin(14.0)
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.set_min_height(94.0);
-            ui.label(
-                RichText::new("新版本邮件提醒")
-                    .size(14.0)
-                    .strong()
-                    .color(INK),
-            );
-            ui.add(
-                egui::Label::new(
-                    RichText::new(
-                        "在 GitHub 仓库选择 Watch → Custom → Releases，并在通知设置中启用邮件。",
-                    )
-                    .size(11.0)
-                    .color(MUTED),
-                )
-                .wrap(),
-            );
-            if secondary_button(ui, "订阅版本邮件", [137.0, 36.0]).clicked() {
-                ctx.open_url(egui::OpenUrl::new_tab(
-                    "https://github.com/xiaoxiaoawei/hw_hub",
-                ));
-            }
-        });
-}
-
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2146,7 +2359,100 @@ fn install_fonts(ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
-    use super::append_csv;
+    use super::{Port, PortRow, append_csv, reconcile_ports, reconcile_scan_result};
+    use std::collections::BTreeMap;
+
+    fn port(name: &str, description: &str) -> Port {
+        Port {
+            name: name.into(),
+            description: description.into(),
+            identity: format!("{name}|{description}"),
+            usb: true,
+            suggested: true,
+        }
+    }
+
+    fn selected(name: &str, description: &str) -> PortRow {
+        PortRow {
+            port: port(name, description),
+            selected: true,
+            online: true,
+        }
+    }
+
+    #[test]
+    fn failed_scan_preserves_known_devices_and_selection() {
+        let previous = vec![selected("COM3", "CP210x A")];
+        let (rows, error) =
+            reconcile_scan_result(previous, Err("enumeration failed".into()), &BTreeMap::new());
+        assert_eq!(error.as_deref(), Some("enumeration failed"));
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].online && rows[0].selected);
+    }
+
+    #[test]
+    fn new_or_reused_com_identity_is_not_automatically_selected() {
+        let previous = vec![selected("COM3", "CP210x A")];
+        let rows = reconcile_ports(
+            previous,
+            vec![port("COM3", "CP210x B"), port("COM4", "CH343")],
+            &BTreeMap::new(),
+        );
+        let old = rows
+            .iter()
+            .find(|row| row.port.description == "CP210x A")
+            .unwrap();
+        assert!(old.selected && !old.online);
+        assert!(
+            rows.iter()
+                .filter(|row| row.online)
+                .all(|row| !row.selected)
+        );
+    }
+
+    #[test]
+    fn offline_batch_device_is_retained_but_reconnection_requires_selection() {
+        let batch = BTreeMap::from([("COM7".into(), port("COM7", "ESP native USB").identity)]);
+        let previous = vec![
+            PortRow {
+                port: port("COM7", "ESP native USB"),
+                selected: false,
+                online: true,
+            },
+            selected("COM3", "CP210x A"),
+            PortRow {
+                port: port("COM9", "unused"),
+                selected: false,
+                online: true,
+            },
+        ];
+        let offline = reconcile_ports(previous, vec![], &batch);
+        assert_eq!(offline.len(), 2);
+        assert!(offline.iter().all(|row| !row.online));
+        let reconnected = reconcile_ports(offline, vec![port("COM3", "CP210x A")], &batch);
+        let restored = reconnected
+            .iter()
+            .find(|row| row.port.name == "COM3")
+            .unwrap();
+        assert!(restored.online && !restored.selected);
+        assert!(
+            reconnected
+                .iter()
+                .any(|row| row.port.name == "COM7" && !row.online)
+        );
+    }
+
+    #[test]
+    fn repeated_scan_deduplicates_observations_without_losing_selection() {
+        let observed = vec![port("COM3", "CP210x A"), port("COM3", "CP210x A")];
+        let rows = reconcile_ports(
+            vec![selected("COM3", "CP210x A")],
+            observed,
+            &BTreeMap::new(),
+        );
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].selected && rows[0].online);
+    }
 
     #[test]
     fn csv_preserves_quotes_newlines_and_prevents_formula_execution() {

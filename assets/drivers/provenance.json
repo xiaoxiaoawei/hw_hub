@@ -1,0 +1,426 @@
+{
+  "schema": 1,
+  "origin": "User-uploaded driver packages; no vendor executable was run.",
+  "validation_scope": "Static archive CRC/path/size, INF hardware IDs, referenced payload presence and PKCS#7/PE certificate structure. Windows trust and installation remain untested.",
+  "packages": {
+    "cp210x": {
+      "original_filename": "CP210x_Universal_Windows_Driver.zip",
+      "original_sha256": "3076ea2700fbadd9b50f01c7e5c8649c8254db9262114661e5f46ac183bd86ed",
+      "embedded_file": "cp210x.zip",
+      "embedded_sha256": "3076ea2700fbadd9b50f01c7e5c8649c8254db9262114661e5f46ac183bd86ed",
+      "driver_version": "10/04/2022,11.2.0.167",
+      "selected_inf": "silabser.inf",
+      "target": "NTamd64.10.0...17134 and x86/ARM/ARM64",
+      "hardware_ids": [
+        "USB\\VID_10C4&PID_EA60"
+      ],
+      "license_file": "cp210x-license.txt",
+      "license_terms": "Original terms retained unmodified. See sections 3 and 4 for binary modification, supported Silicon Labs ICs, notices, redistribution and end-user agreement requirements. No additional redistribution authorization is claimed.",
+      "files": [
+        {
+          "path": "arm64/silabser.sys",
+          "bytes": 151600,
+          "sha256": "f0fce4346134f957d423a8fb8aa800801b1215f32c50e5b3b3be9ce1041b9e53"
+        },
+        {
+          "path": "arm/silabser.sys",
+          "bytes": 130576,
+          "sha256": "4050528983e9044c9e2297c5ef6549f7db2c7f9786e58e93100128efba73444f"
+        },
+        {
+          "path": "CP210x_Universal_Windows_Driver_ReleaseNotes.txt",
+          "bytes": 29721,
+          "sha256": "074f161aa4a4aaa85ffb2a8a788404846cf273fb6e73a3152be8228d03bc4523"
+        },
+        {
+          "path": "silabser.cat",
+          "bytes": 13674,
+          "sha256": "91d2e3db2761568f23b905de7715176d14853ee16f9c56b1bb70d821714d61f3"
+        },
+        {
+          "path": "silabser.inf",
+          "bytes": 12774,
+          "sha256": "edc4fda5e61a8b6cd05a1ed4084db1e0ce343d1a6b481f3ef2125a3e27c502fa"
+        },
+        {
+          "path": "SLAB_License_Agreement_VCP_Windows.txt",
+          "bytes": 8371,
+          "sha256": "d423c0202937441271dc0bc445ae3f9e024678cafd3070aaf104f345eef8885e"
+        },
+        {
+          "path": "x64/silabser.sys",
+          "bytes": 153616,
+          "sha256": "649ebafee0032f02de8b418707d7c610033ca546ac571de76984bb5abf0ccca5"
+        },
+        {
+          "path": "x86/silabser.sys",
+          "bytes": 135168,
+          "sha256": "3773c26f4265fdaca03f7c462dcfcbcde66e3acd07e5e0e0552a76783dcfa915"
+        }
+      ],
+      "original_license_entry": "SLAB_License_Agreement_VCP_Windows.txt",
+      "pe_payloads": [
+        {
+          "path": "arm64/silabser.sys",
+          "machine": "0xaa64",
+          "pe_magic": "0x20b",
+          "certificate_offset": 131584,
+          "certificate_bytes": 20016,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        },
+        {
+          "path": "arm/silabser.sys",
+          "machine": "0x1c4",
+          "pe_magic": "0x10b",
+          "certificate_offset": 110592,
+          "certificate_bytes": 19984,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        },
+        {
+          "path": "x64/silabser.sys",
+          "machine": "0x8664",
+          "pe_magic": "0x20b",
+          "certificate_offset": 133632,
+          "certificate_bytes": 19984,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        },
+        {
+          "path": "x86/silabser.sys",
+          "machine": "0x14c",
+          "pe_magic": "0x10b",
+          "certificate_offset": 115200,
+          "certificate_bytes": 19968,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        }
+      ],
+      "catalog_inspection": {
+        "file": "silabser.cat",
+        "parser": "OpenSSL pkcs7 DER certificate parsing, without trust verification",
+        "contains_subject": "Microsoft Windows Hardware Compatibility Publisher",
+        "trust_verified": false
+      }
+    },
+    "ch343": {
+      "original_filename": "CH343SER.EXE",
+      "original_file_preserved_as": "ch343.exe",
+      "original_sha256": "99f16f9c4cf9c315dc9a17b29021d82d522014ecc053d9ee1c7b38c214dea40b",
+      "embedded_file": "ch343.zip",
+      "embedded_sha256": "b49881a847d9446d7e2e9b5ed1819f2db5468c673e3fe5ff4f494225e00cfae2",
+      "driver_version": "05/19/2026,2.2.2026.05",
+      "selected_inf": "WIN 1X/CH343SER.INF",
+      "selection_basis": "Exactly the known root/WIN 1X layout; both INF files and all nine corresponding INF/CAT/SYS/DLL payloads are byte-identical. The vendor WIN 1X directory is selected deterministically for Windows 10/11; all original archive files remain in the ZIP. NTamd64 includes PID55D3/PID55D4 and copies CH343S64.SYS.",
+      "hardware_ids": [
+        "USB\\VID_1A86&PID_55D3",
+        "USB\\VID_1A86&PID_55D4"
+      ],
+      "source_format": "PE32 RAR self-extracting archive, statically read with system libarchive 3.7.4; extraction did not execute any EXE.",
+      "pe_certificate_table": {
+        "offset": 685520,
+        "bytes": 10768,
+        "revision": "0x0200",
+        "type": "PKCS#7 SignedData",
+        "contains_subject": "Nanjing Qinheng Microelectronics Co., Ltd.",
+        "trust_verified": false
+      },
+      "license_note": "No standalone license text was found in the supplied RAR payload. All original files and the original signed SFX are preserved; no extra redistribution license is inferred.",
+      "files": [
+        {
+          "path": "CH343M64.sys",
+          "bytes": 71000,
+          "sha256": "4d7abde7e04d7034846af6e434559bed3cde95489499e35c99b3a5a6dc17bbb7"
+        },
+        {
+          "path": "CH343PORTS.dll",
+          "bytes": 71688,
+          "sha256": "baa48405380b78b9f802223fe3b8a9157ac948cbd40c87dbb77d8691d5462b97"
+        },
+        {
+          "path": "CH343PORTSA64.dll",
+          "bytes": 83464,
+          "sha256": "a9de23131e40e6b57227b5564e8b975cc00f964889a12dce5278559768d9abce"
+        },
+        {
+          "path": "CH343PT.DLL",
+          "bytes": 75920,
+          "sha256": "d67be859a1a6a6c56e59b1d9600d4121944ddba6ba3772249caef6b8dc93a0d0"
+        },
+        {
+          "path": "CH343PTA64.DLL",
+          "bytes": 97424,
+          "sha256": "2b54c73290fc474b3e59b7d9d5589d63c0c21d1df9ce20b4ce012d20a67de2a6"
+        },
+        {
+          "path": "CH343S64.sys",
+          "bytes": 83088,
+          "sha256": "54509f079628ef001864e7443fae620d4dbd2b38aa3aad900bb55f4e4755f1e8"
+        },
+        {
+          "path": "CH343SER.CAT",
+          "bytes": 17702,
+          "sha256": "51b0406cab638155608f1cc60175571c16514c97a4ad4d3bb251268e6452ea0b"
+        },
+        {
+          "path": "CH343SER.INF",
+          "bytes": 23908,
+          "sha256": "beb0a14ae91338feba30a679d0397e3e52d89a9a309d77f0c14b0601e28602c2"
+        },
+        {
+          "path": "CH343SER.sys",
+          "bytes": 61712,
+          "sha256": "5778f39c4053fba9f55175bf38f6d7a6e2a2932996f8ed2bc105b8b02133175d"
+        },
+        {
+          "path": "DRVSETUP64/DRVSETUP64.exe",
+          "bytes": 54224,
+          "sha256": "b5d55fa31753fcd86145c460d644bac78f171f51d708a050326234b4a2876c4c"
+        },
+        {
+          "path": "SETUP.EXE",
+          "bytes": 92624,
+          "sha256": "b89fd6c6a1eb20df0fb347e9af5e935be2e6f2e2915b984543c0532e6d0ffaa2"
+        },
+        {
+          "path": "WIN 1X/CH343M64.sys",
+          "bytes": 71000,
+          "sha256": "4d7abde7e04d7034846af6e434559bed3cde95489499e35c99b3a5a6dc17bbb7"
+        },
+        {
+          "path": "WIN 1X/CH343PORTS.dll",
+          "bytes": 71688,
+          "sha256": "baa48405380b78b9f802223fe3b8a9157ac948cbd40c87dbb77d8691d5462b97"
+        },
+        {
+          "path": "WIN 1X/CH343PORTSA64.dll",
+          "bytes": 83464,
+          "sha256": "a9de23131e40e6b57227b5564e8b975cc00f964889a12dce5278559768d9abce"
+        },
+        {
+          "path": "WIN 1X/CH343PT.DLL",
+          "bytes": 75920,
+          "sha256": "d67be859a1a6a6c56e59b1d9600d4121944ddba6ba3772249caef6b8dc93a0d0"
+        },
+        {
+          "path": "WIN 1X/CH343PTA64.DLL",
+          "bytes": 97424,
+          "sha256": "2b54c73290fc474b3e59b7d9d5589d63c0c21d1df9ce20b4ce012d20a67de2a6"
+        },
+        {
+          "path": "WIN 1X/CH343S64.sys",
+          "bytes": 83088,
+          "sha256": "54509f079628ef001864e7443fae620d4dbd2b38aa3aad900bb55f4e4755f1e8"
+        },
+        {
+          "path": "WIN 1X/CH343SER.CAT",
+          "bytes": 17702,
+          "sha256": "51b0406cab638155608f1cc60175571c16514c97a4ad4d3bb251268e6452ea0b"
+        },
+        {
+          "path": "WIN 1X/CH343SER.INF",
+          "bytes": 23908,
+          "sha256": "beb0a14ae91338feba30a679d0397e3e52d89a9a309d77f0c14b0601e28602c2"
+        },
+        {
+          "path": "WIN 1X/CH343SER.sys",
+          "bytes": 61712,
+          "sha256": "5778f39c4053fba9f55175bf38f6d7a6e2a2932996f8ed2bc105b8b02133175d"
+        }
+      ],
+      "pe_payloads": [
+        {
+          "path": "CH343M64.sys",
+          "machine": "0xaa64",
+          "pe_magic": "0x20b",
+          "certificate_offset": 58880,
+          "certificate_bytes": 12120,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        },
+        {
+          "path": "CH343PORTS.dll",
+          "machine": "0x14c",
+          "pe_magic": "0x10b",
+          "certificate_offset": 41472,
+          "certificate_bytes": 30216,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        },
+        {
+          "path": "CH343PORTSA64.dll",
+          "machine": "0x8664",
+          "pe_magic": "0x20b",
+          "certificate_offset": 53248,
+          "certificate_bytes": 30216,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        },
+        {
+          "path": "CH343PT.DLL",
+          "machine": "0x14c",
+          "pe_magic": "0x10b",
+          "certificate_offset": 66048,
+          "certificate_bytes": 9872,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        },
+        {
+          "path": "CH343PTA64.DLL",
+          "machine": "0x8664",
+          "pe_magic": "0x20b",
+          "certificate_offset": 87552,
+          "certificate_bytes": 9872,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        },
+        {
+          "path": "CH343S64.sys",
+          "machine": "0x8664",
+          "pe_magic": "0x20b",
+          "certificate_offset": 73216,
+          "certificate_bytes": 9872,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        },
+        {
+          "path": "CH343SER.sys",
+          "machine": "0x14c",
+          "pe_magic": "0x10b",
+          "certificate_offset": 51840,
+          "certificate_bytes": 9872,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        },
+        {
+          "path": "DRVSETUP64/DRVSETUP64.exe",
+          "machine": "0x8664",
+          "pe_magic": "0x20b",
+          "certificate_offset": 43520,
+          "certificate_bytes": 10704,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        },
+        {
+          "path": "SETUP.EXE",
+          "machine": "0x14c",
+          "pe_magic": "0x10b",
+          "certificate_offset": 81920,
+          "certificate_bytes": 10704,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        },
+        {
+          "path": "WIN 1X/CH343M64.sys",
+          "machine": "0xaa64",
+          "pe_magic": "0x20b",
+          "certificate_offset": 58880,
+          "certificate_bytes": 12120,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        },
+        {
+          "path": "WIN 1X/CH343PORTS.dll",
+          "machine": "0x14c",
+          "pe_magic": "0x10b",
+          "certificate_offset": 41472,
+          "certificate_bytes": 30216,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        },
+        {
+          "path": "WIN 1X/CH343PORTSA64.dll",
+          "machine": "0x8664",
+          "pe_magic": "0x20b",
+          "certificate_offset": 53248,
+          "certificate_bytes": 30216,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        },
+        {
+          "path": "WIN 1X/CH343PT.DLL",
+          "machine": "0x14c",
+          "pe_magic": "0x10b",
+          "certificate_offset": 66048,
+          "certificate_bytes": 9872,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        },
+        {
+          "path": "WIN 1X/CH343PTA64.DLL",
+          "machine": "0x8664",
+          "pe_magic": "0x20b",
+          "certificate_offset": 87552,
+          "certificate_bytes": 9872,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        },
+        {
+          "path": "WIN 1X/CH343S64.sys",
+          "machine": "0x8664",
+          "pe_magic": "0x20b",
+          "certificate_offset": 73216,
+          "certificate_bytes": 9872,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        },
+        {
+          "path": "WIN 1X/CH343SER.sys",
+          "machine": "0x14c",
+          "pe_magic": "0x10b",
+          "certificate_offset": 51840,
+          "certificate_bytes": 9872,
+          "certificate_trust_verified": false,
+          "win_certificate_revision": "0x200",
+          "win_certificate_type": 2,
+          "certificate_structure_in_bounds": true
+        }
+      ],
+      "catalog_inspection": {
+        "file": "CH343SER.CAT",
+        "parser": "OpenSSL pkcs7 DER certificate parsing, without trust verification",
+        "contains_subject": "Microsoft Windows Hardware Compatibility Publisher",
+        "trust_verified": false
+      }
+    }
+  }
+}

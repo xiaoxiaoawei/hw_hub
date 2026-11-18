@@ -53,7 +53,12 @@ try {
         throw "CHANGELOG.md is missing release notes for $Version."
     }
 
+    $DriversRequired = $RequireDrivers -or ([version]$Version -ge [version]'0.4.0')
+    if ($DriversRequired -and $AllowMissingDrivers) {
+        throw 'This release requires both embedded driver ZIPs; -AllowMissingDrivers is only for historical versions before 0.4.0.'
+    }
     $DriverStatus = [ordered]@{}
+    $DriverPackageFiles = [ordered]@{}
     foreach ($Name in @('ch343', 'cp210x')) {
         $Path = Join-Path 'assets\drivers' "$Name.zip"
         if ($FetchDrivers -and -not (Test-Path -LiteralPath $Path)) {
@@ -61,10 +66,18 @@ try {
             # Download failures throw, never becoming a successful embedded-driver build.
         }
         $Present = (Test-Path -LiteralPath $Path -PathType Leaf) -and (Get-Item -LiteralPath $Path).Length -gt 0
-        if (-not $Present -and ($FetchDrivers -or $RequireDrivers)) {
+        if (-not $Present -and ($FetchDrivers -or $DriversRequired)) {
             throw "Missing $Path. The requested driver bundle cannot be built."
         }
         $DriverStatus[$Name] = if ($Present) { 'embedded' } else { 'not_embedded' }
+        if ($Present) {
+            $DriverPackageFiles[$Name] = [ordered]@{
+                file = "$Name.zip"
+                bytes = (Get-Item -LiteralPath $Path).Length
+                sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+                installation = 'Windows PnPUtil using the embedded complete INF/CAT/SYS package'
+            }
+        }
         if (-not $Present) {
             Write-Warning "$Name is NOT embedded. The user must select an official driver ZIP when installing."
         }
@@ -97,6 +110,12 @@ try {
     $DriverDocumentation = Join-Path $Staging 'drivers'
     [void][IO.Directory]::CreateDirectory($DriverDocumentation)
     Copy-Item -LiteralPath assets\drivers\README.md -Destination $DriverDocumentation
+    foreach ($Name in @('provenance.json', 'cp210x-license.txt')) {
+        $Notice = Join-Path 'assets\drivers' $Name
+        if (Test-Path -LiteralPath $Notice -PathType Leaf) {
+            Copy-Item -LiteralPath $Notice -Destination $DriverDocumentation
+        }
+    }
     foreach ($Name in @('ch343', 'cp210x')) {
         if ($DriverStatus[$Name] -eq 'embedded') {
             foreach ($Suffix in @('source.json', 'sha256')) {
@@ -111,6 +130,7 @@ try {
         version = $Version
         target = 'x86_64-pc-windows-msvc'
         driver_packages = $DriverStatus
+        driver_package_files = $DriverPackageFiles
     } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $Staging 'BUILD-METADATA.json') -Encoding UTF8
 
     # Retain original dependency notices, including bundled font licences.

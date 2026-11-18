@@ -10,23 +10,19 @@
 
 1. **选择芯片**：默认 ESP32-C3，其他型号可在芯片选择器中切换。工具会检查固件镜像头，并与实际连接的芯片比较。
 2. **配置固件**：选择合并 BIN，或添加多个 BIN 和十六进制地址。常用分段模板会随芯片切换 bootloader 地址；实际地址以固件发布说明为准。
-3. **勾选设备**：刷新串口并选中本批设备；新出现的端口不会自动勾选。
+3. **勾选设备**：串口每两秒后台自动刷新，也可手动刷新；新出现的端口不会自动勾选。
 4. **开始批量烧录**：每台独立连接、检查 Flash 容量、压缩写入、MD5 校验并复位。仅全部步骤成功后标记成功；单台失败不影响其他设备。
-5. **保存结果**：导出含芯片、固件布局摘要、耗时及结果的 CSV，便于追踪生产批次。
+5. **查看进度与保存结果**：每个 COM 口独立显示进度条、百分比、状态和耗时；导出含芯片、固件布局摘要、耗时及结果的 CSV。日志支持随时清空，设备进度和结果保持可用。
 
 支持 1–16 台同时烧录，更多设备排队处理；默认并发 4 台，波特率 460800，可选择 115200 或 921600。“停止排队”仅取消尚未开始的设备，正在写入的设备会继续完成校验。
 
-## 自动检查更新与版本邮件
+## 自动检查软件更新
 
 启动后在后台检查 GitHub 最新正式 Release，每天最多自动请求一次；侧栏“检查更新”可随时手动查询，也可在更新窗口关闭自动检查。检查失败会显示网络错误并保留重试入口；没有正式 Release 时明确提示尚未发布。
 
 发现比当前版本更新的正式版时显示版本号、更新说明和官方 Windows 下载入口；若附件尚未上传，显示“发布包尚未上传”并提供发布页。下载由用户选择，烧录任务保持独立运行。设置保存于 Windows 的 `%LOCALAPPDATA%\FlashTool` 用户目录。
 
 更新来源固定为本仓库 GitHub Releases。预发布和草稿不会作为升级提示；下载地址须属于本仓库的正式版本资产，按语义版本比较（例如 `0.10.0` 高于 `0.9.0`）。
-
-**版本邮件使用 GitHub 的 Releases 订阅机制**：在软件的更新窗口点击“订阅版本邮件”，进入仓库后选择 `Watch → Custom → Releases`，并在 [GitHub 通知设置](https://github.com/settings/notifications) 启用 Email。发布流程先上传并核验附件，再将草稿转为正式 Release，使订阅通知对应一个可下载的版本。
-
-GitHub 会依据每个账号的订阅、邮件偏好及投递策略发送通知；软件不会读取邮箱、保存邮箱密码或自行发送邮件。未启用仓库 Releases 邮件订阅的账号不能保证收到邮件。Actions 构建邮件与 Releases 版本邮件是两种通知，可在 GitHub 分别配置。
 
 ## 芯片与地址
 
@@ -45,7 +41,18 @@ USB Hub 建议使用独立供电，先完成单台验证再增加并发。连接
 
 提供 CH343/CH9102、CP2102/CP210x 两类手动安装入口（此前提到的 SP2102 按 CP2102 处理）。仅用户点击后才触发 UAC，由 Windows PnPUtil 校验并安装原厂驱动，程序等待实际退出码。
 
-本次默认发布包**不含内置驱动 ZIP**：当前云环境无法访问官方镜像。可在界面选择完整官方 ZIP，或把包放在 EXE 相邻的 `drivers/ch343.zip`、`drivers/cp210x.zip`；有包时界面会明确显示来源。具备原厂包后可构建真正内置的版本，参见[驱动打包说明](assets/drivers/README.md)。
+v0.4.0 内置上传的 CP210x Universal 驱动，以及从上传的 CH343 自解压包静态提取的完整签名驱动文件。软件运行时不需要联网下载驱动。Windows 安装时执行系统签名与信任检查；原包及许可保留于工程的驱动目录。详见[驱动说明](assets/drivers/README.md)。
+
+## GitHub 构建成功邮件
+
+邮件来自 **GitHub Actions 工作流完成通知**。软件中不配置邮箱，也不通过 Releases 订阅替代构建通知。
+
+1. 在仓库确认 GitHub Actions 已启用，并关注（Watch）本仓库。
+2. 打开 [GitHub 通知设置](https://github.com/settings/notifications)，在 **System → Actions** 选择 **Email**。
+3. 取消 **Only notify for failed workflows**，保存，以包含成功构建。
+4. 使用自己的 GitHub 账号推送代码或标签，或手动运行工作流进行验证。GitHub 根据触发者和个人通知偏好发送完成邮件，工作流 YAML 无法替账号开启此选项。
+
+本项目对 `main`、`flashtool` 分支推送以及 `v*` 标签执行 Windows 构建；只有版本标签或明确选择发布时创建正式 Release。构建产物生成后会写入成功摘要。官方说明见 [Actions 完成通知](https://docs.github.com/en/actions/concepts/workflows-and-actions/notifications-for-workflow-runs)。
 
 ## 构建与验证
 
@@ -59,9 +66,9 @@ cargo run --locked
 ```
 
 ```powershell
-# 构建支持手动导入驱动 ZIP 的版本
-.\scripts\build-windows.ps1 -AllowMissingDrivers
-# 下载官方包并构建内置驱动版本（保留原厂完整包及许可）
+# v0.4.0 起发布构建要求两种已提供的驱动均内置
+.\scripts\build-windows.ps1 -RequireDrivers
+# 显式下载辅助入口仅用于缺少资源时；不会覆盖已有的上传包
 .\scripts\build-windows.ps1 -FetchDrivers
 ```
 
@@ -71,11 +78,11 @@ cargo run --locked
 python3 scripts/bump-version.py --help
 python3 scripts/bump-version.py --check
 # 先为下一版本写好 CHANGELOG，再预演并更新版本：
-python3 scripts/bump-version.py 0.4.0 --dry-run
-python3 scripts/bump-version.py 0.4.0
+python3 scripts/bump-version.py 0.5.0 --dry-run
+python3 scripts/bump-version.py 0.5.0
 ```
 
-提交并验证新版本后创建对应 Git 标签，例如 `git tag -a v0.4.0 -m "FlashTool v0.4.0"`，再推送分支和标签以触发发布。标签必须与 Cargo 版本相同；发布后不移动标签、不覆盖已有资产，修复使用新版本。
+提交并验证新版本后创建对应 Git 标签，例如 `git tag -a v0.5.0 -m "FlashTool v0.5.0"`，再推送分支和标签以触发发布。标签必须与 Cargo 版本相同；发布后不移动标签、不覆盖已有资产，修复使用新版本。
 
 GitHub Actions 验证 `vX.Y.Z` 标签与 Cargo 版本一致，通过格式、静态检查和测试后在 Windows 构建。正式 Release 统一使用 `FlashTool vX.Y.Z` 标题，上传版本 ZIP、源码 ZIP 和 SHA256 校验文件，验证成功后才发布并标记 Latest。已发布标签及附件保持不变；可手动选择只构建或发布一个已存在的版本标签。Latest 保持指向较高的正式版本，补发旧版本时保留更新版本的 Latest 标记。
 
@@ -88,7 +95,7 @@ bash scripts/publish-release.sh --assets-dir dist --check
 bash scripts/publish-release.sh --assets-dir dist
 ```
 
-发布工具要求已有的 Git 标签与 Cargo 版本一致，并且 Windows ZIP 及其校验文件已生成；网络或权限错误会中止发布。版本邮件以正式发布事件为前提，上传失败不会将未完成的草稿发布出去。
+发布工具要求已有的 Git 标签与 Cargo 版本一致，并且 Windows ZIP 及其校验文件已生成；网络或权限错误会中止发布。上传失败会保留未完成的草稿；GitHub 构建完成邮件与附件发布是独立的状态。
 
 ### 只读命令行
 

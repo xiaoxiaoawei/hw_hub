@@ -2,6 +2,7 @@ name: Windows build and release
 
 on:
   push:
+    branches: [main, flashtool]
     tags: ['v*']
   workflow_dispatch:
     inputs:
@@ -27,6 +28,7 @@ concurrency:
 
 jobs:
   windows:
+    name: Windows x64 (${{ github.ref_name }})
     runs-on: windows-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -100,8 +102,10 @@ jobs:
         env:
           BUNDLE_DRIVERS: ${{ inputs.bundle_drivers && 'true' || 'false' }}
           EXPECTED_TAG: ${{ steps.selection.outputs.tag }}
+          APP_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          ./scripts/build-windows.ps1 -FetchDrivers:($env:BUNDLE_DRIVERS -eq 'true') -ExpectedTag $env:EXPECTED_TAG
+          $RequireDrivers = [version]$env:APP_VERSION -ge [version]'0.4.0'
+          ./scripts/build-windows.ps1 -FetchDrivers:($env:BUNDLE_DRIVERS -eq 'true') -RequireDrivers:$RequireDrivers -ExpectedTag $env:EXPECTED_TAG
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v4
         with:
@@ -110,6 +114,14 @@ jobs:
             dist/FlashTool-v${{ steps.version.outputs.version }}-windows-x64.zip
             dist/SHA256SUMS
           if-no-files-found: error
+      - name: Summarize successful build
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          "## FlashTool v$env:APP_VERSION · Windows build succeeded" >> $env:GITHUB_STEP_SUMMARY
+          "The versioned Windows ZIP and SHA256SUMS are available in this run's artifacts." >> $env:GITHUB_STEP_SUMMARY
+          "Build email notifications use GitHub account Settings → Notifications → System → Actions → Email. Include successful workflows by disabling 'Only notify for failed workflows'." >> $env:GITHUB_STEP_SUMMARY
 
   release:
     if: needs.windows.outputs.publish_release == 'true'

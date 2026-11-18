@@ -125,7 +125,7 @@ try:
         "driver_packages": metadata.get("driver_packages", {}),
         "steps": ["verify remote tag commit", "create or resume draft", "upload and verify every asset",
                   "publish draft; advance Latest only for a non-older stable SemVer", "verify published release and Latest"],
-        "notification": "GitHub's published event notifies users who subscribed to Releases; email delivery depends on their GitHub settings.",
+        "build_notifications": "GitHub Actions completion emails follow the triggering user's Actions Email preferences, including the only-failed setting.",
     }
     print(json.dumps(plan, ensure_ascii=False, indent=2), flush=True)
     if args.check or args.dry_run:
@@ -165,7 +165,6 @@ try:
         notes_text = notes[1].strip()
         notes_text += "\n\nWindows x64 构建平台和验证范围见 ZIP 内 BUILD-METADATA.json；USB Hub 多设备烧录及驱动安装仍需实机验收。"
         notes_text += "\n\n驱动包状态：" + json.dumps(metadata.get("driver_packages", {}), ensure_ascii=False)
-        notes_text += "\n\n订阅仓库 Watch → Custom → Releases 可接收 GitHub 发布通知；邮件是否送达取决于个人通知设置。\n"
         notes_path.write_text(notes_text, encoding="utf-8")
         verify_remote_tag()
         release = api(f"{prefix}/releases/tags/{tag}", missing_ok=True)

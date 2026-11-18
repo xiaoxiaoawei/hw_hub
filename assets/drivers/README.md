@@ -1,48 +1,37 @@
-# Windows USB 串口驱动包
+# 内置 Windows USB 串口驱动
 
-本目录支持两个可选的原厂完整 ZIP：
+当前版本使用用户提供的两份驱动，运行时将完整驱动 ZIP 编入 FlashTool：
 
-| 文件 | 芯片 | 预期 INF / 常见硬件 ID |
+| 文件 | 用途 | SHA256 |
 | --- | --- | --- |
-| `ch343.zip` | WCH CH343 / CH9102 | `CH343SER.INF`，`USB\VID_1A86&PID_55D3` / `55D4` |
-| `cp210x.zip` | Silicon Labs CP2102 / CP210x | `silabser.inf`，`USB\VID_10C4&PID_EA60` |
+| cp210x.zip | 上传的 CP210x 原始 ZIP，逐字节保留 | 3076ea2700fbadd9b50f01c7e5c8649c8254db9262114661e5f46ac183bd86ed |
+| ch343.exe | 上传的 CH343SER.EXE 原文件，仅保留作溯源 | 99f16f9c4cf9c315dc9a17b29021d82d522014ecc053d9ee1c7b38c214dea40b |
+| ch343.zip | 从上述 RAR 自解压 EXE 静态提取的完整驱动包 | b49881a847d9446d7e2e9b5ed1819f2db5468c673e3fe5ff4f494225e00cfae2 |
 
-仓库目前没有附带驱动二进制。缺包不会导致编译失败，界面会准确显示“未打包”，仍可由用户选择官方 ZIP 安装。不能将占位文件或其他芯片的驱动改名后用作驱动包。
+来源、完整文件清单、字节数和每个文件的哈希见 provenance.json。没有运行上传的 EXE，也没有修改 INF、CAT、SYS 或 DLL。ch343.zip 保留原 RAR 的全部 20 个文件及目录；原 EXE 同时保留在仓库。实际编入应用的 CH343 安装资源是 ch343.zip，应用不会启动其中的 SETUP.EXE 或 DRVSETUP64.exe。
 
-## 获取及打包
+## 静态检查与安装目标
 
-在安装了 PowerShell 的 Windows 机器上，从仓库根目录运行：
+CP210x 包的 DriverVer 为 10/04/2022,11.2.0.167，包含 silabser.inf、silabser.cat、x86/x64/ARM/ARM64 的 SYS、原始许可和发行说明。INF 的 NTamd64.10.0...17134 设备段支持 Windows 10 build 17134 及以上，对应 SYS 在 x64/silabser.sys。常见 CP2102 硬件 ID USB\VID_10C4&PID_EA60 包含在包内。
 
-```powershell
-powershell -File scripts/fetch-drivers.ps1
-```
+CH343 包的 DriverVer 为 05/19/2026,2.2.2026.05；NTamd64 设备段包含 CH343 的 USB\VID_1A86&PID_55D3 与 CH9102 的 PID_55D4，x64 安装段引用 CH343S64.SYS 及配套 DLL。
 
-脚本仅下载和检查，不安装驱动。它使用 Espressif 官方 Windows 安装器采用的下载镜像：
+该 WCH 包有根目录和 WIN 1X 两份 CH343SER.INF。静态比较确认这两份 INF 和其余八份对应的 CAT/SYS/DLL 均逐字节一致。程序仅对白名单中的这两条路径、且九份配套文件全部相同时，确定选择 WIN 1X/CH343SER.INF 作为 Windows 10/11 安装候选。其他不明确的多 INF 布局会被拒绝；单 INF 的旧版官方 ZIP 仍可使用。INF SourceDisksFiles 中引用的各架构文件也必须完整存在。
 
-- CH343：<https://dl.espressif.com/dl/idf-installer/CH341SER.ZIP>
-- CP210x：<https://dl.espressif.com/dl/idf-installer/CP210x_Universal_Windows_Driver.zip>
+ZIP 的路径、条目数量、展开大小及 CRC 已检查。原 EXE 的 PE 证书表在文件边界内，是 PKCS#7 SignedData 结构，含 Nanjing Qinheng Microelectronics Co., Ltd. 证书；两个 CAT 均能解析出 Microsoft Windows Hardware Compatibility Publisher 证书。这些是静态结构检查，未完成 Windows 证书信任、吊销或驱动安装验证，不能据此声称驱动已经受系统信任或安装成功。
 
-原厂页面：
+## 许可原文
 
-- WCH：<https://www.wch.cn/downloads/CH343SER_ZIP.html>
-- Silicon Labs：<https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers>
+CP210x ZIP 内的 SLAB_License_Agreement_VCP_Windows.txt 原文额外保存为 cp210x-license.txt，字节不变。内置 CP210x 的安装入口先展示原文，用户接受后才启动安装。包内条款第 3、4 节涉及二进制修改、Silicon Labs 芯片范围、通知保留、再分发及终端用户协议要求；应阅读完整原文，不将本应用的开源依赖许可视为驱动的许可，也不声称获得了条款以外的再分发授权。
 
-镜像及 INF 路径的参考是 Espressif [`idf-env/src/driver.rs`](https://github.com/espressif/idf-env/blob/cc4b7c3fb309b93fc3828b29553bddcd19fe41bd/src/driver.rs)。CH343 镜像文件名虽为 `CH341SER.ZIP`，实际包内仍必须包含 CH343 对应的 INF、硬件 ID、CAT 及 SYS；脚本和程序会检查，不能仅按下载文件名判断兼容性。
+上传的 CH343 RAR 中未发现单独的许可文本；全部文件与原始 EXE 均完整保留，没有凭空补写厂商授权。
 
-每次下载记录 SHA256、字节数、来源、时间及包内许可/说明文件名，分别写入 `*.sha256` 和 `*.source.json`。这是下载记录，不是厂商公布的校验值。已审阅的哈希可用于固定后续构建输入：
+## 构建与手动安装
 
-```powershell
-powershell -File scripts/fetch-drivers.ps1 -Driver cp210x -ExpectedSha256 <已审阅的64位SHA256>
-```
+build.rs 根据 ZIP 的存在情况编入完整原包。0.4.0 及以后版本的 Windows 打包默认要求两种驱动均内置；历史版本仍可明确选择缺包构建。BUILD-METADATA.json 记录 embedded 状态以及实际 ZIP 文件名、大小和 SHA256；发布 ZIP 还保留本说明、provenance.json 和 CP210x 许可。
 
-脚本默认保留已有 ZIP，只有显式传入 `-Force` 才替换；TLS 和证书验证始终开启。当前云环境到上述厂商及 Espressif 下载域名的请求被代理以 CONNECT 403 拒绝，因此这里尚未获取到原厂包，也没有核验其具体版本、签名或重分发条款。
+只有用户点击安装后，程序才解压到独立临时目录，验证芯片硬件 ID、目标 INF、CAT 结构和全部引用文件，然后通过 UAC 以管理员权限运行系统目录的 pnputil.exe /add-driver "<INF>" /install。程序等待真实退出码；0 表示 Windows 已成功处理驱动包，3010 表示还需重启，其他值显示失败。成功后仍需刷新串口列表或重新插拔以确认具体设备。取消 UAC 不会被报告为成功。
 
-重新编译时，`build.rs` 将存在的 ZIP 原样编入 EXE。完整 ZIP 保留原厂 CAT、SYS、许可和说明文件。发布包含驱动包的 EXE 前，需实际阅读随包及厂商页面的再分发条款；当前未确认两家具体授权条件，不能把其他开源项目的许可当作这些驱动二进制的授权。
+Windows PnPUtil 负责驱动包签名与系统信任的最终检查，程序不会禁用签名验证。Linux 上只进行静态解析与测试，不执行安装器。
 
-若不重新编译，也可将 ZIP 放到发布 EXE 旁的 `drivers/ch343.zip`、`drivers/cp210x.zip`。界面会将这种来源标为相邻离线包，区分于真正的编译内置包；选择 ZIP 直接安装也受支持。
-
-## 手动安装行为
-
-只有用户点击安装按钮后才解压到独立临时目录，并检查路径、条目数、展开大小、目标 INF、USB 硬件 ID、SYS 及 INF 引用的 CAT 结构。程序保留完整包，调用 Windows 系统目录中 `pnputil.exe /add-driver "<INF>" /install`，通过 UAC 请求管理员权限，等待实际退出码：`0` 表示成功，`3010` 表示成功但需要重启，其他值显示失败；取消授权不会报告安装成功。
-
-CAT 预检查只检查文件结构；Windows 的驱动包签名和证书信任校验才是安装依据。程序不会禁用签名校验、自动安装驱动、修改设备为不相关的 USB 驱动，或执行下载包里的 EXE。驱动包进入驱动存储后，设备是否匹配和是否需要重启仍由 Windows 决定。安装完成后可刷新串口列表或重新插拔设备。
+也可在 EXE 旁的 drivers/ch343.zip、drivers/cp210x.zip 放置离线包，或手动选择 ZIP；界面区分相邻离线包和真正的内置资源。已有内置包会优先使用。scripts/fetch-drivers.ps1 保留为显式下载官方镜像的辅助工具，默认不会覆盖已提供的 ZIP；当前构建无需重新下载驱动。
