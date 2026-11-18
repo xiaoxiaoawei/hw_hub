@@ -16,6 +16,18 @@
 
 支持 1–16 台同时烧录，更多设备排队处理；默认并发 4 台，波特率 460800，可选择 115200 或 921600。“停止排队”仅取消尚未开始的设备，正在写入的设备会继续完成校验。
 
+## 自动检查更新与版本邮件
+
+启动后在后台检查 GitHub 最新正式 Release，每天最多自动请求一次；侧栏“检查更新”可随时手动查询，也可在更新窗口关闭自动检查。检查失败会显示网络错误并保留重试入口；没有正式 Release 时明确提示尚未发布。
+
+发现比当前版本更新的正式版时显示版本号、更新说明和官方 Windows 下载入口；若附件尚未上传，显示“发布包尚未上传”并提供发布页。下载由用户选择，烧录任务保持独立运行。设置保存于 Windows 的 `%LOCALAPPDATA%\FlashTool` 用户目录。
+
+更新来源固定为本仓库 GitHub Releases。预发布和草稿不会作为升级提示；下载地址须属于本仓库的正式版本资产，按语义版本比较（例如 `0.10.0` 高于 `0.9.0`）。
+
+**版本邮件使用 GitHub 的 Releases 订阅机制**：在软件的更新窗口点击“订阅版本邮件”，进入仓库后选择 `Watch → Custom → Releases`，并在 [GitHub 通知设置](https://github.com/settings/notifications) 启用 Email。发布流程先上传并核验附件，再将草稿转为正式 Release，使订阅通知对应一个可下载的版本。
+
+GitHub 会依据每个账号的订阅、邮件偏好及投递策略发送通知；软件不会读取邮箱、保存邮箱密码或自行发送邮件。未启用仓库 Releases 邮件订阅的账号不能保证收到邮件。Actions 构建邮件与 Releases 版本邮件是两种通知，可在 GitHub 分别配置。
+
 ## 芯片与地址
 
 | 芯片 | 常用独立 bootloader 地址 | 合并镜像起点 |
@@ -59,13 +71,24 @@ cargo run --locked
 python3 scripts/bump-version.py --help
 python3 scripts/bump-version.py --check
 # 先为下一版本写好 CHANGELOG，再预演并更新版本：
-python3 scripts/bump-version.py 0.3.0 --dry-run
-python3 scripts/bump-version.py 0.3.0
+python3 scripts/bump-version.py 0.4.0 --dry-run
+python3 scripts/bump-version.py 0.4.0
 ```
 
-提交并验证新版本后创建对应 Git 标签，例如 `git tag -a v0.3.0 -m "FlashTool v0.3.0"`，再推送分支和标签以触发发布。标签必须与 Cargo 版本相同；发布后不移动标签、不覆盖已有资产，修复使用新版本。
+提交并验证新版本后创建对应 Git 标签，例如 `git tag -a v0.4.0 -m "FlashTool v0.4.0"`，再推送分支和标签以触发发布。标签必须与 Cargo 版本相同；发布后不移动标签、不覆盖已有资产，修复使用新版本。
 
-GitHub Actions 验证 `vX.Y.Z` 标签与 Cargo 版本一致，通过格式、静态检查和测试后在 Windows 构建，再发布带版本号的 ZIP 和 SHA256 校验文件。手动触发工作流可仅生成构建产物。
+GitHub Actions 验证 `vX.Y.Z` 标签与 Cargo 版本一致，通过格式、静态检查和测试后在 Windows 构建。正式 Release 统一使用 `FlashTool vX.Y.Z` 标题，上传版本 ZIP、源码 ZIP 和 SHA256 校验文件，验证成功后才发布并标记 Latest。已发布标签及附件保持不变；可手动选择只构建或发布一个已存在的版本标签。Latest 保持指向较高的正式版本，补发旧版本时保留更新版本的 Latest 标记。
+
+发布工具也可从本地验证过的标签和构建产物完成相同流程：
+
+```sh
+# 离线核对当前版本的标签、提交、Windows ZIP 与 SHA256SUMS
+bash scripts/publish-release.sh --assets-dir dist --check
+# 确认计划后访问 GitHub，上传并核验草稿附件，最后正式发布
+bash scripts/publish-release.sh --assets-dir dist
+```
+
+发布工具要求已有的 Git 标签与 Cargo 版本一致，并且 Windows ZIP 及其校验文件已生成；网络或权限错误会中止发布。版本邮件以正式发布事件为前提，上传失败不会将未完成的草稿发布出去。
 
 ### 只读命令行
 

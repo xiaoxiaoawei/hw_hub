@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use chrono::Local;
@@ -15,6 +15,7 @@ use esp32c3_flashtool::{
     chip::ChipModel,
     drivers::{self, DriverKind},
     firmware::{FirmwareInput, prepare_firmware},
+    updater::{self, CheckResult, ReleaseUpdate, UpdateSettings},
 };
 
 const ACCENT: Color32 = Color32::from_rgb(0, 133, 120);
@@ -89,6 +90,16 @@ pub struct FlashApp {
     batch_firmware: String,
     batch_started: String,
     logs_visible: bool,
+    update_dialog_open: bool,
+    update_settings: UpdateSettings,
+    update_settings_error: Option<String>,
+    update_result: Option<mpsc::Receiver<Result<CheckResult, String>>>,
+    update_checking: bool,
+    update_was_manual: bool,
+    update_status: String,
+    update_error: Option<String>,
+    update_available: Option<ReleaseUpdate>,
+    update_latest_version: Option<String>,
 }
 
 impl FlashApp {
@@ -129,6 +140,13 @@ impl FlashApp {
                 .text_styles
                 .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
         });
+        let (update_settings, update_settings_error) = match updater::load_settings() {
+            Ok(settings) => (settings, None),
+            Err(error) => (
+                UpdateSettings::default(),
+                Some(format!("无法读取更新设置：{error:#}")),
+            ),
+        };
         let mut app = Self {
             selected_chip: ChipModel::default(),
             pending_chip: ChipModel::default(),
@@ -153,8 +171,23 @@ impl FlashApp {
             batch_firmware: String::new(),
             batch_started: String::new(),
             logs_visible: false,
+            update_dialog_open: false,
+            update_settings,
+            update_settings_error,
+            update_result: None,
+            update_checking: false,
+            update_was_manual: false,
+            update_status: "尚未检查更新".into(),
+            update_error: None,
+            update_available: None,
+            update_latest_version: None,
         };
         app.scan_ports();
+        if app.update_settings_error.is_none()
+            && updater::should_auto_check(&app.update_settings, now_unix())
+        {
+            app.start_update_check(false, &cc.egui_ctx);
+        }
         app
     }
 
@@ -168,6 +201,271 @@ impl FlashApp {
 
     fn busy(&self) -> bool {
         self.running() || self.driver_busy
+    }
+
+    fn open_update_dialog(&mut self) {
+        self.chip_picker_open = false;
+        self.driver_dialog_open = false;
+        self.update_dialog_open = true;
+    }
+
+    fn start_update_check(&mut self, manual: bool, ctx: &egui::Context) {
+        if self.update_checking {
+            return;
+        }
+        if !manual {
+            if !updater::should_auto_check(&self.update_settings, now_unix()) {
+                return;
+            }
+            let previous_attempt = self.update_settings.last_auto_attempt_unix;
+            self.update_settings.last_auto_attempt_unix = Some(now_unix());
+            if let Err(error) = updater::save_settings(&self.update_settings) {
+                self.update_settings.last_auto_attempt_unix = previous_attempt;
+                self.update_settings_error = Some(format!("无法保存自动检查记录：{error:#}"));
+                self.update_status = "自动检查未执行：更新设置无法保存".into();
+                return;
+            }
+        }
+        self.update_checking = true;
+        self.update_was_manual = manual;
+        self.update_status = "正在检查正式发布版本…".into();
+        self.update_error = None;
+        let (sender, receiver) = mpsc::channel();
+        self.update_result = Some(receiver);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let result = updater::check_latest().map_err(|error| format!("{error:#}"));
+            let _ = sender.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    fn collect_update_events(&mut self) {
+        let result = match self.update_result.as_ref().map(mpsc::Receiver::try_recv) {
+            Some(Ok(result)) => result,
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                Err("更新检查任务意外结束，请手动重试。".into())
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) | None => return,
+        };
+        self.update_checking = false;
+        self.update_result = None;
+        match result {
+            Ok(result) => {
+                self.update_error = None;
+                self.update_settings.last_checked_unix = Some(now_unix());
+                if let Err(error) = updater::save_settings(&self.update_settings) {
+                    self.update_settings_error =
+                        Some(format!("检查已完成，但无法保存检查时间：{error:#}"));
+                } else {
+                    self.update_settings_error = None;
+                }
+                match result {
+                    CheckResult::UpToDate { latest_version } => {
+                        self.update_latest_version = Some(latest_version);
+                        self.update_available = None;
+                        self.update_status = "当前已是最新版本".into();
+                    }
+                    CheckResult::Available(release) => {
+                        self.update_latest_version = Some(release.version.clone());
+                        self.update_status = format!("发现新版本 {}", release.version);
+                        self.update_available = Some(release);
+                    }
+                    CheckResult::NoPublishedRelease => {
+                        self.update_latest_version = None;
+                        self.update_available = None;
+                        self.update_status = "暂未发布正式版本".into();
+                    }
+                }
+            }
+            Err(error) => {
+                self.update_status = if self.update_was_manual {
+                    "检查更新失败，请稍后重试".into()
+                } else {
+                    "自动检查暂不可用".into()
+                };
+                self.update_error = Some(error);
+            }
+        }
+    }
+
+    fn update_dialog(&mut self, ctx: &egui::Context) {
+        if !self.update_dialog_open {
+            return;
+        }
+        let mut close = false;
+        let mut manual_check = false;
+        let mut enable_auto_check = false;
+        let response = egui::Modal::new(egui::Id::new("application_updates"))
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::WHITE)
+                    .corner_radius(16.0)
+                    .inner_margin(26.0),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(620.0);
+                ui.horizontal(|ui| {
+                    icon(ui, Icon::Chip, 25.0, ACCENT);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("FlashTool 更新").size(23.0).strong());
+                        ui.label(
+                            RichText::new(format!("当前版本 {}", env!("CARGO_PKG_VERSION")))
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if text_button(ui, "关闭").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.add_space(14.0);
+                // Keep the subscription controls outside the scrolling content.
+                // Reserve their full height even in the minimum 720px window.
+                egui::ScrollArea::vertical()
+                    .id_salt("update_dialog_content")
+                    .max_height((ctx.screen_rect().height() - 420.0).max(180.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        egui::Frame::new()
+                            .fill(BACKGROUND)
+                            .corner_radius(10.0)
+                            .inner_margin(16.0)
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    if self.update_checking {
+                                        ui.spinner();
+                                    }
+                                    ui.label(
+                                        RichText::new(&self.update_status)
+                                            .size(16.0)
+                                            .strong()
+                                            .color(if self.update_available.is_some() {
+                                                ACCENT
+                                            } else {
+                                                INK
+                                            }),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .add_enabled_ui(!self.update_checking, |ui| {
+                                                    secondary_button(ui, "手动检查", [93.0, 34.0])
+                                                })
+                                                .inner
+                                                .clicked()
+                                            {
+                                                manual_check = true;
+                                            }
+                                        },
+                                    );
+                                });
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(format!(
+                                        "上次成功检查：{}",
+                                        self.update_settings
+                                            .last_checked_unix
+                                            .map(format_update_time)
+                                            .unwrap_or_else(|| "尚未检查".into())
+                                    ))
+                                    .size(11.0)
+                                    .color(MUTED),
+                                );
+                                if let Some(version) = &self.update_latest_version {
+                                    ui.label(
+                                        RichText::new(format!("最新正式版本：{version}"))
+                                            .size(12.0)
+                                            .color(MUTED),
+                                    );
+                                }
+                            });
+                        ui.add_space(8.0);
+                        let was_auto = self.update_settings.auto_check;
+                        if ui
+                            .checkbox(
+                                &mut self.update_settings.auto_check,
+                                "启动时自动检查更新（每天最多一次）",
+                            )
+                            .changed()
+                        {
+                            if let Err(error) = updater::save_settings(&self.update_settings) {
+                                self.update_settings.auto_check = was_auto;
+                                self.update_settings_error =
+                                    Some(format!("无法保存自动检查设置：{error:#}"));
+                            } else {
+                                self.update_settings_error = None;
+                                enable_auto_check = self.update_settings.auto_check;
+                            }
+                        }
+                        if let Some(message) = &self.update_settings_error {
+                            banner(ui, message, true);
+                        }
+                        if let Some(message) = &self.update_error {
+                            ui.add_space(4.0);
+                            banner(ui, &format!("更新服务暂不可用：{message}"), true);
+                        }
+                        if let Some(release) = &self.update_available {
+                            ui.add_space(12.0);
+                            ui.label(
+                                RichText::new(format!("版本 {}", release.version))
+                                    .size(16.0)
+                                    .strong()
+                                    .color(ACCENT),
+                            );
+                            if !release.notes.trim().is_empty() {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("release_notes")
+                                    .max_height(120.0)
+                                    .show(ui, |ui| {
+                                        let mut notes =
+                                            release.notes.chars().take(2_000).collect::<String>();
+                                        if release.notes.chars().count() > 2_000 {
+                                            notes.push_str("\n…完整说明请查看发布页面。");
+                                        }
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(notes).size(12.0).color(MUTED),
+                                            )
+                                            .wrap(),
+                                        );
+                                    });
+                            }
+                            ui.add_space(5.0);
+                            if release.download_url.is_none() {
+                                ui.label(
+                                    RichText::new("发布包尚未上传，可先查看发布页面。")
+                                        .size(12.0)
+                                        .color(MUTED),
+                                );
+                            }
+                            ui.horizontal(|ui| {
+                                if let Some(url) = &release.download_url
+                                    && primary_button(ui, "下载新版", [124.0, 38.0]).clicked()
+                                {
+                                    ctx.open_url(egui::OpenUrl::new_tab(url));
+                                }
+                                if secondary_button(ui, "查看发布", [105.0, 38.0]).clicked() {
+                                    ctx.open_url(egui::OpenUrl::new_tab(&release.release_url));
+                                }
+                            });
+                        }
+                    });
+                ui.add_space(14.0);
+                mail_subscription_footer(ui, ctx);
+            });
+        if close || response.should_close() {
+            self.update_dialog_open = false;
+        }
+        if manual_check {
+            self.start_update_check(true, ctx);
+        } else if enable_auto_check {
+            self.start_update_check(false, ctx);
+        }
     }
 
     fn scan_ports(&mut self) {
@@ -400,7 +698,7 @@ impl FlashApp {
         };
     }
 
-    fn sidebar(&self, ui: &mut egui::Ui) {
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             icon(ui, Icon::Chip, 24.0, Color32::from_rgb(79, 215, 191));
@@ -412,11 +710,29 @@ impl FlashApp {
             );
         });
         ui.add_space(2.0);
-        ui.label(
-            RichText::new(format!("VERSION {}", env!("CARGO_PKG_VERSION")))
-                .size(10.0)
-                .color(Color32::from_rgb(123, 145, 169)),
-        );
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            ui.label(
+                RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                    .size(10.0)
+                    .color(Color32::from_rgb(123, 145, 169)),
+            );
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("检查更新")
+                            .size(11.0)
+                            .color(Color32::from_rgb(133, 209, 193)),
+                    )
+                    .frame(false)
+                    .min_size(egui::vec2(0.0, 23.0)),
+                )
+                .clicked()
+            {
+                self.open_update_dialog();
+                self.start_update_check(true, ui.ctx());
+            }
+        });
         ui.add_space(30.0);
         ui.label(
             RichText::new("工作空间")
@@ -457,6 +773,71 @@ impl FlashApp {
                 .size(11.0)
                 .color(Color32::from_rgb(133, 153, 177)),
         );
+        if self.update_checking {
+            ui.add_space(15.0);
+            ui.label(
+                RichText::new("正在检查更新…")
+                    .size(11.0)
+                    .color(Color32::from_rgb(133, 153, 177)),
+            );
+        } else if let Some(version) = self
+            .update_available
+            .as_ref()
+            .map(|release| release.version.clone())
+        {
+            ui.add_space(20.0);
+            egui::Frame::new()
+                .fill(Color32::from_rgb(24, 63, 66))
+                .corner_radius(8.0)
+                .inner_margin(11.0)
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.label(
+                        RichText::new("发现新版本")
+                            .size(11.0)
+                            .color(Color32::from_rgb(130, 218, 196)),
+                    );
+                    ui.label(
+                        RichText::new(version)
+                            .size(15.0)
+                            .strong()
+                            .color(Color32::from_rgb(206, 247, 234)),
+                    );
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("查看更新  >")
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(130, 218, 196)),
+                            )
+                            .frame(false),
+                        )
+                        .clicked()
+                    {
+                        self.open_update_dialog();
+                    }
+                });
+        } else if self.update_settings_error.is_some() || self.update_error.is_some() {
+            ui.add_space(15.0);
+            let text = if self.update_settings_error.is_some() {
+                "更新设置需要检查"
+            } else {
+                "更新检查暂不可用"
+            };
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new(text)
+                            .size(10.0)
+                            .color(Color32::from_rgb(149, 163, 182)),
+                    )
+                    .frame(false),
+                )
+                .clicked()
+            {
+                self.open_update_dialog();
+            }
+        }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.add_space(10.0);
             ui.label(
@@ -505,6 +886,8 @@ impl FlashApp {
                     .inner
                     .clicked()
                 {
+                    self.chip_picker_open = false;
+                    self.update_dialog_open = false;
                     self.driver_dialog_open = true;
                 }
                 let (text, color) = if self.running() {
@@ -550,6 +933,8 @@ impl FlashApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if secondary_button(ui, "选择芯片  >", [112.0, 38.0]).clicked() {
                     self.pending_chip = self.selected_chip;
+                    self.driver_dialog_open = false;
+                    self.update_dialog_open = false;
                     self.chip_picker_open = true;
                 }
             });
@@ -1238,6 +1623,7 @@ impl FlashApp {
 impl eframe::App for FlashApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.collect_events();
+        self.collect_update_events();
         let busy = self.busy();
         if ctx.input(|input| input.viewport().close_requested()) && busy {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1316,7 +1702,8 @@ impl eframe::App for FlashApp {
             self.chip_dialog(ctx);
             self.driver_dialog(ctx);
         }
-        if self.busy() {
+        self.update_dialog(ctx);
+        if self.busy() || self.update_checking {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -1634,6 +2021,56 @@ fn banner(ui: &mut egui::Ui, message: &str, error: bool) {
                 .wrap(),
             );
         });
+}
+
+fn mail_subscription_footer(ui: &mut egui::Ui, ctx: &egui::Context) {
+    egui::Frame::new()
+        .fill(ACCENT_LIGHT)
+        .corner_radius(10.0)
+        .inner_margin(14.0)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.set_min_height(94.0);
+            ui.label(
+                RichText::new("新版本邮件提醒")
+                    .size(14.0)
+                    .strong()
+                    .color(INK),
+            );
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "在 GitHub 仓库选择 Watch → Custom → Releases，并在通知设置中启用邮件。",
+                    )
+                    .size(11.0)
+                    .color(MUTED),
+                )
+                .wrap(),
+            );
+            if secondary_button(ui, "订阅版本邮件", [137.0, 36.0]).clicked() {
+                ctx.open_url(egui::OpenUrl::new_tab(
+                    "https://github.com/xiaoxiaoawei/hw_hub",
+                ));
+            }
+        });
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn format_update_time(timestamp: u64) -> String {
+    i64::try_from(timestamp)
+        .ok()
+        .and_then(|seconds| chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0))
+        .map(|time| {
+            time.with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "时间无效".into())
 }
 
 fn timestamp() -> String {

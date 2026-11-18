@@ -1116,13 +1116,14 @@ checksum = "911aadae41ec99104efa865bd0b6e486b4b735999f9b571963748a46d16495ab"
 
 [[package]]
 name = "esp32c3-flashtool"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
  "eframe",
  "espflash",
  "rfd",
+ "semver",
  "serde",
  "serde_json",
  "serialport",
