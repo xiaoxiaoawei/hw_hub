@@ -1,3 +1,6 @@
+mod settings;
+mod software_update;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs,
@@ -10,7 +13,7 @@ use std::{
 use chrono::Local;
 use eframe::egui::{self, Color32, RichText};
 use esp32c3_flashtool::{
-    backend::{self, DeviceIdentity, Port},
+    backend::{DeviceIdentity, Port},
     batch::{Batch, BatchEvent, BatchEventKind, JobState},
     chip::ChipModel,
     device_scan::DeviceScanner,
@@ -179,7 +182,7 @@ struct PendingRecord {
 #[derive(Default)]
 struct ScanSchedule {
     manual_pending: bool,
-    event_deadlines: VecDeque<Instant>,
+    event_deadlines: [Option<Instant>; 5],
     last_scan: Option<Instant>,
 }
 
@@ -189,20 +192,17 @@ impl ScanSchedule {
     }
 
     fn device_event(&mut self, now: Instant) {
-        // Discover immediately, then use finite event-only settling scans.
-        // Unioning pending deadlines prevents a USB/COM burst from postponing
-        // an earlier request while the current enumeration is still active.
-        let mut pending: BTreeSet<_> = self.event_deadlines.iter().copied().collect();
-        pending.extend(
-            [0, 100, 300, 750, 1_500]
-                .into_iter()
-                .map(|millis| now + Duration::from_millis(millis)),
-        );
-        self.event_deadlines = pending.into_iter().collect();
+        // Fixed slots coalesce successive responses from the hub and driver.
+        // Preserve earlier work and make one final pass after the last event.
+        for (slot, millis) in self.event_deadlines[..4].iter_mut().zip([0, 100, 300, 750]) {
+            let deadline = now + Duration::from_millis(millis);
+            *slot = Some(slot.map_or(deadline, |pending| pending.min(deadline)));
+        }
+        self.event_deadlines[4] = Some(now + Duration::from_millis(1_500));
     }
 
     fn disable_auto(&mut self) {
-        self.event_deadlines.clear();
+        self.event_deadlines.fill(None);
     }
 
     fn is_due(&self, now: Instant) -> bool {
@@ -212,12 +212,10 @@ impl ScanSchedule {
     fn scan_started(&mut self, now: Instant) {
         self.manual_pending = false;
         self.last_scan = Some(now);
-        while self
-            .event_deadlines
-            .front()
-            .is_some_and(|deadline| *deadline <= now)
-        {
-            self.event_deadlines.pop_front();
+        for deadline in &mut self.event_deadlines {
+            if deadline.is_some_and(|time| time <= now) {
+                *deadline = None;
+            }
         }
     }
 
@@ -231,11 +229,10 @@ impl ScanSchedule {
     }
 
     fn auto_deadline(&self) -> Option<Instant> {
-        self.event_deadlines.front().map(|deadline| {
-            self.last_scan.map_or(*deadline, |last| {
-                (*deadline).max(last + Duration::from_millis(50))
-            })
-        })
+        let deadline = self.event_deadlines.iter().flatten().copied().min()?;
+        Some(self.last_scan.map_or(deadline, |last| {
+            deadline.max(last + Duration::from_millis(50))
+        }))
     }
 }
 
@@ -244,7 +241,6 @@ pub struct FlashApp {
     pending_chip: ChipModel,
     batch_chip: ChipModel,
     chip_picker_open: bool,
-    driver_dialog_open: bool,
     pending_driver_license: Option<DriverKind>,
     layout: FirmwareLayout,
     firmware: Vec<FirmwareRow>,
@@ -283,9 +279,6 @@ pub struct FlashApp {
     record_submit_error: Option<String>,
     close_confirm_open: bool,
     allow_exit: bool,
-    diagnostics_running: bool,
-    diagnostics_result: Option<mpsc::Receiver<Result<String, String>>>,
-    diagnostics_text: String,
     error: Option<String>,
     notice: Option<String>,
     driver_result: Option<mpsc::Receiver<Result<String, String>>>,
@@ -302,11 +295,9 @@ pub struct FlashApp {
     update_settings_error: Option<String>,
     update_result: Option<mpsc::Receiver<Result<CheckResult, String>>>,
     update_checking: bool,
-    update_was_manual: bool,
     update_status: String,
     update_error: Option<String>,
     update_available: Option<ReleaseUpdate>,
-    update_latest_version: Option<String>,
     update_service: SelfUpdateService,
     prepared_update: Option<PreparedUpdate>,
     update_downloaded: u64,
@@ -317,8 +308,6 @@ pub struct FlashApp {
     update_focus_later: bool,
     resume_settings_after_update: bool,
     installer_preparing: bool,
-    installer_ready: bool,
-    install_allow_upload_interruption: bool,
     installer_result: Option<mpsc::Receiver<Result<(), String>>>,
 }
 
@@ -352,13 +341,17 @@ impl FlashApp {
         cc.egui_ctx.style_mut(|style| {
             style.spacing.item_spacing = egui::vec2(8.0, 7.0);
             style.spacing.button_padding = egui::vec2(10.0, 7.0);
-            style.spacing.interact_size.y = 32.0;
+            style.spacing.interact_size.y = 30.0;
             style
                 .text_styles
-                .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+                .insert(egui::TextStyle::Body, egui::FontId::proportional(13.0));
             style
                 .text_styles
-                .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
+                .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
+            style.text_styles.insert(
+                egui::TextStyle::Heading,
+                egui::FontId::new(18.0, egui::FontFamily::Name("ui-heading".into())),
+            );
         });
         let (update_settings, update_settings_error) = match updater::load_settings() {
             Ok(settings) => (settings, None),
@@ -389,7 +382,6 @@ impl FlashApp {
             pending_chip: ChipModel::default(),
             batch_chip: ChipModel::default(),
             chip_picker_open: false,
-            driver_dialog_open: false,
             pending_driver_license: None,
             layout: FirmwareLayout::Merged,
             firmware: vec![FirmwareRow::empty("合并固件", "0x0")],
@@ -432,9 +424,6 @@ impl FlashApp {
             record_submit_error: None,
             close_confirm_open: false,
             allow_exit: false,
-            diagnostics_running: false,
-            diagnostics_result: None,
-            diagnostics_text: String::new(),
             error: None,
             notice: None,
             driver_result: None,
@@ -451,11 +440,9 @@ impl FlashApp {
             update_settings_error,
             update_result: None,
             update_checking: false,
-            update_was_manual: false,
             update_status: "尚未检查更新".into(),
             update_error: None,
             update_available: None,
-            update_latest_version: None,
             update_service: SelfUpdateService::new(move || update_repaint.request_repaint()),
             prepared_update: None,
             update_downloaded: 0,
@@ -466,8 +453,6 @@ impl FlashApp {
             update_focus_later: false,
             resume_settings_after_update: false,
             installer_preparing: false,
-            installer_ready: false,
-            install_allow_upload_interruption: false,
             installer_result: None,
         };
         app.scan_ports();
@@ -491,329 +476,6 @@ impl FlashApp {
         self.running() || self.driver_busy || self.installer_preparing
     }
 
-    fn open_update_dialog(&mut self) {
-        self.resume_settings_after_update |= self.settings_open;
-        self.settings_open = false;
-        self.chip_picker_open = false;
-        self.driver_dialog_open = false;
-        self.pending_driver_license = None;
-        self.update_dialog_open = true;
-        self.update_prompt_pending = false;
-        self.update_focus_later = true;
-    }
-
-    fn start_update_check(&mut self, manual: bool, ctx: &egui::Context) {
-        if self.update_checking || self.update_service.is_busy() || self.installer_preparing {
-            return;
-        }
-        if !manual {
-            if !updater::should_auto_check(&self.update_settings, now_unix()) {
-                return;
-            }
-            let previous_attempt = self.update_settings.last_auto_attempt_unix;
-            self.update_settings.last_auto_attempt_unix = Some(now_unix());
-            if let Err(error) = updater::save_settings(&self.update_settings) {
-                self.update_settings.last_auto_attempt_unix = previous_attempt;
-                self.update_settings_error = Some(format!("无法保存自动检查记录：{error:#}"));
-                self.update_status = "自动检查未执行：更新设置无法保存".into();
-                return;
-            }
-        }
-        self.update_checking = true;
-        self.update_was_manual = manual;
-        self.update_status = "正在检查正式发布版本…".into();
-        self.update_error = None;
-        let (sender, receiver) = mpsc::channel();
-        self.update_result = Some(receiver);
-        let ctx = ctx.clone();
-        thread::spawn(move || {
-            let result = updater::check_latest().map_err(|error| format!("{error:#}"));
-            let _ = sender.send(result);
-            ctx.request_repaint();
-        });
-    }
-
-    fn collect_update_events(&mut self, ctx: &egui::Context) {
-        let result = match self.update_result.as_ref().map(mpsc::Receiver::try_recv) {
-            Some(Ok(result)) => result,
-            Some(Err(mpsc::TryRecvError::Disconnected)) => {
-                Err("更新检查任务意外结束，请手动重试。".into())
-            }
-            Some(Err(mpsc::TryRecvError::Empty)) | None => return,
-        };
-        self.update_checking = false;
-        self.update_result = None;
-        match result {
-            Ok(result) => {
-                self.update_error = None;
-                self.update_settings.last_checked_unix = Some(now_unix());
-                if let Err(error) = updater::save_settings(&self.update_settings) {
-                    self.update_settings_error =
-                        Some(format!("检查已完成，但无法保存检查时间：{error:#}"));
-                } else {
-                    self.update_settings_error = None;
-                }
-                match result {
-                    CheckResult::UpToDate { latest_version } => {
-                        self.update_latest_version = Some(latest_version);
-                        self.update_available = None;
-                        self.update_status = "当前已是最新版本".into();
-                    }
-                    CheckResult::Available(release) => {
-                        if self
-                            .prepared_update
-                            .as_ref()
-                            .is_some_and(|ready| ready.version != release.version)
-                        {
-                            self.prepared_update = None;
-                        }
-                        self.update_latest_version = Some(release.version.clone());
-                        self.update_status = format!("发现新版本 {}", release.version);
-                        self.update_available = Some(release);
-                        self.update_prompt_pending = true;
-                    }
-                    CheckResult::NoPublishedRelease => {
-                        self.update_latest_version = None;
-                        self.update_available = None;
-                        self.update_status = "暂未发布正式版本".into();
-                    }
-                }
-            }
-            Err(error) => {
-                self.update_status = if self.update_was_manual {
-                    "检查更新失败，请稍后重试".into()
-                } else {
-                    "自动检查暂不可用".into()
-                };
-                self.log(format!("更新检查失败：{error}"));
-                self.update_error = Some(error);
-            }
-        }
-        // The result can change modal geometry after its cached sizing pass.
-        // Request one settling frame only when a result was consumed.
-        ctx.request_repaint();
-    }
-
-    fn start_download_update(&mut self) {
-        let Some(release) = self.update_available.clone() else {
-            return;
-        };
-        if self.update_service.is_busy() || self.installer_preparing {
-            return;
-        }
-        self.self_update_error = None;
-        self.update_downloaded = 0;
-        self.update_total = None;
-        match self.update_service.start_download(release) {
-            Ok(()) => self.self_update_phase = "正在下载更新".into(),
-            Err(error) => self.self_update_error = Some(format!("无法开始下载更新：{error:#}")),
-        }
-    }
-
-    fn poll_self_update(&mut self, ctx: &egui::Context) {
-        while let Some(event) = self.update_service.poll() {
-            match event {
-                SelfUpdateEvent::Progress {
-                    downloaded,
-                    total,
-                    phase,
-                } => {
-                    self.update_downloaded = downloaded;
-                    self.update_total = total;
-                    self.self_update_phase = phase;
-                }
-                SelfUpdateEvent::Ready(prepared) => {
-                    self.prepared_update = Some(prepared);
-                    self.self_update_phase = "更新已下载并校验".into();
-                    self.self_update_error = None;
-                    self.update_prompt_pending = true;
-                }
-                SelfUpdateEvent::Failed(error) => {
-                    self.self_update_phase = "更新未完成".into();
-                    self.log(format!("更新未完成：{error}"));
-                    self.self_update_error = Some(error);
-                }
-            }
-            ctx.request_repaint();
-        }
-        let result = match self.installer_result.as_ref().map(mpsc::Receiver::try_recv) {
-            Some(Ok(result)) => Some(result),
-            Some(Err(mpsc::TryRecvError::Disconnected)) => {
-                Some(Err("更新准备任务意外结束。".into()))
-            }
-            _ => None,
-        };
-        if let Some(result) = result {
-            self.installer_result = None;
-            match result {
-                Ok(()) => {
-                    self.installer_ready = true;
-                    self.self_update_phase = "更新程序已就绪".into();
-                }
-                Err(error) => {
-                    self.installer_preparing = false;
-                    self.installer_ready = false;
-                    self.prepared_update = None;
-                    self.self_update_phase = "无法准备更新".into();
-                    self.log(format!("无法准备更新：{error}"));
-                    self.self_update_error = Some(error);
-                }
-            }
-            ctx.request_repaint();
-        }
-        if self.installer_ready && self.restart_block_reason().is_none() {
-            if self.record_service.pending_count() > 0 && !self.install_allow_upload_interruption {
-                self.self_update_phase = "本地已保存，请确认未完成上传后重启".into();
-                if !self.update_dialog_open {
-                    self.update_prompt_pending = true;
-                }
-            } else {
-                self.allow_exit = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        }
-    }
-
-    fn restart_block_reason(&self) -> Option<&'static str> {
-        restart_safety_reason(
-            self.running(),
-            self.driver_busy,
-            self.record_service.pending_local_count(),
-            self.pending_records.len(),
-            self.failed_records.len(),
-        )
-    }
-
-    fn start_update_installer(&mut self, ctx: &egui::Context) {
-        if let Some(reason) = self.restart_block_reason() {
-            self.self_update_phase = reason.into();
-            return;
-        }
-        if !cfg!(windows) {
-            self.self_update_error =
-                Some("当前平台不支持安装 Windows 更新，请在 Windows 电脑使用。".into());
-            return;
-        }
-        self.install_allow_upload_interruption = self.record_service.pending_count() > 0;
-        if self.installer_ready {
-            self.poll_self_update(ctx);
-            return;
-        }
-        if self.installer_preparing {
-            return;
-        }
-        let Some(prepared) = self.prepared_update.clone() else {
-            return;
-        };
-        self.installer_preparing = true;
-        self.self_update_error = None;
-        self.self_update_phase = "正在准备重启并检查写入权限".into();
-        self.settings_open = false;
-        self.resume_settings_after_update = false;
-        self.driver_dialog_open = false;
-        self.pending_driver_license = None;
-        let (sender, receiver) = mpsc::channel();
-        self.installer_result = Some(receiver);
-        let ctx = ctx.clone();
-        thread::spawn(move || {
-            let result =
-                self_update::launch_installer(&prepared).map_err(|error| format!("{error:#}"));
-            let _ = sender.send(result);
-            ctx.request_repaint();
-        });
-    }
-
-    fn update_dialog(&mut self, ctx: &egui::Context) {
-        if !self.update_dialog_open {
-            return;
-        }
-        let mut later = false;
-        let mut manual_check = false;
-        let mut download = false;
-        let mut restart = false;
-        let response = egui::Modal::new(egui::Id::new("application_updates"))
-            .frame(egui::Frame::new().fill(SURFACE).corner_radius(6.0).inner_margin(20.0))
-            .show(ctx, |ui| {
-                ui.set_width(600.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("FlashTool 更新").size(20.0).strong());
-                    ui.label(RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).size(12.0).color(MUTED));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { if text_button(ui, "关闭").clicked() { later = true; } });
-                });
-                ui.add_space(8.0);
-                if let Some(message) = &self.self_update_error { update_error_panel(ui, ctx, &self.self_update_phase, message); }
-                else if let Some(message) = &self.update_error { update_error_panel(ui, ctx, &self.update_status, message); }
-                let max_height = (ctx.screen_rect().height() - 240.0 - if self.self_update_error.is_some() || self.update_error.is_some() { 190.0 } else { 0.0 }).max(170.0);
-                egui::ScrollArea::vertical().id_salt("update_dialog_content").min_scrolled_height(170.0).max_height(max_height).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let status = if self.installer_preparing || self.update_service.is_busy() || self.prepared_update.is_some() { &self.self_update_phase } else { &self.update_status };
-                        if self.update_checking || self.update_service.is_busy() || self.installer_preparing { ui.spinner(); }
-                        ui.add(egui::Label::new(RichText::new(status).size(14.0).strong()).wrap());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add_enabled_ui(!self.update_checking && !self.update_service.is_busy() && !self.installer_preparing, |ui| secondary_button(ui, "手动检查", [91.0, 31.0])).inner.clicked() { manual_check = true; }
-                        });
-                    });
-                    ui.label(RichText::new(format!("上次成功检查：{}", self.update_settings.last_checked_unix.map(format_update_time).unwrap_or_else(|| "尚未检查".into()))).size(12.0).color(MUTED));
-                    let was_auto = self.update_settings.auto_check;
-                    if ui.checkbox(&mut self.update_settings.auto_check, "启动时自动检查更新").changed() {
-                        if let Err(error) = updater::save_settings(&self.update_settings) {
-                            self.update_settings.auto_check = was_auto;
-                            self.update_settings_error = Some(format!("无法保存更新设置：{error:#}"));
-                        } else { self.update_settings_error = None; }
-                    }
-                    if let Some(error) = &self.update_settings_error { banner(ui, error, true); }
-                    ui.separator();
-                    if let Some(prepared) = &self.prepared_update {
-                        ui.label(RichText::new(format!("v{} 已下载并校验，是否重启安装？", prepared.version)).size(15.0).strong());
-                        ui.label(RichText::new("重启前请先保存软件设置。").size(12.0).color(MUTED));
-                        if let Some(reason) = self.restart_block_reason() { ui.label(RichText::new(reason).size(12.0).color(MUTED)); }
-                        let uploads = self.record_service.pending_count().saturating_sub(self.record_service.pending_local_count());
-                        if uploads > 0 { ui.label(RichText::new(format!("本地已保存，仍有 {uploads} 条上传未完成；重启会中断这些上传。")).size(12.0).color(DANGER)); }
-                        ui.horizontal(|ui| {
-                            let postpone = secondary_button(ui, if self.installer_preparing { "隐藏" } else { "稍后" }, [88.0, 36.0]);
-                            if self.update_focus_later { postpone.request_focus(); self.update_focus_later = false; }
-                            if postpone.clicked() { later = true; }
-                            if ui.add_enabled_ui(self.restart_block_reason().is_none() && (!self.installer_preparing || self.installer_ready), |ui| primary_button(ui, "重启更新", [120.0, 36.0])).inner.clicked() { restart = true; }
-                        });
-                    } else if self.update_service.is_busy() {
-                        let progress = self.update_total.filter(|total| *total > 0).map(|total| (self.update_downloaded as f64 / total as f64).clamp(0.0, 1.0) as f32);
-                        let text = match self.update_total { Some(total) => format!("{:.1} / {:.1} MiB", self.update_downloaded as f64 / 1_048_576.0, total as f64 / 1_048_576.0), None => format!("已下载 {:.1} MiB", self.update_downloaded as f64 / 1_048_576.0) };
-                        ui.add(egui::ProgressBar::new(progress.unwrap_or(0.0)).desired_width(ui.available_width()).fill(SUCCESS).text(text).animate(progress.is_none()));
-                    } else if let Some(release) = &self.update_available {
-                        ui.label(RichText::new(format!("发现新版本 v{}", release.version)).size(15.0).strong());
-                        if !release.notes.trim().is_empty() { ui.add(egui::Label::new(RichText::new(release.notes.chars().take(1_500).collect::<String>()).size(12.0).color(MUTED)).wrap()); }
-                        if release.download_url.is_some() {
-                            ui.label(RichText::new("是否下载更新？下载期间可继续使用。").size(12.0).color(MUTED));
-                            ui.horizontal(|ui| {
-                                let postpone = secondary_button(ui, "稍后", [88.0, 36.0]);
-                                if self.update_focus_later { postpone.request_focus(); self.update_focus_later = false; }
-                                if postpone.clicked() { later = true; }
-                                if primary_button(ui, "下载更新", [120.0, 36.0]).clicked() { download = true; }
-                            });
-                        } else { ui.label(RichText::new("发布包尚未上传。").size(12.0).color(MUTED)); }
-                        if text_button(ui, "查看官方发布页").clicked() { ctx.open_url(egui::OpenUrl::new_tab(&release.release_url)); }
-                    }
-                });
-            });
-        if later || response.should_close() {
-            self.update_dialog_open = false;
-            self.update_prompt_pending = false;
-            if self.resume_settings_after_update {
-                self.settings_open = true;
-                self.resume_settings_after_update = false;
-            }
-        }
-        if manual_check {
-            self.start_update_check(true, ctx);
-        }
-        if download {
-            self.start_download_update();
-        }
-        if restart {
-            self.start_update_installer(ctx);
-        }
-    }
-
     fn scan_ports(&mut self) {
         self.scan_schedule.request_manual();
         self.start_scheduled_scan();
@@ -827,6 +489,16 @@ impl FlashApp {
     }
 
     fn poll_ports(&mut self) {
+        if let Some(Err(error)) = self
+            .watcher
+            .as_mut()
+            .and_then(DeviceWatcher::poll_registration)
+        {
+            self.watcher = None;
+            self.auto_refresh = false;
+            self.scan_schedule.disable_auto();
+            self.watcher_error = Some(format!("设备插拔监听不可用：{error:#}"));
+        }
         if self
             .watcher
             .as_ref()
@@ -1336,318 +1008,6 @@ impl FlashApp {
         self.retry_record_submissions();
     }
 
-    fn start_diagnostics(&mut self, ctx: &egui::Context) {
-        if self.diagnostics_running {
-            return;
-        }
-        self.diagnostics_running = true;
-        let (sender, receiver) = mpsc::channel();
-        self.diagnostics_result = Some(receiver);
-        let ctx = ctx.clone();
-        thread::spawn(move || {
-            let result =
-                backend::port_diagnostics().map_err(|error| format!("串口诊断失败：{error:#}"));
-            let _ = sender.send(result);
-            ctx.request_repaint();
-        });
-    }
-
-    fn poll_diagnostics(&mut self) {
-        let result = match self
-            .diagnostics_result
-            .as_ref()
-            .map(mpsc::Receiver::try_recv)
-        {
-            Some(Ok(result)) => result,
-            Some(Err(mpsc::TryRecvError::Disconnected)) => Err("串口诊断任务意外结束。".into()),
-            _ => return,
-        };
-        self.diagnostics_running = false;
-        self.diagnostics_result = None;
-        self.diagnostics_text = result.unwrap_or_else(|error| error);
-    }
-
-    fn settings_window(&mut self, ctx: &egui::Context) {
-        if !self.settings_open {
-            return;
-        }
-        let mut open = true;
-        let mut check_updates = false;
-        egui::Window::new("软件设置")
-            .id(egui::Id::new("software_settings"))
-            .open(&mut open)
-            .default_size([720.0, 640.0])
-            .min_size([570.0, 420.0])
-            .max_height(ctx.screen_rect().height() - 50.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("settings_content")
-                    .min_scrolled_height(300.0)
-                    .max_height((ui.available_height() - 65.0).max(250.0))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("FlashTool {}", env!("CARGO_PKG_VERSION")))
-                                    .size(22.0)
-                                    .strong(),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if secondary_button(ui, "检查软件更新", [119.0, 33.0]).clicked()
-                                    {
-                                        check_updates = true;
-                                    }
-                                },
-                            );
-                        });
-                        ui.checkbox(&mut self.settings_auto_update, "启动时自动检查软件更新");
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui.label(RichText::new("本地记录").size(16.0).strong());
-                        let directory = self
-                            .telemetry_draft
-                            .csv_directory
-                            .clone()
-                            .map(Ok)
-                            .unwrap_or_else(telemetry::default_records_directory);
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("CSV 目录").size(12.0).color(MUTED));
-                            if secondary_button(ui, "选择目录", [89.0, 31.0]).clicked()
-                                && let Some(path) = rfd::FileDialog::new()
-                                    .set_title("选择烧录记录 CSV 目录")
-                                    .pick_folder()
-                            {
-                                self.telemetry_draft.csv_directory = Some(path);
-                                self.settings_saved = false;
-                            }
-                            if text_button(ui, "默认目录").clicked() {
-                                self.telemetry_draft.csv_directory = None;
-                                self.settings_saved = false;
-                            }
-                            if let Ok(path) = &directory
-                                && ui
-                                    .add_enabled_ui(path.is_dir(), |ui| text_button(ui, "打开目录"))
-                                    .inner
-                                    .clicked()
-                                && let Err(error) = open_records_directory(path)
-                            {
-                                self.telemetry_settings_error =
-                                    Some(format!("无法打开记录目录：{error}"));
-                            }
-                        });
-                        match directory {
-                            Ok(path) => {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(path.display().to_string())
-                                            .monospace()
-                                            .size(12.0)
-                                            .color(MUTED),
-                                    )
-                                    .wrap(),
-                                );
-                            }
-                            Err(error) => {
-                                ui.label(
-                                    RichText::new(format!("默认目录不可用：{error}"))
-                                        .size(12.0)
-                                        .color(DANGER),
-                                );
-                            }
-                        }
-                        ui.label(
-                            RichText::new("每台设备任务结束后自动保存 CSV，上报关闭时仍会保存。")
-                                .size(12.0)
-                                .color(MUTED),
-                        );
-                        if !self.failed_records.is_empty() {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{} 条本地记录保存失败",
-                                        self.failed_records.len()
-                                    ))
-                                    .size(12.0)
-                                    .color(DANGER),
-                                );
-                                if secondary_button(ui, "保存设置并重试", [140.0, 32.0]).clicked()
-                                    && self.save_settings_from_ui()
-                                {
-                                    self.retry_failed_local_records();
-                                }
-                            });
-                        }
-                        ui.add_space(9.0);
-                        ui.separator();
-                        ui.label(RichText::new("日志上报").size(16.0).strong());
-                        ui.checkbox(&mut self.telemetry_draft.upload_enabled, "启用烧录日志上报");
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("接口地址").size(12.0).color(MUTED));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.telemetry_draft.endpoint)
-                                    .desired_width(ui.available_width())
-                                    .hint_text("http:// 或 https://"),
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("请求超时").size(12.0).color(MUTED));
-                            ui.add(
-                                egui::DragValue::new(&mut self.telemetry_draft.timeout_seconds)
-                                    .range(5..=30)
-                                    .suffix(" 秒"),
-                            );
-                        });
-                        if !self.failed_uploads.is_empty() {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{} 条记录已保存，上传未完成",
-                                        self.failed_uploads.len()
-                                    ))
-                                    .size(12.0)
-                                    .color(MUTED),
-                                );
-                                if ui
-                                    .add_enabled_ui(self.telemetry_draft.upload_enabled, |ui| {
-                                        secondary_button(ui, "按当前设置重试上报", [172.0, 32.0])
-                                    })
-                                    .inner
-                                    .clicked()
-                                    && self.save_settings_from_ui()
-                                {
-                                    self.retry_failed_uploads();
-                                }
-                            });
-                        }
-                        egui::CollapsingHeader::new("高级设置 · 身份提取与请求头")
-                            .id_salt("advanced_record_settings")
-                            .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new("eFuse 出厂 MAC 提取规则")
-                                        .size(12.0)
-                                        .color(MUTED),
-                                );
-                                ui.add(
-                                    egui::TextEdit::singleline(
-                                        &mut self.telemetry_draft.efuse_pattern,
-                                    )
-                                    .font(egui::TextStyle::Monospace)
-                                    .desired_width(ui.available_width()),
-                                );
-                                ui.label(RichText::new("MAC 提取规则").size(12.0).color(MUTED));
-                                ui.add(
-                                    egui::TextEdit::singleline(
-                                        &mut self.telemetry_draft.mac_pattern,
-                                    )
-                                    .font(egui::TextStyle::Monospace)
-                                    .desired_width(ui.available_width()),
-                                );
-                                ui.add_space(5.0);
-                                ui.label(RichText::new("自定义请求头").size(12.0).color(MUTED));
-                                let mut remove = None;
-                                for (index, (name, value)) in
-                                    self.settings_headers.iter_mut().enumerate()
-                                {
-                                    ui.push_id(index, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.add(
-                                                egui::TextEdit::singleline(name)
-                                                    .desired_width(160.0)
-                                                    .hint_text("Header-Name"),
-                                            );
-                                            ui.add(
-                                                egui::TextEdit::singleline(value)
-                                                    .password(true)
-                                                    .desired_width(
-                                                        (ui.available_width() - 63.0).max(120.0),
-                                                    )
-                                                    .hint_text("Header value"),
-                                            );
-                                            if text_button(ui, "移除").clicked() {
-                                                remove = Some(index);
-                                            }
-                                        });
-                                    });
-                                }
-                                if let Some(index) = remove {
-                                    self.settings_headers.remove(index);
-                                }
-                                if text_button(ui, "+ 添加请求头").clicked() {
-                                    self.settings_headers.push((String::new(), String::new()));
-                                }
-                            });
-                        egui::CollapsingHeader::new("设备诊断")
-                            .id_salt("serial_diagnostics")
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .add_enabled_ui(!self.diagnostics_running, |ui| {
-                                            secondary_button(ui, "生成串口诊断", [124.0, 32.0])
-                                        })
-                                        .inner
-                                        .clicked()
-                                    {
-                                        self.start_diagnostics(ctx);
-                                    }
-                                    if ui
-                                        .add_enabled_ui(!self.diagnostics_text.is_empty(), |ui| {
-                                            text_button(ui, "复制诊断")
-                                        })
-                                        .inner
-                                        .clicked()
-                                    {
-                                        ctx.copy_text(self.diagnostics_text.clone());
-                                    }
-                                    if self.diagnostics_running {
-                                        ui.spinner();
-                                    }
-                                });
-                                if !self.diagnostics_text.is_empty() {
-                                    ui.add(
-                                        egui::TextEdit::multiline(&mut self.diagnostics_text)
-                                            .font(egui::TextStyle::Monospace)
-                                            .interactive(false)
-                                            .desired_width(ui.available_width())
-                                            .desired_rows(8),
-                                    );
-                                }
-                            });
-                        if let Some(error) = &self.telemetry_settings_error {
-                            banner(ui, error, true);
-                        }
-                        if let Some(error) = &self.record_submit_error {
-                            banner(ui, error, true);
-                        }
-                    });
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if primary_button(ui, "保存设置", [124.0, 38.0]).clicked() {
-                        self.save_settings_from_ui();
-                    }
-                    if self.settings_saved {
-                        ui.label(RichText::new("设置已保存").size(12.0).color(ACCENT));
-                    }
-                    let local =
-                        self.record_service.pending_local_count() + self.pending_records.len();
-                    if local > 0 {
-                        ui.label(
-                            RichText::new(format!("{local} 条记录等待本地保存"))
-                                .size(12.0)
-                                .color(MUTED),
-                        );
-                    }
-                });
-            });
-        self.settings_open = open;
-        if check_updates {
-            self.resume_settings_after_update = true;
-            self.open_update_dialog();
-            self.start_update_check(true, ctx);
-        }
-    }
-
     fn confirm_record_exit(&mut self, ctx: &egui::Context) {
         if !self.close_confirm_open {
             return;
@@ -1705,7 +1065,6 @@ impl FlashApp {
         self.error = None;
         self.notice = None;
         self.driver_busy = true;
-        self.driver_dialog_open = false;
         let (sender, receiver) = mpsc::channel();
         self.driver_result = Some(receiver);
         thread::spawn(move || {
@@ -1720,7 +1079,6 @@ impl FlashApp {
 
     fn request_bundled_driver(&mut self, kind: DriverKind) {
         if drivers::bundled_license_text(kind).is_some() {
-            self.driver_dialog_open = false;
             self.pending_driver_license = Some(kind);
         } else {
             self.install_driver(kind, None);
@@ -1824,22 +1182,13 @@ impl FlashApp {
     }
 
     fn open_settings(&mut self) {
-        if self.settings_open {
+        if self.settings_open || self.installer_preparing {
             return;
         }
         self.update_dialog_open = false;
         self.chip_picker_open = false;
-        self.driver_dialog_open = false;
         self.pending_driver_license = None;
-        self.telemetry_draft = self.telemetry_settings.clone();
-        self.settings_headers = self
-            .telemetry_settings
-            .custom_headers
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        self.settings_auto_update = self.update_settings.auto_check;
-        self.settings_saved = false;
+        self.discard_settings_draft();
         self.settings_open = true;
     }
 
@@ -1850,6 +1199,7 @@ impl FlashApp {
             icon(ui, Icon::Chip, 23.0, ACCENT);
             ui.label(
                 RichText::new("FlashTool")
+                    .heading()
                     .size(22.0)
                     .strong()
                     .color(Color32::WHITE),
@@ -1870,24 +1220,33 @@ impl FlashApp {
                 .clicked()
             {
                 self.open_update_dialog();
-                if !self.update_service.is_busy()
-                    && self.prepared_update.is_none()
-                    && !self.installer_preparing
-                {
-                    self.start_update_check(true, ui.ctx());
-                }
+                self.start_update_check(true, ui.ctx());
             }
         });
         ui.add_space(22.0);
-        ui.label(RichText::new("工作空间").size(12.0).color(meta));
+        ui.label(
+            RichText::new("工作空间")
+                .heading()
+                .size(13.0)
+                .strong()
+                .color(INK),
+        );
         if nav_item(ui, Icon::Grid, "批量烧录", !self.settings_open).clicked() {
             self.settings_open = false;
+            self.discard_settings_draft();
         }
         ui.add_space(20.0);
-        ui.label(RichText::new("当前配置").size(12.0).color(meta));
+        ui.label(
+            RichText::new("当前配置")
+                .heading()
+                .size(13.0)
+                .strong()
+                .color(INK),
+        );
         ui.label(
             RichText::new(self.selected_chip.label())
-                .size(12.0)
+                .heading()
+                .size(14.0)
                 .strong()
                 .color(Color32::from_rgb(220, 230, 241)),
         );
@@ -1896,10 +1255,7 @@ impl FlashApp {
                 .size(12.0)
                 .color(meta),
         );
-        if self.installer_preparing
-            || self.update_service.is_busy()
-            || self.prepared_update.is_some()
-        {
+        if self.update_in_progress() {
             ui.add_space(12.0);
             let text = if self.installer_preparing {
                 "正在准备更新"
@@ -1954,14 +1310,24 @@ impl FlashApp {
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.add_space(8.0);
-            ui.label(
-                RichText::new(format!(
-                    "{} 个串口在线",
-                    self.ports.iter().filter(|row| row.online).count()
-                ))
-                .size(12.0)
-                .color(meta),
-            );
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled_ui(!self.installer_preparing, settings_icon_button)
+                    .inner
+                    .on_hover_text("软件设置")
+                    .clicked()
+                {
+                    self.open_settings();
+                }
+                ui.label(
+                    RichText::new(format!(
+                        "{} 个串口在线",
+                        self.ports.iter().filter(|row| row.online).count()
+                    ))
+                    .size(12.0)
+                    .color(meta),
+                );
+            });
             if !self.failed_records.is_empty() {
                 if ui
                     .add(
@@ -1989,6 +1355,7 @@ impl FlashApp {
             title_rect = ui
                 .label(
                     RichText::new("设备烧录工作台")
+                        .heading()
                         .size(22.0)
                         .strong()
                         .color(INK),
@@ -2002,27 +1369,14 @@ impl FlashApp {
                     .inner;
                 controls_left = controls_left.min(driver.rect.left());
                 if driver.clicked() {
-                    self.chip_picker_open = false;
-                    self.update_dialog_open = false;
-                    self.settings_open = false;
-                    self.driver_dialog_open = true;
+                    self.open_settings();
+                    settings::select_page(ui.ctx(), settings::SettingsPage::Drivers);
                 }
-                let (text, color) = if self.running() {
-                    ("批次运行中", ACCENT)
-                } else if self.driver_busy {
-                    ("驱动安装中", ACCENT)
-                } else if self.ports.iter().all(|row| !row.online) {
-                    ("等待连接设备", MUTED)
-                } else {
-                    ("设备已就绪", ACCENT)
-                };
-                controls_left = controls_left.min(status_pill(ui, text, color).left());
             });
         });
         let modal_open = self.settings_open
             || self.update_dialog_open
             || self.chip_picker_open
-            || self.driver_dialog_open
             || self.pending_driver_license.is_some()
             || self.close_confirm_open;
         if !modal_open
@@ -2055,7 +1409,6 @@ impl FlashApp {
         {
             self.pending_chip = self.selected_chip;
             self.settings_open = false;
-            self.driver_dialog_open = false;
             self.update_dialog_open = false;
             self.chip_picker_open = true;
         }
@@ -2169,7 +1522,7 @@ impl FlashApp {
 
     fn firmware_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            panel_title(ui, Icon::File, "本批烧录配置", "01");
+            panel_title(ui, Icon::File, "本批烧录配置");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.chip_panel(ui)
             });
@@ -2279,7 +1632,7 @@ impl FlashApp {
             .filter(|row| row.selected && row.online)
             .count();
         ui.horizontal(|ui| {
-            panel_title(ui, Icon::Usb, "在线 COM 设备", "02");
+            panel_title(ui, Icon::Usb, "在线 COM 设备");
             ui.label(
                 RichText::new(format!("在线 {online}  /  已选 {selected}"))
                     .size(11.0)
@@ -2484,102 +1837,6 @@ impl FlashApp {
         }
     }
 
-    fn driver_panel(&mut self, ui: &mut egui::Ui) {
-        ui.columns(2, |columns| {
-            for (index, kind, name) in [
-                (0, DriverKind::Ch343, "CH343 / CH9102"),
-                (1, DriverKind::Cp210x, "CP2102 / CP210x"),
-            ] {
-                let column = &mut columns[index];
-                let available = drivers::package_available(kind);
-                egui::Frame::new()
-                    .fill(BACKGROUND)
-                    .corner_radius(4.0)
-                    .inner_margin(12.0)
-                    .show(column, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(RichText::new(name).strong().size(13.0));
-                                ui.label(
-                                    RichText::new(
-                                        drivers::package_source(kind).unwrap_or("官方驱动包未内置"),
-                                    )
-                                    .size(11.0)
-                                    .color(MUTED),
-                                );
-                            });
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if available {
-                                        if secondary_button(ui, "安装驱动", [86.0, 34.0]).clicked()
-                                        {
-                                            self.request_bundled_driver(kind);
-                                        }
-                                    } else if secondary_button(ui, "选择 ZIP", [86.0, 34.0])
-                                        .on_hover_text(
-                                            "选择原厂完整驱动 ZIP 后手动安装；不会自动下载或安装。",
-                                        )
-                                        .clicked()
-                                        && let Some(path) = rfd::FileDialog::new()
-                                            .set_title(format!("选择 {name} 原厂完整驱动 ZIP"))
-                                            .add_filter("驱动压缩包", &["zip"])
-                                            .pick_file()
-                                    {
-                                        self.install_driver(kind, Some(path));
-                                    }
-                                },
-                            );
-                        });
-                    });
-            }
-        });
-    }
-
-    fn driver_dialog(&mut self, ctx: &egui::Context) {
-        if !self.driver_dialog_open {
-            return;
-        }
-        let mut close = false;
-        let response = egui::Modal::new(egui::Id::new("driver_manager"))
-            .frame(
-                egui::Frame::new()
-                    .fill(SURFACE)
-                    .corner_radius(6.0)
-                    .inner_margin(25.0),
-            )
-            .show(ctx, |ui| {
-                ui.set_width(660.0);
-                ui.horizontal(|ui| {
-                    icon(ui, Icon::Shield, 22.0, ACCENT);
-                    ui.label(RichText::new("安装 USB 串口驱动").size(22.0).strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if text_button(ui, "关闭").clicked() {
-                            close = true;
-                        }
-                    });
-                });
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("选择设备对应的原厂驱动，安装时 Windows 将请求管理员授权。")
-                        .size(12.0)
-                        .color(MUTED),
-                );
-                ui.add_space(15.0);
-                self.driver_panel(ui);
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new("驱动安装完成后会刷新串口。若尚未发现设备，请重新连接 USB Hub。")
-                        .size(12.0)
-                        .color(MUTED),
-                );
-            });
-        if close || response.should_close() {
-            self.driver_dialog_open = false;
-        }
-    }
-
     fn actions_panel(&mut self, ui: &mut egui::Ui) {
         let running = self.running();
         let selected = self
@@ -2626,9 +1883,6 @@ impl FlashApp {
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if settings_icon_button(ui).on_hover_text("软件设置").clicked() {
-                    self.open_settings();
-                }
                 let label = if running {
                     "批次正在运行…"
                 } else if self.driver_busy {
@@ -2662,7 +1916,7 @@ impl FlashApp {
 
     fn logs_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            panel_title(ui, Icon::Grid, "烧录汇总", "03");
+            panel_title(ui, Icon::Grid, "烧录汇总");
             ui.label(
                 RichText::new(format!("{} 条", self.logs.len()))
                     .size(10.0)
@@ -2818,7 +2072,6 @@ impl eframe::App for FlashApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.collect_events();
         self.poll_records();
-        self.poll_diagnostics();
         self.collect_update_events(ctx);
         self.poll_self_update(ctx);
         self.poll_ports();
@@ -2893,14 +2146,12 @@ impl eframe::App for FlashApp {
             });
         if !busy {
             self.chip_dialog(ctx);
-            self.driver_dialog(ctx);
             self.driver_license_dialog(ctx);
         }
         if self.update_prompt_pending
             && !self.close_confirm_open
             && self.pending_driver_license.is_none()
             && !self.chip_picker_open
-            && !self.driver_dialog_open
         {
             self.open_update_dialog();
         }
@@ -2908,13 +2159,12 @@ impl eframe::App for FlashApp {
         self.settings_window(ctx);
         self.device_log_windows(ctx);
         self.confirm_record_exit(ctx);
-        if self.busy()
-            || self.update_checking
-            || self.scanner.is_scanning()
-            || self.diagnostics_running
-        {
+        if self.busy() || self.update_checking || self.scanner.is_scanning() {
             ctx.request_repaint_after(Duration::from_millis(100));
-        } else if let Some(delay) = self.scan_schedule.repaint_delay(Instant::now()) {
+        }
+        if !self.scanner.is_scanning()
+            && let Some(delay) = self.scan_schedule.repaint_delay(Instant::now())
+        {
             ctx.request_repaint_after(delay);
         }
     }
@@ -3390,36 +2640,15 @@ fn dot(ui: &mut egui::Ui, color: Color32, size: f32) {
     ui.painter().circle_filled(rect.center(), size / 2.0, color);
 }
 
-fn status_pill(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Rect {
-    egui::Frame::new()
-        .fill(Color32::from_rgba_unmultiplied(
-            color.r(),
-            color.g(),
-            color.b(),
-            14,
-        ))
-        .corner_radius(20.0)
-        .inner_margin(egui::Margin::symmetric(11, 6))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                dot(ui, color, 5.0);
-                ui.label(RichText::new(text).size(12.0).color(color));
-            });
-        })
-        .response
-        .rect
-}
-
-fn panel_title(ui: &mut egui::Ui, kind: Icon, title: &str, index: &str) {
+fn panel_title(ui: &mut egui::Ui, kind: Icon, title: &str) {
     ui.horizontal(|ui| {
         icon(ui, kind, 17.0, ACCENT);
-        ui.label(RichText::new(title).size(16.0).strong().color(INK));
         ui.label(
-            RichText::new(index)
-                .monospace()
-                .size(10.0)
-                .color(Color32::from_rgb(166, 178, 193)),
+            RichText::new(title)
+                .heading()
+                .size(16.0)
+                .strong()
+                .color(INK),
         );
     });
 }
@@ -3707,29 +2936,88 @@ fn append_csv<'a>(output: &mut String, values: impl IntoIterator<Item = &'a str>
 }
 
 fn install_fonts(ctx: &egui::Context) {
-    let candidates = [
-        "C:/Windows/Fonts/msyh.ttc",
-        "C:/Windows/Fonts/simhei.ttf",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-    ];
-    for path in candidates {
-        if let Ok(bytes) = fs::read(Path::new(path)) {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts
-                .font_data
-                .insert("chinese".into(), egui::FontData::from_owned(bytes).into());
-            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+    let mut fonts = egui::FontDefinitions::default();
+    let mut load = |name: &str, path: PathBuf| -> bool {
+        match fs::read(path) {
+            Ok(bytes) => {
                 fonts
-                    .families
-                    .entry(family)
-                    .or_default()
-                    .push("chinese".into());
+                    .font_data
+                    .insert(name.into(), egui::FontData::from_owned(bytes).into());
+                true
             }
-            ctx.set_fonts(fonts);
-            break;
+            Err(_) => false,
+        }
+    };
+    let windows_fonts = std::env::var_os("WINDIR")
+        .or_else(|| std::env::var_os("SystemRoot"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:/Windows"))
+        .join("Fonts");
+    let system_ui = cfg!(windows) && load("system-ui", windows_fonts.join("segoeui.ttf"));
+    let system_bold = cfg!(windows) && load("system-ui-bold", windows_fonts.join("segoeuib.ttf"));
+    let system_mono = cfg!(windows) && load("system-mono", windows_fonts.join("consola.ttf"));
+    let mut cjk = cfg!(windows) && load("system-cjk", windows_fonts.join("msyh.ttc"));
+    let cjk_bold = cfg!(windows) && load("system-cjk-bold", windows_fonts.join("msyhbd.ttc"));
+    if !cjk {
+        for path in [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        ] {
+            if load("system-cjk", PathBuf::from(path)) {
+                cjk = true;
+                break;
+            }
         }
     }
+    let fallback = fonts
+        .families
+        .get(&egui::FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let mut proportional = Vec::new();
+    if system_ui {
+        proportional.push("system-ui".into());
+    }
+    if cjk {
+        proportional.push("system-cjk".into());
+    }
+    proportional.extend(fallback.clone());
+    fonts
+        .families
+        .insert(egui::FontFamily::Proportional, proportional);
+    let mut heading = Vec::new();
+    if system_bold {
+        heading.push("system-ui-bold".into());
+    } else if system_ui {
+        heading.push("system-ui".into());
+    }
+    if cjk_bold {
+        heading.push("system-cjk-bold".into());
+    } else if cjk {
+        heading.push("system-cjk".into());
+    }
+    heading.extend(fallback);
+    fonts
+        .families
+        .insert(egui::FontFamily::Name("ui-heading".into()), heading);
+    let mut monospace = Vec::new();
+    if system_mono {
+        monospace.push("system-mono".into());
+    }
+    if cjk {
+        monospace.push("system-cjk".into());
+    }
+    monospace.extend(
+        fonts
+            .families
+            .get(&egui::FontFamily::Monospace)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    fonts
+        .families
+        .insert(egui::FontFamily::Monospace, monospace);
+    ctx.set_fonts(fonts);
 }
 
 #[cfg(test)]
@@ -3989,16 +3277,21 @@ mod tests {
     }
 
     #[test]
-    fn successive_device_events_do_not_postpone_an_earlier_due_scan() {
+    fn large_device_burst_keeps_earliest_scan_and_only_one_final_settling_pass() {
         let mut schedule = ScanSchedule::default();
         let now = Instant::now();
-        schedule.device_event(now);
-        schedule.device_event(now + Duration::from_millis(150));
-        assert_eq!(schedule.event_deadlines.front(), Some(&now));
-        assert!(schedule.is_due(now + Duration::from_millis(150)));
-        schedule.scan_started(now + Duration::from_millis(150));
-        assert!(!schedule.is_due(now + Duration::from_millis(249)));
-        assert!(schedule.is_due(now + Duration::from_millis(250)));
+        for index in 0..=150 {
+            schedule.device_event(now + Duration::from_millis(index));
+        }
+        assert_eq!(schedule.auto_deadline(), Some(now));
+        let first_scan = now + Duration::from_millis(150);
+        schedule.scan_started(first_scan);
+        for millis in [300, 750, 1_650] {
+            let next = now + Duration::from_millis(millis);
+            assert_eq!(schedule.auto_deadline(), Some(next));
+            schedule.scan_started(next);
+        }
+        assert!(schedule.auto_deadline().is_none());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Read-only GitHub release discovery. Confirmed downloads and installation are
 //! handled separately by the self-update service.
 use anyhow::{Context, Result, bail, ensure};
+use chrono::{Local, TimeZone};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -16,7 +17,7 @@ const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_LOCATION_BYTES: usize = 8192;
 const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
-const AUTO_CHECK_INTERVAL: u64 = 24 * 60 * 60;
+const MAX_RELEASE_NOTES_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReleaseUpdate {
@@ -39,6 +40,7 @@ pub enum UpdateEndpoint {
     ApiLatest,
     WebsiteLatest,
     ExpandedAssets { tag: String },
+    ReleaseNotes { tag: String },
 }
 
 impl UpdateEndpoint {
@@ -56,6 +58,13 @@ impl UpdateEndpoint {
                     format!("{RELEASES_PATH}/expanded_assets/{tag}"),
                 )
             }
+            Self::ReleaseNotes { tag } => {
+                stable_tag_version(tag)?;
+                (
+                    "raw.githubusercontent.com",
+                    format!("/xiaoxiaoawei/hw_hub/refs/tags/{tag}/CHANGELOG.md"),
+                )
+            }
         })
     }
 
@@ -64,6 +73,7 @@ impl UpdateEndpoint {
             Self::ApiLatest => {
                 "Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n"
             }
+            Self::ReleaseNotes { .. } => "Accept: text/plain\r\n",
             _ => "Accept: text/html\r\n",
         }
     }
@@ -281,12 +291,79 @@ fn check_official_website(
             latest_version: version.to_string(),
         });
     }
+    // Notes are optional metadata, never another discovery/update channel.
+    // Fetch only this exact immutable official tag after release+asset proof;
+    // a blocked raw host or missing section must not hide a verified update.
+    let notes = match request(UpdateEndpoint::ReleaseNotes {
+        tag: tag.to_owned(),
+    }) {
+        Ok(response)
+            if response.status == 200
+                && response.location.is_none()
+                && response.body.len() <= MAX_RESPONSE_BYTES =>
+        {
+            std::str::from_utf8(&response.body)
+                .ok()
+                .and_then(|text| changelog_release_notes(&version.to_string(), text))
+                .unwrap_or_default()
+        }
+        _ => String::new(),
+    };
     Ok(CheckResult::Available(ReleaseUpdate {
         version: version.to_string(),
         release_url: format!("{RELEASES_URL}/tag/{tag}"),
         download_url: Some(canonical),
-        notes: String::new(),
+        notes,
     }))
+}
+
+fn changelog_release_notes(version: &str, text: &str) -> Option<String> {
+    let wanted = format!("## [{version}]");
+    let mut found = false;
+    let mut collecting = false;
+    let mut fence = None;
+    let mut notes = Vec::new();
+    let mut bytes = 0usize;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let marker = if trimmed.starts_with("```") {
+            Some('`')
+        } else if trimmed.starts_with("~~~") {
+            Some('~')
+        } else {
+            None
+        };
+        if let Some(marker) = marker {
+            if fence == Some(marker) {
+                fence = None;
+            } else if fence.is_none() {
+                fence = Some(marker);
+            }
+        } else if fence.is_none() && line.starts_with("## [") {
+            let matching = line
+                .strip_prefix(&wanted)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(char::is_whitespace));
+            if matching {
+                if found {
+                    return None;
+                }
+                found = true;
+                collecting = true;
+                continue;
+            }
+            collecting = false;
+        }
+        if collecting {
+            bytes = bytes.checked_add(line.len() + 1)?;
+            if bytes > MAX_RELEASE_NOTES_BYTES {
+                return None;
+            }
+            notes.push(line);
+        }
+    }
+    let notes = notes.join("\n");
+    let notes = notes.trim();
+    (found && !notes.is_empty()).then(|| notes.to_owned())
 }
 
 // Read only quoted href attributes of real <a> start tags, never comments,
@@ -414,15 +491,34 @@ impl Default for UpdateSettings {
 }
 
 pub fn should_auto_check(settings: &UpdateSettings, now: u64) -> bool {
+    should_auto_check_in_timezone(settings, now, &Local)
+}
+
+// Keep persisted Unix timestamps compatible with older releases, interpreting
+// each timestamp in the machine's local calendar rather than a rolling 24h.
+fn should_auto_check_in_timezone<Tz: TimeZone>(
+    settings: &UpdateSettings,
+    now: u64,
+    timezone: &Tz,
+) -> bool {
     if !settings.auto_check {
         return false;
     }
+    let day = |timestamp| {
+        i64::try_from(timestamp)
+            .ok()
+            .and_then(|timestamp| timezone.timestamp_opt(timestamp, 0).single())
+            .map(|timestamp| timestamp.date_naive())
+    };
+    let Some(today) = day(now) else {
+        return false;
+    };
     let last = settings
         .last_checked_unix
         .into_iter()
         .chain(settings.last_auto_attempt_unix)
         .max();
-    last.is_none_or(|last| now.saturating_sub(last) >= AUTO_CHECK_INTERVAL)
+    last.is_none_or(|last| last <= now && day(last).is_some_and(|last_day| last_day < today))
 }
 
 pub fn load_settings() -> Result<UpdateSettings> {
@@ -822,6 +918,102 @@ mod tests {
                 )
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn daily_schedule_uses_local_midnight_instead_of_utc_or_elapsed_hours() {
+        let timezone = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        let local = |day, hour, minute, second| {
+            u64::try_from(
+                timezone
+                    .with_ymd_and_hms(2026, 11, day, hour, minute, second)
+                    .unwrap()
+                    .timestamp(),
+            )
+            .unwrap()
+        };
+        let mut settings = UpdateSettings {
+            last_auto_attempt_unix: Some(local(19, 23, 59, 55)),
+            ..UpdateSettings::default()
+        };
+        assert!(should_auto_check_in_timezone(
+            &settings,
+            local(20, 0, 0, 5),
+            &timezone
+        ));
+        settings.last_auto_attempt_unix = Some(local(20, 0, 0, 5));
+        // Crossing UTC midnight eight hours later is still the same local day.
+        assert!(!should_auto_check_in_timezone(
+            &settings,
+            local(20, 8, 0, 5),
+            &timezone
+        ));
+        settings.last_checked_unix = Some(local(20, 9, 0, 0));
+        assert!(!should_auto_check_in_timezone(
+            &settings,
+            local(20, 23, 59, 59),
+            &timezone
+        ));
+        assert!(should_auto_check_in_timezone(
+            &settings,
+            local(21, 0, 0, 0),
+            &timezone
+        ));
+        assert!(!should_auto_check_in_timezone(
+            &settings,
+            local(19, 12, 0, 0),
+            &timezone
+        ));
+        assert!(!should_auto_check_in_timezone(
+            &settings,
+            u64::MAX,
+            &timezone
+        ));
+        settings.last_auto_attempt_unix = Some(u64::MAX);
+        assert!(!should_auto_check_in_timezone(
+            &settings,
+            local(21, 0, 0, 0),
+            &timezone
+        ));
+    }
+
+    #[test]
+    fn fallback_notes_endpoint_is_fixed_to_the_exact_official_tag() {
+        assert_eq!(
+            UpdateEndpoint::ReleaseNotes {
+                tag: "v0.5.2".into()
+            }
+            .destination()
+            .unwrap(),
+            (
+                "raw.githubusercontent.com",
+                "/xiaoxiaoawei/hw_hub/refs/tags/v0.5.2/CHANGELOG.md".into()
+            )
+        );
+        for tag in ["v0.5.2/../../main", "v0.5.2?x=bad", "v0.5.2-rc.1", "main"] {
+            assert!(
+                UpdateEndpoint::ReleaseNotes { tag: tag.into() }
+                    .destination()
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn changelog_notes_take_one_exact_release_section_and_preserve_code_blocks() {
+        let markdown = "# Changelog\n\n## [0.5.3] - date\nnewer-only\n\n## [0.5.2] - date\n- 正确说明\n```text\n## [0.0.1] example inside code\n```\n\n## [0.5.1]\nolder-only\n";
+        assert_eq!(
+            changelog_release_notes("0.5.2", markdown).as_deref(),
+            Some("- 正确说明\n```text\n## [0.0.1] example inside code\n```")
+        );
+        for markdown in [
+            "## [0.5.21]\nwrong prefix",
+            "## [0.5.2]unexpected\nwrong boundary",
+            "## [0.5.2]\nfirst\n## [0.5.2]\nambiguous",
+            "## [0.5.2]\n\n## [0.5.1]\nold",
+        ] {
+            assert!(changelog_release_notes("0.5.2", markdown).is_none());
         }
     }
 }

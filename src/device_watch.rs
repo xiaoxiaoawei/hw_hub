@@ -1,8 +1,8 @@
 //! Windows Plug and Play notifications, without a polling timer or hidden window.
 //!
-//! Register before the initial serial scan: Config Manager only reports future
-//! changes. The UI consumes coalesced changes and retains its own rescan-dirty
-//! state while an existing enumeration is still running.
+//! Registration, teardown and user wake callbacks all run outside the UI and
+//! Config Manager callbacks. Successful registration requests one fresh scan
+//! to close the startup race; subsequent scans remain event driven.
 use anyhow::Result;
 
 #[cfg(any(windows, test))]
@@ -11,15 +11,14 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, SyncSender},
+        mpsc::{self, Receiver, Sender, SyncSender},
     },
     thread,
 };
 
 pub struct DeviceWatcher {
-    // Drop registrations before releasing the outer reference to callback data.
     #[cfg(windows)]
-    _registration: native::Registration,
+    registration: RegistrationWorker,
     #[cfg(windows)]
     state: Arc<EventSignal>,
 }
@@ -30,14 +29,24 @@ impl DeviceWatcher {
     }
 
     /// `wake` runs on a relay thread, never a Config Manager callback. Creating
-    /// this object does not enumerate devices, open serial ports, or set timers.
+    /// this object only starts workers. Native registration and unregistration
+    /// can wait inside Windows, so neither is allowed on the UI thread.
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Result<Self> {
         #[cfg(windows)]
         {
-            let state = EventSignal::start(wake)?;
-            let registration = native::Registration::new(state.clone())?;
+            let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
+            let relay_wake = wake.clone();
+            let state = EventSignal::start(move || relay_wake())?;
+            let registration =
+                match RegistrationWorker::start(state.clone(), wake, native::Registration::new) {
+                    Ok(registration) => registration,
+                    Err(error) => {
+                        state.close();
+                        return Err(error);
+                    }
+                };
             Ok(Self {
-                _registration: registration,
+                registration,
                 state,
             })
         }
@@ -45,6 +54,19 @@ impl DeviceWatcher {
         {
             let _ = wake;
             anyhow::bail!("当前平台不支持 Windows USB 插拔通知，请使用手动刷新串口")
+        }
+    }
+
+    /// One asynchronous registration result. On failure the UI should expose
+    /// the error and offer manual refresh; construction cannot hide an OS wait.
+    pub fn poll_registration(&mut self) -> Option<Result<()>> {
+        #[cfg(windows)]
+        {
+            self.registration.poll()
+        }
+        #[cfg(not(windows))]
+        {
+            None
         }
     }
 
@@ -65,6 +87,78 @@ impl DeviceWatcher {
 
     pub fn poll_changed(&self) -> bool {
         self.take_pending()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DeviceWatcher {
+    fn drop(&mut self) {
+        self.state.close();
+        // RegistrationWorker only sends a stop token. Its owner unregisters
+        // native handles and releases callback state after callbacks quiesce.
+    }
+}
+
+#[cfg(any(windows, test))]
+struct RegistrationWorker {
+    stop: Sender<()>,
+    result: Receiver<Result<()>>,
+}
+
+#[cfg(any(windows, test))]
+impl RegistrationWorker {
+    fn start<T: 'static>(
+        state: Arc<EventSignal>,
+        wake: Arc<dyn Fn() + Send + Sync>,
+        register: impl FnOnce(Arc<EventSignal>) -> Result<T> + Send + 'static,
+    ) -> Result<Self> {
+        use anyhow::Context;
+        let (stop, stop_receiver) = mpsc::channel();
+        let (sender, result) = mpsc::channel();
+        thread::Builder::new()
+            .name("flashtool-device-owner".into())
+            .spawn(move || {
+                let registered = catch_unwind(AssertUnwindSafe(|| register(state.clone())))
+                    .unwrap_or_else(|_| {
+                        Err(anyhow::anyhow!(
+                            "Windows 插拔通知注册发生异常，请使用手动刷新"
+                        ))
+                    });
+                let registration = match registered {
+                    Ok(registration) => {
+                        if sender.send(Ok(())).is_err() {
+                            return;
+                        }
+                        // A scan may have finished before registration became
+                        // active. This single event reconciles that startup gap.
+                        state.notify();
+                        Some(registration)
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        None
+                    }
+                };
+                // A partial native registration may already have closed the
+                // relay. Wake directly from this owner, never the CM callback.
+                let _ = catch_unwind(AssertUnwindSafe(|| wake()));
+                let _ = stop_receiver.recv();
+                state.close();
+                drop(registration);
+            })
+            .context("无法启动 Windows 插拔通知管理线程")?;
+        Ok(Self { stop, result })
+    }
+
+    fn poll(&mut self) -> Option<Result<()>> {
+        self.result.try_recv().ok()
+    }
+}
+
+#[cfg(any(windows, test))]
+impl Drop for RegistrationWorker {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
     }
 }
 
@@ -255,6 +349,85 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(3);
 
     #[test]
+    fn slow_native_registration_and_teardown_never_block_the_owner_or_dropper() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (created_tx, created_rx) = mpsc::channel();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let (native_drop_tx, native_drop_rx) = mpsc::channel();
+        struct NativeRegistration(mpsc::Sender<thread::ThreadId>);
+        impl Drop for NativeRegistration {
+            fn drop(&mut self) {
+                let _ = self.0.send(thread::current().id());
+            }
+        }
+        thread::spawn(move || {
+            let state = EventSignal::start(|| {}).unwrap();
+            let worker = RegistrationWorker::start(state.clone(), Arc::new(|| {}), move |_| {
+                let id = thread::current().id();
+                entered_tx.send(id)?;
+                release_rx.recv()?;
+                Ok(NativeRegistration(native_drop_tx))
+            })
+            .unwrap();
+            created_tx.send((worker, state)).unwrap();
+        });
+        let (worker, state) = created_rx
+            .recv_timeout(WAIT)
+            .expect("constructor must not wait for native registration");
+        let native_thread = entered_rx.recv_timeout(WAIT).unwrap();
+        thread::spawn(move || {
+            drop(worker);
+            state.close();
+            let _ = dropped_tx.send(());
+        });
+        let dropped = dropped_rx.recv_timeout(WAIT);
+        // Release the OS stand-in even if a broken synchronous Drop would fail.
+        release_tx.send(()).unwrap();
+        dropped.expect("Drop must not wait for registration/unregistration");
+        assert_eq!(native_drop_rx.recv_timeout(WAIT).unwrap(), native_thread);
+    }
+
+    #[test]
+    fn registration_reports_ready_and_reconciles_the_startup_gap_or_reports_failure() {
+        for fail in [false, true] {
+            let (wake_tx, wake_rx) = mpsc::channel();
+            let state = EventSignal::start(|| {}).unwrap();
+            let mut owner = RegistrationWorker::start(
+                state.clone(),
+                Arc::new(move || {
+                    let _ = wake_tx.send(());
+                }),
+                move |_| {
+                    if fail {
+                        anyhow::bail!("mock CM registration failure");
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            wake_rx.recv_timeout(WAIT).unwrap();
+            let result = owner.poll().expect("wake follows registration result");
+            assert_eq!(result.is_err(), fail);
+            if fail {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("mock CM registration failure")
+                );
+            } else {
+                assert!(
+                    state.take_pending(),
+                    "ready must request a snapshot after async registration"
+                );
+            }
+            drop(owner);
+            state.close();
+        }
+    }
+
+    #[test]
     fn a_device_burst_coalesces_until_the_consumer_takes_the_event() {
         let (tx, rx) = mpsc::channel();
         let signal = EventSignal::start(move || {
@@ -377,8 +550,20 @@ mod tests {
     #[test]
     fn native_notifications_register_and_unregister_without_device_access() {
         assert!(DeviceWatcher::supported());
-        let watcher =
+        let mut watcher =
             DeviceWatcher::new(|| {}).expect("Windows Config Manager notification registration");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(result) = watcher.poll_registration() {
+                result.expect("native notification registration must succeed");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native registration timed out"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
         drop(watcher); // No enumeration, serial open, driver install, or physical USB test.
     }
 }

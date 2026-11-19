@@ -6,28 +6,22 @@ use crate::backend::{self, Port};
 use anyhow::{Result, anyhow};
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{
-        Arc,
-        mpsc::{self, Receiver, Sender, TryRecvError},
-    },
+    sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     thread,
 };
 
 type ScanResult = Result<Vec<Port>>;
-type ScanOperation = dyn Fn() -> ScanResult + Send + Sync;
-type Wake = dyn Fn() + Send + Sync;
-
 pub struct DeviceScanner {
-    sender: Sender<ScanResult>,
+    requests: SyncSender<()>,
     receiver: Receiver<ScanResult>,
-    operation: Arc<ScanOperation>,
-    wake: Arc<Wake>,
+    startup_error: Option<String>,
     scanning: bool,
 }
 
 impl DeviceScanner {
-    /// `wake` is called on the worker after a result is available, e.g. to
-    /// request an egui repaint. Construction does not enumerate any devices.
+    /// Starts one persistent background worker; no device is enumerated until
+    /// requested. Native enumeration and subsequent thread creation never run
+    /// on the UI path when a USB/COM burst is received.
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
         Self::with_operation(wake, backend::list_ports)
     }
@@ -36,54 +30,60 @@ impl DeviceScanner {
         wake: impl Fn() + Send + Sync + 'static,
         operation: impl Fn() -> ScanResult + Send + Sync + 'static,
     ) -> Self {
+        let (requests, request_receiver) = mpsc::sync_channel(1);
         let (sender, receiver) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("flashtool-port-scan".into())
+            .spawn(move || {
+                while request_receiver.recv().is_ok() {
+                    let result = catch_unwind(AssertUnwindSafe(&operation))
+                        .unwrap_or_else(|_| Err(anyhow!("串口扫描出现异常，请稍后重试")));
+                    // Closing the UI drops its receiver and request sender.
+                    // Never join a possibly slow OS enumeration from Drop.
+                    if sender.send(result).is_err() {
+                        break;
+                    }
+                    let _ = catch_unwind(AssertUnwindSafe(&wake));
+                }
+            });
         Self {
-            sender,
+            requests,
             receiver,
-            operation: Arc::new(operation),
-            wake: Arc::new(wake),
+            startup_error: worker
+                .err()
+                .map(|error| format!("无法启动串口扫描线程：{error}")),
             scanning: false,
         }
     }
 
-    /// Starts a background scan and returns immediately. Automatic and manual
-    /// refreshes use this same entry point. Returns false while a prior request
-    /// is running OR its result has not yet been consumed with `poll`.
+    /// Only a bounded non-blocking send: automatic and manual refreshes share
+    /// the same worker. A result must be consumed before another request is
+    /// accepted, so there is never an overlapping scan or a queued scan storm.
     pub fn request_scan(&mut self) -> bool {
         if self.scanning {
             return false;
         }
         self.scanning = true;
-        let sender = self.sender.clone();
-        let operation = self.operation.clone();
-        let wake = self.wake.clone();
-        let worker = thread::Builder::new()
-            .name("flashtool-port-scan".into())
-            .spawn(move || {
-                let result = catch_unwind(AssertUnwindSafe(|| operation()))
-                    .unwrap_or_else(|_| Err(anyhow!("串口扫描出现异常，请稍后重试")));
-                // A closed receiver means the window/scanner has been dropped.
-                // Do not wake a disposed UI, and do not wait for it to close.
-                if sender.send(result).is_ok() {
-                    wake();
-                }
-            });
-        if let Err(error) = worker {
-            // Keep failure reporting identical to an ordinary worker result.
-            // The pending result also prevents another overlapping request.
-            let _ = self
-                .sender
-                .send(Err(anyhow!("无法启动串口扫描线程：{error}")));
-            (self.wake)();
+        match self.requests.try_send(()) {
+            Ok(()) => {}
+            Err(TrySendError::Full(())) => return false,
+            Err(TrySendError::Disconnected(())) => {
+                self.startup_error
+                    .get_or_insert_with(|| "串口扫描线程已断开，请重启程序".into());
+            }
         }
-        // Dropping JoinHandle detaches the worker. No UI operation joins it;
-        // dropping DeviceScanner never waits for a slow OS enumeration.
         true
     }
 
     /// Non-blocking receipt. Preserve the UI's previous list on Err; only an
     /// Ok snapshot (including a genuinely empty one) replaces live discovery.
     pub fn poll(&mut self) -> Option<ScanResult> {
+        if self.scanning
+            && let Some(error) = &self.startup_error
+        {
+            self.scanning = false;
+            return Some(Err(anyhow!(error.clone())));
+        }
         match self.receiver.try_recv() {
             Ok(result) => {
                 self.scanning = false;
@@ -109,7 +109,7 @@ mod tests {
     use super::*;
     use std::{
         sync::{
-            Mutex,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
@@ -184,6 +184,36 @@ mod tests {
         scanner.poll().unwrap().unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn successive_scans_reuse_one_worker_even_after_a_wake_panics() {
+        let (thread_tx, thread_rx) = mpsc::channel();
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let wakes = AtomicUsize::new(0);
+        let mut scanner = DeviceScanner::with_operation(
+            move || {
+                wake_tx.send(()).unwrap();
+                if wakes.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("mock UI wake panic");
+                }
+            },
+            move || {
+                thread_tx.send(thread::current().id())?;
+                Ok(vec![port("COM7")])
+            },
+        );
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            assert!(scanner.request_scan());
+            for _ in 0..100 {
+                assert!(!scanner.request_scan());
+            }
+            wake_rx.recv_timeout(DEADLINE).unwrap();
+            assert_eq!(scanner.poll().unwrap().unwrap()[0].name, "COM7");
+            threads.push(thread_rx.recv_timeout(DEADLINE).unwrap());
+        }
+        assert_eq!(threads[0], threads[1]);
     }
 
     #[test]

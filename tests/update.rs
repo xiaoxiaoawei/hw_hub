@@ -1,3 +1,4 @@
+use chrono::{Local, TimeZone};
 use esp32c3_flashtool::updater::{
     CheckResult, UpdateEndpoint, UpdateHttpResponse, UpdateSettings, check_latest_from_json,
     check_latest_with_transport, load_settings_from, save_settings_at, should_auto_check,
@@ -140,19 +141,35 @@ fn malformed_missing_fields_and_oversized_json_are_rejected() {
 }
 
 #[test]
-fn automatic_checks_use_both_attempt_and_success_times_with_a_daily_limit() {
+fn automatic_checks_use_local_calendar_days_and_keep_old_timestamp_fields() {
+    let local = |day, hour, minute, second| {
+        u64::try_from(
+            Local
+                .with_ymd_and_hms(2026, 1, day, hour, minute, second)
+                .earliest()
+                .expect("valid local calendar date")
+                .timestamp(),
+        )
+        .unwrap()
+    };
     let mut settings = UpdateSettings::default();
-    assert!(should_auto_check(&settings, 0));
-    settings.last_auto_attempt_unix = Some(1000);
+    let first = local(10, 23, 59, 30);
+    let next_day = local(11, 0, 0, 30);
+    assert!(should_auto_check(&settings, first));
+    settings.last_auto_attempt_unix = Some(first);
     assert!(settings.last_checked_unix.is_none());
-    assert!(!should_auto_check(&settings, 1000 + 86_399));
-    assert!(should_auto_check(&settings, 1000 + 86_400));
-    settings.last_checked_unix = Some(2000);
-    assert!(!should_auto_check(&settings, 1000 + 86_400));
-    assert!(should_auto_check(&settings, 2000 + 86_400));
-    assert!(!should_auto_check(&settings, 10)); // Clock moving backwards cannot cause a retry loop.
+    assert!(!should_auto_check(&settings, local(10, 23, 59, 59)));
+    assert!(
+        next_day - first < 86_400,
+        "midnight need not wait a rolling 24h"
+    );
+    assert!(should_auto_check(&settings, next_day));
+    settings.last_checked_unix = Some(local(11, 9, 0, 0));
+    assert!(!should_auto_check(&settings, local(11, 23, 59, 59)));
+    assert!(should_auto_check(&settings, local(12, 0, 0, 0)));
+    assert!(!should_auto_check(&settings, first)); // Clock moving backwards cannot cause a retry loop.
     settings.auto_check = false;
-    assert!(!should_auto_check(&settings, 2000 + 2 * 86_400));
+    assert!(!should_auto_check(&settings, local(13, 12, 0, 0)));
 }
 
 #[test]
@@ -282,6 +299,19 @@ fn fallback_replies(
     ]
 }
 
+fn with_notes(
+    mut replies: Vec<(UpdateEndpoint, anyhow::Result<UpdateHttpResponse>)>,
+    notes: anyhow::Result<UpdateHttpResponse>,
+) -> Vec<(UpdateEndpoint, anyhow::Result<UpdateHttpResponse>)> {
+    replies.push((
+        UpdateEndpoint::ReleaseNotes {
+            tag: "v0.4.2".into(),
+        },
+        notes,
+    ));
+    replies
+}
+
 #[test]
 fn real_published_042_sample_is_up_to_date_without_any_fallback_or_downgrade() {
     for current in ["0.4.2", "0.4.3"] {
@@ -321,10 +351,13 @@ fn transient_api_failures_use_only_verified_official_latest_and_asset_proof() {
     }
     let CheckResult::Available(update) = replay(
         "0.4.1",
-        fallback_replies(
-            Err(anyhow::anyhow!("WinHTTP 12029: cannot connect")),
-            latest_redirect(),
-            response(200, WINDOWS_042_HTML, None),
+        with_notes(
+            fallback_replies(
+                Err(anyhow::anyhow!("WinHTTP 12029: cannot connect")),
+                latest_redirect(),
+                response(200, WINDOWS_042_HTML, None),
+            ),
+            Err(anyhow::anyhow!("raw host unavailable")),
         ),
     )
     .unwrap() else {
@@ -565,14 +598,17 @@ fn fallback_asset_proof_is_canonical_unique_and_never_redirected_or_extracted_fr
     assert!(matches!(
         replay(
             "0.4.1",
-            fallback_replies(
-                Ok(response(429, Vec::new(), None)),
-                response(
-                    302,
-                    Vec::new(),
-                    Some("/xiaoxiaoawei/hw_hub/releases/tag/v0.4.2")
+            with_notes(
+                fallback_replies(
+                    Ok(response(429, Vec::new(), None)),
+                    response(
+                        302,
+                        Vec::new(),
+                        Some("/xiaoxiaoawei/hw_hub/releases/tag/v0.4.2")
+                    ),
+                    response(200, reordered, None),
                 ),
-                response(200, reordered, None),
+                Ok(response(404, Vec::new(), None))
             )
         )
         .unwrap(),
@@ -615,4 +651,71 @@ fn fallback_responses_remain_bounded_and_require_utf8() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn verified_website_update_can_show_same_tag_release_notes_when_api_is_blocked() {
+    let changelog = "# 更新记录\n\n## [0.4.3] - 2026-11-19\nnewer-only\n\n## [0.4.2] - 2026-11-18\n- 原生串口事件检测。\n- 改善更新提示。\n\n## [0.4.1]\nolder-only\n";
+    let CheckResult::Available(update) = replay(
+        "0.4.1",
+        with_notes(
+            fallback_replies(
+                Ok(response(429, Vec::new(), None)),
+                latest_redirect(),
+                response(200, WINDOWS_042_HTML, None),
+            ),
+            Ok(response(200, changelog, None)),
+        ),
+    )
+    .unwrap() else {
+        panic!("expected a verified newer release");
+    };
+    assert_eq!(update.notes, "- 原生串口事件检测。\n- 改善更新提示。");
+    assert_eq!(update.version, "0.4.2");
+    assert!(update.download_url.is_some());
+}
+
+#[test]
+fn unavailable_or_unsafe_optional_notes_do_not_hide_a_verified_download() {
+    let mut responses = vec![
+        Err(anyhow::anyhow!("TLS failure for optional release notes")),
+        Ok(response(404, Vec::new(), None)),
+        Ok(response(503, Vec::new(), None)),
+        Ok(response(
+            302,
+            Vec::new(),
+            Some("https://evil.example/CHANGELOG.md"),
+        )),
+        Ok(response(
+            200,
+            "## [0.4.2]\nunsafe redirect",
+            Some("https://evil.example/"),
+        )),
+        Ok(response(200, vec![0xff], None)),
+        Ok(response(200, "## [0.4.3]\nwrong version", None)),
+        Ok(response(200, "## [0.4.2]\none\n## [0.4.2]\ntwo", None)),
+    ];
+    responses.push(Ok(response(
+        200,
+        format!("## [0.4.2]\n{}", "x".repeat(64 * 1024 + 1)),
+        None,
+    )));
+    for notes in responses {
+        let CheckResult::Available(update) = replay(
+            "0.4.1",
+            with_notes(
+                fallback_replies(
+                    Ok(response(503, Vec::new(), None)),
+                    latest_redirect(),
+                    response(200, WINDOWS_042_HTML, None),
+                ),
+                notes,
+            ),
+        )
+        .unwrap() else {
+            panic!("optional notes must not hide the verified update");
+        };
+        assert!(update.notes.is_empty());
+        assert!(update.download_url.is_some());
+    }
 }

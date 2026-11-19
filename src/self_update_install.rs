@@ -421,14 +421,12 @@ pub fn launch_installer(prepared: &PreparedUpdate) -> Result<()> {
         let result = (|| -> Result<()> {
             let deadline = Instant::now() + Duration::from_secs(15);
             while Instant::now() < deadline {
-                if ticket_matches(
+                let ready = ticket_matches(
                     &manifest.stage_dir.join(READY_NAME),
                     &manifest,
                     helper.id(),
                     &manifest.old_sha256,
-                ) {
-                    return Ok(());
-                }
+                );
                 let error_path = manifest.stage_dir.join(ERROR_NAME);
                 if no_links(&error_path).is_ok()
                     && let Ok(file) = File::open(error_path)
@@ -439,6 +437,9 @@ pub fn launch_installer(prepared: &PreparedUpdate) -> Result<()> {
                 }
                 if let Some(status) = helper.try_wait()? {
                     bail!("更新辅助程序提前退出：{status}");
+                }
+                if ready {
+                    return Ok(());
                 }
                 thread::sleep(Duration::from_millis(50));
             }

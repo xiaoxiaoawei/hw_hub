@@ -111,7 +111,7 @@ fn format_windows_diagnostics(
     let missing: Vec<_> = names.difference(&library_names).cloned().collect();
     let stale: Vec<_> = library_names.difference(&names).cloned().collect();
     let mut report = format!(
-        "FlashTool {}\nOS=windows\nSOURCE=SetupAPI DIGCF_PRESENT healthy Ports/Modem/COMPORT\nWINDOWS_HEALTHY_COM_COUNT={}\nWINDOWS_PNP_NODE_COUNT={}\n",
+        "FlashTool {}\nOS=windows\nSOURCE=ConfigManager PRESENT healthy Ports/Modem/COMPORT\nWINDOWS_HEALTHY_COM_COUNT={}\nWINDOWS_PNP_NODE_COUNT={}\n",
         env!("CARGO_PKG_VERSION"),
         names.len(),
         nodes.len(),
@@ -270,159 +270,297 @@ fn serial_info_from_instance(name: String, instance_id: &str) -> SerialPortInfo 
     }
 }
 
+// Config Manager list sizes can change during hotplug. Bound both allocation
+// and retries; a churn/error is not an authoritative empty snapshot.
+#[cfg(any(windows, test))]
+fn read_pnp_list(
+    mut size: impl FnMut() -> Result<u32>,
+    mut read: impl FnMut(&mut [u16]) -> Result<bool>,
+) -> Result<Vec<String>> {
+    for _ in 0..4 {
+        let length = size()? as usize;
+        anyhow::ensure!(
+            (1..=1024 * 1024).contains(&length),
+            "Windows PnP 列表长度无效或过大"
+        );
+        let mut buffer = vec![0_u16; length];
+        if !read(&mut buffer)? {
+            continue;
+        }
+        let mut entries = Vec::new();
+        let mut position = 0;
+        while position < buffer.len() {
+            let end = buffer[position..]
+                .iter()
+                .position(|word| *word == 0)
+                .map(|offset| position + offset)
+                .context("Windows PnP 列表未终止")?;
+            if end == position {
+                anyhow::ensure!(
+                    buffer[position..].iter().all(|word| *word == 0),
+                    "Windows PnP 列表终止后含无效数据"
+                );
+                return Ok(entries);
+            }
+            entries.push(
+                String::from_utf16(&buffer[position..end])
+                    .context("Windows PnP 列表不是有效 UTF-16")?,
+            );
+            position = end + 1;
+        }
+        anyhow::bail!("Windows PnP 列表缺少最终终止符");
+    }
+    anyhow::bail!("Windows 正在变更设备列表，本次扫描未完成；请稍后重试")
+}
+
 #[cfg(windows)]
 mod present_ports {
-    use super::{PresentPort, serial_info_from_instance};
-    use anyhow::{Context, Result, bail, ensure};
+    use super::{PresentPort, read_pnp_list, serial_info_from_instance};
+    use anyhow::{Context, Result, ensure};
     use std::{
+        collections::BTreeSet,
         mem,
         ptr::{null, null_mut},
     };
     use windows_sys::{
         Win32::{
-            Devices::DeviceAndDriverInstallation::{
-                CM_Get_DevNode_Status, CR_SUCCESS, DICS_FLAG_GLOBAL, DIGCF_DEVICEINTERFACE,
-                DIGCF_PRESENT, DIREG_DEV, GUID_DEVCLASS_MODEM, GUID_DEVCLASS_PORTS, HDEVINFO,
-                SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
-                SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiOpenDevRegKey,
+            Devices::{
+                DeviceAndDriverInstallation::{
+                    CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_GETIDLIST_FILTER_CLASS,
+                    CM_GETIDLIST_FILTER_PRESENT, CM_Get_DevNode_Status,
+                    CM_Get_Device_ID_List_SizeW, CM_Get_Device_ID_ListW,
+                    CM_Get_Device_Interface_List_SizeW, CM_Get_Device_Interface_ListW,
+                    CM_Get_Device_Interface_PropertyW, CM_LOCATE_DEVNODE_NORMAL,
+                    CM_Locate_DevNodeW, CM_Open_DevNode_Key, CM_REGISTRY_HARDWARE, CR_BUFFER_SMALL,
+                    CR_DEVICE_NOT_THERE, CR_NO_SUCH_DEVICE_INTERFACE, CR_NO_SUCH_DEVNODE,
+                    CR_NO_SUCH_REGISTRY_KEY, CR_SUCCESS, RegDisposition_OpenExisting,
+                },
+                Properties::{DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING},
             },
-            Foundation::{
-                ERROR_FILE_NOT_FOUND, ERROR_KEY_DOES_NOT_EXIST, ERROR_NO_MORE_ITEMS,
-                ERROR_PATH_NOT_FOUND, INVALID_HANDLE_VALUE,
+            Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND},
+            System::Registry::{
+                HKEY, KEY_QUERY_VALUE, REG_SZ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
             },
-            System::Registry::{HKEY, KEY_QUERY_VALUE, REG_SZ, RegCloseKey, RegQueryValueExW},
         },
         core::GUID,
     };
 
-    struct DeviceSet(HDEVINFO);
-    impl Drop for DeviceSet {
-        fn drop(&mut self) {
-            unsafe {
-                SetupDiDestroyDeviceInfoList(self.0);
-            }
-        }
-    }
+    const COMPORT: GUID = GUID::from_u128(0x86e0d1e0_8089_11d0_9ce4_08003e301f73);
+    const CLASS_FILTERS: [&str; 2] = [
+        "{4d36e978-e325-11ce-bfc1-08002be10318}", // Ports
+        "{4d36e96d-e325-11ce-bfc1-08002be10318}", // Modem
+    ];
 
     struct DeviceKey(HKEY);
     impl Drop for DeviceKey {
         fn drop(&mut self) {
-            unsafe {
-                RegCloseKey(self.0);
-            }
+            unsafe { RegCloseKey(self.0) };
         }
     }
 
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(Some(0)).collect()
+    }
+    fn check(result: u32, action: &str) -> Result<()> {
+        ensure!(result == CR_SUCCESS, "{action}（CM 错误 0x{result:X}）");
+        Ok(())
+    }
+    fn disappeared(result: u32) -> bool {
+        matches!(
+            result,
+            CR_NO_SUCH_DEVNODE | CR_NO_SUCH_DEVICE_INTERFACE | CR_DEVICE_NOT_THERE
+        )
+    }
+
     pub(super) fn entries() -> Result<Vec<PresentPort>> {
-        let mut ports = Vec::new();
-        // Include COM interfaces for drivers that use a nonstandard setup
-        // class. Duplicate views of one node are reconciled by COM+instance ID.
-        let comport = GUID::from_u128(0x86e0d1e0_8089_11d0_9ce4_08003e301f73);
-        for (class, flags) in [
-            (GUID_DEVCLASS_PORTS, DIGCF_PRESENT),
-            (GUID_DEVCLASS_MODEM, DIGCF_PRESENT),
-            (comport, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE),
-        ] {
-            let raw = unsafe { SetupDiGetClassDevsW(&class, null(), null_mut(), flags) };
-            if raw == INVALID_HANDLE_VALUE as HDEVINFO {
-                return Err(std::io::Error::last_os_error())
-                    .context("无法读取当前在线的 Ports/Modem 设备集合");
-            }
-            let devices = DeviceSet(raw);
-            let mut index = 0u32;
-            loop {
-                let mut device: SP_DEVINFO_DATA = unsafe { mem::zeroed() };
-                device.cbSize = mem::size_of::<SP_DEVINFO_DATA>() as u32;
-                if unsafe { SetupDiEnumDeviceInfo(devices.0, index, &mut device) } == 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() == Some(ERROR_NO_MORE_ITEMS as i32) {
-                        break;
+        // Read the local PnP manager's present-node cache directly. Constructing
+        // three SetupAPI device-information sets per settling pass can wait on
+        // device installation/co-installers; it is unnecessary for COM metadata.
+        // Preserve Ports + Modem + nonstandard-class COM interfaces, not VID/PID
+        // deduplication, registry SERIALCOMM ghosts, or serial I/O probes.
+        let mut instances = BTreeSet::new();
+        for class in CLASS_FILTERS {
+            let filter = wide(class);
+            let flags = CM_GETIDLIST_FILTER_CLASS | CM_GETIDLIST_FILTER_PRESENT;
+            let list = read_pnp_list(
+                || {
+                    let mut count = 0;
+                    check(
+                        unsafe { CM_Get_Device_ID_List_SizeW(&mut count, filter.as_ptr(), flags) },
+                        "无法读取当前串口节点列表大小",
+                    )?;
+                    Ok(count)
+                },
+                |buffer| {
+                    let result = unsafe {
+                        CM_Get_Device_ID_ListW(
+                            filter.as_ptr(),
+                            buffer.as_mut_ptr(),
+                            buffer.len() as u32,
+                            flags,
+                        )
+                    };
+                    if result == CR_BUFFER_SMALL {
+                        return Ok(false);
                     }
-                    return Err(error).context("枚举当前在线串口设备失败");
+                    check(result, "无法读取当前串口节点列表")?;
+                    Ok(true)
+                },
+            )?;
+            instances.extend(list);
+        }
+        let interfaces = read_pnp_list(
+            || {
+                let mut count = 0;
+                check(
+                    unsafe {
+                        CM_Get_Device_Interface_List_SizeW(
+                            &mut count,
+                            &COMPORT,
+                            null(),
+                            CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+                        )
+                    },
+                    "无法读取当前 COM 接口列表大小",
+                )?;
+                Ok(count)
+            },
+            |buffer| {
+                let result = unsafe {
+                    CM_Get_Device_Interface_ListW(
+                        &COMPORT,
+                        null(),
+                        buffer.as_mut_ptr(),
+                        buffer.len() as u32,
+                        CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+                    )
+                };
+                if result == CR_BUFFER_SMALL {
+                    return Ok(false);
                 }
-                let (mut status, mut problem) = (0u32, 0u32);
-                let result =
-                    unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, device.DevInst, 0) };
-                ensure!(
-                    result == CR_SUCCESS,
-                    "读取当前串口设备状态失败（CM 错误 0x{result:X}）"
-                );
-                // Match serialport's healthy-device policy, including Unknown
-                // entries obtained from SERIALCOMM after the primary scan.
-                if problem == 0
-                    && let Some(name) = port_name(&devices, &device)?
-                {
-                    let instance_id = instance_id(&devices, &device)?;
-                    ports.push(PresentPort {
-                        info: serial_info_from_instance(name, &instance_id),
-                        instance_id,
-                    });
-                }
-                index = index.checked_add(1).context("在线设备数量超出支持范围")?;
+                check(result, "无法读取当前 COM 接口列表")?;
+                Ok(true)
+            },
+        )?;
+        for interface in interfaces {
+            if let Some(instance) = interface_instance(&interface)? {
+                instances.insert(instance);
+            }
+        }
+        let mut ports = Vec::new();
+        for instance_id in instances {
+            let id = wide(&instance_id);
+            let mut node = 0;
+            let result =
+                unsafe { CM_Locate_DevNodeW(&mut node, id.as_ptr(), CM_LOCATE_DEVNODE_NORMAL) };
+            if disappeared(result) {
+                continue;
+            }
+            check(result, "无法定位当前串口节点")?;
+            let (mut status, mut problem) = (0, 0);
+            let result = unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, node, 0) };
+            if disappeared(result) {
+                continue;
+            }
+            check(result, "无法读取当前串口状态")?;
+            if problem == 0
+                && let Some(name) = port_name(node)?
+            {
+                ports.push(PresentPort {
+                    info: serial_info_from_instance(name, &instance_id),
+                    instance_id,
+                });
             }
         }
         Ok(ports)
     }
 
-    fn instance_id(devices: &DeviceSet, device: &SP_DEVINFO_DATA) -> Result<String> {
-        // Windows instance IDs are bounded by MAX_DEVICE_ID_LEN (200 WCHARs).
-        // Keep a larger bounded buffer, and fail explicitly on an API error.
-        let mut buffer = [0u16; 512];
-        let mut required = 0u32;
-        if unsafe {
-            SetupDiGetDeviceInstanceIdW(
-                devices.0,
-                device,
-                buffer.as_mut_ptr(),
-                buffer.len() as u32,
-                &mut required,
-            )
-        } == 0
-        {
-            return Err(std::io::Error::last_os_error())
-                .context("无法读取在线串口的 PnP 设备实例 ID");
-        }
-        let length = buffer
-            .iter()
-            .position(|word| *word == 0)
-            .context("PnP 设备实例 ID 未终止")?;
-        ensure!(
-            length > 0 && required as usize <= buffer.len(),
-            "PnP 设备实例 ID 长度无效"
-        );
-        String::from_utf16(&buffer[..length]).context("PnP 设备实例 ID 不是有效 UTF-16")
-    }
-
-    fn port_name(devices: &DeviceSet, device: &SP_DEVINFO_DATA) -> Result<Option<String>> {
-        let raw = unsafe {
-            SetupDiOpenDevRegKey(
-                devices.0,
-                device,
-                DICS_FLAG_GLOBAL,
+    fn interface_instance(interface: &str) -> Result<Option<String>> {
+        let interface = wide(interface);
+        let mut buffer = [0_u16; 512];
+        let mut byte_len = mem::size_of_val(&buffer) as u32;
+        let mut property_type = 0;
+        let result = unsafe {
+            CM_Get_Device_Interface_PropertyW(
+                interface.as_ptr(),
+                &DEVPKEY_Device_InstanceId,
+                &mut property_type,
+                buffer.as_mut_ptr().cast(),
+                &mut byte_len,
                 0,
-                DIREG_DEV,
-                KEY_QUERY_VALUE,
             )
         };
-        if raw == INVALID_HANDLE_VALUE {
-            let error = std::io::Error::last_os_error();
-            // Some present Ports/Modem nodes are controllers or have not been
-            // assigned a port. A missing key/value is not a failed full scan.
-            if matches!(error.raw_os_error(), Some(code) if code == ERROR_FILE_NOT_FOUND as i32 || code == ERROR_PATH_NOT_FOUND as i32 || code == ERROR_KEY_DOES_NOT_EXIST as i32)
-            {
-                return Ok(None);
-            }
-            return Err(error).context("无法读取在线设备的 PortName 注册表项");
+        if disappeared(result) {
+            return Ok(None);
         }
+        check(result, "无法读取 COM 接口对应的设备实例")?;
+        ensure!(
+            property_type == DEVPROP_TYPE_STRING
+                && byte_len >= 2
+                && byte_len.is_multiple_of(2)
+                && byte_len as usize <= mem::size_of_val(&buffer),
+            "COM 接口实例属性类型或长度无效"
+        );
+        let words = &buffer[..byte_len as usize / 2];
+        ensure!(
+            words.last() == Some(&0) && !words[..words.len() - 1].contains(&0),
+            "COM 接口实例 ID 终止符无效"
+        );
+        let instance = String::from_utf16(&words[..words.len() - 1])
+            .context("COM 接口实例 ID 不是有效 UTF-16")?;
+        ensure!(!instance.is_empty(), "COM 接口实例 ID 为空");
+        Ok(Some(instance))
+    }
+
+    fn port_name(node: u32) -> Result<Option<String>> {
+        let mut raw = null_mut();
+        let result = unsafe {
+            CM_Open_DevNode_Key(
+                node,
+                KEY_QUERY_VALUE,
+                0,
+                RegDisposition_OpenExisting,
+                &mut raw,
+                CM_REGISTRY_HARDWARE,
+            )
+        };
+        if disappeared(result) || result == CR_NO_SUCH_REGISTRY_KEY {
+            return Ok(None);
+        }
+        check(result, "无法读取在线设备的硬件注册表项")?;
+        ensure!(
+            !raw.is_null() && raw as isize != -1,
+            "Windows 返回无效的设备注册表句柄"
+        );
         let key = DeviceKey(raw);
-        let value_name: Vec<_> = "PortName".encode_utf16().chain(Some(0)).collect();
-        let mut buffer = [0u16; 256];
+        if let Some(name) = query_port_name(&key)? {
+            return Ok(Some(name));
+        }
+        // Some registry APIs/drivers expose the hardware root rather than its
+        // Device Parameters child. Both reads are metadata-only and read-only.
+        let parameters = wide("Device Parameters");
+        let mut child = null_mut();
+        let result =
+            unsafe { RegOpenKeyExW(key.0, parameters.as_ptr(), 0, KEY_QUERY_VALUE, &mut child) };
+        if matches!(result, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) {
+            return Ok(None);
+        }
+        if result != 0 {
+            return Err(std::io::Error::from_raw_os_error(result as i32))
+                .context("无法读取设备的 Device Parameters");
+        }
+        query_port_name(&DeviceKey(child))
+    }
+
+    fn query_port_name(key: &DeviceKey) -> Result<Option<String>> {
+        let value = wide("PortName");
+        let mut buffer = [0_u16; 256];
         let mut byte_len = mem::size_of_val(&buffer) as u32;
         let mut value_type = 0;
         let result = unsafe {
             RegQueryValueExW(
                 key.0,
-                value_name.as_ptr(),
+                value.as_ptr(),
                 null(),
                 &mut value_type,
                 buffer.as_mut_ptr().cast(),
@@ -438,20 +576,19 @@ mod present_ports {
         }
         ensure!(
             value_type == REG_SZ
+                && byte_len >= 2
                 && byte_len.is_multiple_of(2)
                 && byte_len as usize <= mem::size_of_val(&buffer),
             "在线设备的 PortName 类型或长度无效"
         );
-        let name = String::from_utf16(&buffer[..byte_len as usize / 2])
+        let words = &buffer[..byte_len as usize / 2];
+        ensure!(
+            words.last() == Some(&0) && !words[..words.len() - 1].contains(&0),
+            "在线设备的 PortName 终止符无效"
+        );
+        let name = String::from_utf16(&words[..words.len() - 1])
             .context("在线设备的 PortName 不是有效 UTF-16")?;
-        let name = name.trim_end_matches('\0');
-        if name.is_empty() {
-            return Ok(None);
-        }
-        if name.contains('\0') {
-            bail!("在线设备的 PortName 含有无效的空字符");
-        }
-        Ok(Some(name.to_owned()))
+        Ok((!name.is_empty()).then_some(name))
     }
 }
 
@@ -921,6 +1058,93 @@ impl ProgressCallbacks for SessionProgress<'_> {
 mod tests {
     use super::*;
     use crate::firmware::FirmwareSegment;
+
+    #[cfg(windows)]
+    #[test]
+    fn native_config_manager_enumeration_returns_a_valid_snapshot_without_opening_ports() {
+        let ports = list_ports().expect("Windows present Ports/Modem/COMPORT metadata enumeration");
+        let mut identities = std::collections::BTreeSet::new();
+        for port in ports {
+            assert!(is_com_name(&port_name_key(&port.name)));
+            assert!(identities.insert(port.identity));
+        }
+    }
+
+    #[test]
+    fn config_manager_buffer_growth_is_retried_and_a_burst_preserves_every_instance() {
+        let calls = std::cell::Cell::new(0);
+        let contents: Vec<_> = "USB\\VID_10C4&PID_EA60\\A\0USB\\VID_10C4&PID_EA60\\B\0\0"
+            .encode_utf16()
+            .collect();
+        let ports = read_pnp_list(
+            || Ok(contents.len() as u32),
+            |buffer| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    return Ok(false);
+                }
+                buffer.copy_from_slice(&contents);
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(ports.len(), 2);
+        assert_ne!(ports[0], ports[1]);
+    }
+
+    #[test]
+    fn config_manager_churn_and_errors_never_become_empty_snapshots_or_unbounded_retries() {
+        let mut calls = 0;
+        assert!(
+            read_pnp_list(
+                || Ok(2),
+                |_| {
+                    calls += 1;
+                    Ok(false)
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(calls, 4);
+        assert!(
+            read_pnp_list(
+                || anyhow::bail!("access denied"),
+                |_| panic!("must not read after size failure")
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("access denied")
+        );
+        assert!(
+            read_pnp_list(
+                || Ok(u32::MAX),
+                |_| panic!("must not allocate an unbounded list")
+            )
+            .is_err()
+        );
+        assert!(
+            read_pnp_list(
+                || Ok(3),
+                |buffer| {
+                    buffer.copy_from_slice(&[0xd800, 0, 0]);
+                    Ok(true)
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            read_pnp_list(
+                || Ok(2),
+                |buffer| {
+                    buffer.copy_from_slice(&[0, 0]);
+                    Ok(true)
+                }
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
 
     fn usb_info(name: &str, serial: Option<&str>) -> SerialPortInfo {
         SerialPortInfo {

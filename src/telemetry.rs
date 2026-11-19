@@ -29,7 +29,7 @@ const UPLOAD_QUEUE_CAPACITY: usize = 32;
 const RECENT_RECORDS: usize = 4096;
 const MAX_ATTEMPTS: usize = 3;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TelemetrySettings {
     pub upload_enabled: bool,
