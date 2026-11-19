@@ -510,6 +510,12 @@ fn read_request(socket: &mut TcpStream) -> Option<CapturedRequest> {
         }
         bytes.extend_from_slice(&buffer[..length]);
     };
+    assert!(
+        !bytes[..header_end]
+            .windows(3)
+            .any(|window| window == b"\r\r\n"),
+        "request sent an extra carriage return in a header delimiter"
+    );
     let header = String::from_utf8(bytes[..header_end].to_vec()).ok()?;
     let mut lines = header.lines();
     let request_line = lines.next()?.to_owned();

@@ -192,9 +192,10 @@ fn platform_post(
     let mut body_file = tempfile::NamedTempFile::new().map_err(io_error)?;
     body_file.write_all(body).map_err(io_error)?;
     let mut header_file = tempfile::NamedTempFile::new().map_err(io_error)?;
-    header_file
-        .write_all(headers.as_bytes())
-        .map_err(io_error)?;
+    // curl adds the wire CRLF itself and may retain a CR from a header file.
+    for line in headers.lines() {
+        writeln!(header_file, "{line}").map_err(io_error)?;
+    }
     // Keep even a secret-bearing query URL out of process arguments. Generated
     // config contains a single escaped URL; all policy flags are set below.
     let mut config_file = tempfile::NamedTempFile::new().map_err(io_error)?;
