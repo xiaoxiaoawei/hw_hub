@@ -289,6 +289,39 @@ mod tests {
     }
 
     #[test]
+    fn a_second_device_event_does_not_wait_for_the_first_wake_and_full_relay_keeps_the_latest_change()
+     {
+        use std::sync::Barrier;
+        let (tx, rx) = mpsc::channel();
+        let gate = Arc::new(Barrier::new(2));
+        let first_wake = gate.clone();
+        let calls = AtomicUsize::new(0);
+        let signal = EventSignal::start(move || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            let _ = tx.send(n);
+            if n == 0 {
+                first_wake.wait();
+            }
+        })
+        .unwrap();
+        signal.notify();
+        assert_eq!(rx.recv_timeout(WAIT).unwrap(), 0);
+        assert!(signal.take_pending());
+        // A second insertion is observable immediately, even while the first
+        // UI wake is busy; the native callback has no debounce/sleep/wait.
+        signal.notify();
+        assert!(signal.take_pending());
+        // Its relay token is already queued. A third event encounters a full
+        // one-slot channel but must still retain dirty state for that token.
+        signal.notify();
+        gate.wait();
+        assert_eq!(rx.recv_timeout(WAIT).unwrap(), 1);
+        assert!(signal.take_pending());
+        assert!(!signal.take_pending());
+        signal.close();
+    }
+
+    #[test]
     fn shutdown_stops_the_relay_and_does_not_retain_a_sender_cycle() {
         let (done_tx, done_rx) = mpsc::channel();
         struct WakeDrop(mpsc::Sender<()>);

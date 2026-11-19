@@ -1,4 +1,5 @@
-//! Read-only GitHub release discovery. Updates are never downloaded or executed.
+//! Read-only GitHub release discovery. Confirmed downloads and installation are
+//! handled separately by the self-update service.
 use anyhow::{Context, Result, bail, ensure};
 use semver::Version;
 use serde::{Deserialize, Serialize};

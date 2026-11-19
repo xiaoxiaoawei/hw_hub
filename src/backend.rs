@@ -141,11 +141,12 @@ fn format_windows_diagnostics(
 fn available_port_infos() -> Result<Vec<DetectedPort>> {
     #[cfg(windows)]
     {
-        // Library metadata is enrichment, not the authoritative device count.
-        // Its registry fallback can omit a COM or keep a removed one; complete
-        // present PnP records supply every usable COM independently instead.
-        let metadata = serialport::available_ports();
-        merge_present_ports(metadata, present_ports::entries())
+        // Hotplug discovery must not wait for a second library-wide metadata /
+        // SERIALCOMM traversal before querying the authoritative PnP records.
+        // PnP already supplies COM, VID/PID, full instance identity and the PID
+        // needed by native USB reset. Friendly adapter names derive from VID.
+        // Only explicit port_diagnostics() requests run the library comparison.
+        present_only_ports(present_ports::entries())
     }
     #[cfg(not(windows))]
     {
@@ -158,6 +159,11 @@ fn available_port_infos() -> Result<Vec<DetectedPort>> {
             })
             .collect())
     }
+}
+
+#[cfg(any(windows, test))]
+fn present_only_ports(present: Result<Vec<PresentPort>>) -> Result<Vec<DetectedPort>> {
+    merge_present_ports(Ok(Vec::new()), present)
 }
 
 #[cfg(any(windows, test))]
@@ -1015,6 +1021,28 @@ mod tests {
         let port = describe_detected_port(ports[0].clone());
         assert_eq!(port.name, "COM4");
         assert!(port.usb && port.suggested);
+    }
+
+    #[test]
+    fn fast_discovery_is_complete_without_optional_library_metadata_and_keeps_native_usb_reset_pid()
+    {
+        let ports = present_only_ports(Ok(vec![
+            pnp("COM3", "USB\\VID_303A&PID_1001&MI_00\\NATIVE_A"),
+            pnp("COM4", "USB\\VID_10C4&PID_EA60\\UART_B"),
+        ]))
+        .unwrap();
+        assert_eq!(ports.len(), 2);
+        let SerialPortType::UsbPort(native) = &ports[0].info.port_type else {
+            panic!("native USB metadata required")
+        };
+        assert_eq!((native.vid, native.pid), (0x303a, 0x1001));
+        for detected in ports {
+            let instance = detected.instance_id.clone().unwrap();
+            let port = describe_detected_port(detected.clone());
+            assert!(port.usb && port.suggested);
+            assert!(port.identity.contains("windows_pnp"));
+            open_checked(Some(&port), &detected.info, Some(&instance), |_| Ok(())).unwrap();
+        }
     }
 
     #[test]

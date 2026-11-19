@@ -120,6 +120,9 @@ try {
     Invoke-Checked cargo @('clippy', '--locked', '--all-targets', '--target', 'x86_64-pc-windows-msvc', '--', '-D', 'warnings')
     Invoke-Checked cargo @('test', '--locked', '--all-targets', '--target', 'x86_64-pc-windows-msvc')
     Invoke-Checked cargo @('build', '--locked', '--release', '--target', 'x86_64-pc-windows-msvc')
+    if ([version]$Version -ge [version]'0.5.1') {
+        Invoke-Checked pwsh @('-NoProfile', '-File', './scripts/test-self-update.ps1', '-Configuration', 'Release', '-Target', 'x86_64-pc-windows-msvc')
+    }
     $script:CurrentStage = 'Check executable --version'
     $Binary = Join-Path 'target\x86_64-pc-windows-msvc\release' ($Application[0].name + '.exe')
     $script:NativeCommand = "$Binary --version"

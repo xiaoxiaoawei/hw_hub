@@ -3,6 +3,9 @@
 mod app;
 
 fn main() -> eframe::Result<()> {
+    if let Some(code) = esp32c3_flashtool::self_update_install::run_if_requested() {
+        std::process::exit(code);
+    }
     if let Some(code) = esp32c3_flashtool::cli::run_if_requested() {
         std::process::exit(code);
     }
@@ -22,6 +25,12 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "FlashTool",
         options,
-        Box::new(|cc| Ok(Box::new(app::FlashApp::new(cc)))),
+        Box::new(|cc| {
+            let app = Box::new(app::FlashApp::new(cc));
+            if let Err(error) = esp32c3_flashtool::self_update_install::notify_startup_ready() {
+                eprintln!("无法确认更新后的界面启动：{error:#}");
+            }
+            Ok(app)
+        }),
     )
 }

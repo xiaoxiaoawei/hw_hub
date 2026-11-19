@@ -6,6 +6,8 @@ pub mod device_scan;
 pub mod device_watch;
 pub mod drivers;
 pub mod firmware;
+pub mod self_update;
+pub mod self_update_install;
 pub mod telemetry;
 pub mod telemetry_http;
 pub mod updater;
