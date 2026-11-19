@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
@@ -10,13 +10,14 @@ use std::{
 use chrono::Local;
 use eframe::egui::{self, Color32, RichText};
 use esp32c3_flashtool::{
-    backend::Port,
-    batch::{Batch, BatchEvent, JobState},
+    backend::{self, DeviceIdentity, Port},
+    batch::{Batch, BatchEvent, BatchEventKind, JobState},
     chip::ChipModel,
     device_scan::DeviceScanner,
     device_watch::DeviceWatcher,
     drivers::{self, DriverKind},
     firmware::{FirmwareInput, prepare_firmware},
+    telemetry::{self, RecordDraft, RecordService, RecordStatus, TelemetrySettings, UploadState},
     updater::{self, CheckResult, ReleaseUpdate, UpdateSettings},
 };
 
@@ -67,6 +68,108 @@ struct JobRow {
     finished: String,
     elapsed: Option<Instant>,
     duration_secs: Option<f64>,
+    started_at: String,
+    finished_at: String,
+    chip_identity: Option<DeviceIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct DeviceLogKey {
+    batch: String,
+    port: String,
+    identity: String,
+}
+
+impl DeviceLogKey {
+    fn from_port(port: &Port, batch: &str) -> Self {
+        Self {
+            batch: batch.into(),
+            port: port.name.clone(),
+            identity: port.identity.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct DeviceLogBook {
+    history: BTreeMap<DeviceLogKey, VecDeque<String>>,
+    current_keys: BTreeMap<String, DeviceLogKey>,
+    current_lines: BTreeMap<String, Vec<String>>,
+    current_bytes: BTreeMap<String, usize>,
+    truncated: BTreeSet<String>,
+    identities: BTreeMap<DeviceLogKey, DeviceIdentity>,
+}
+
+impl DeviceLogBook {
+    fn begin_batch(&mut self, ports: &[Port], batch: &str, chip: &str, firmware: &str) {
+        self.current_keys.clear();
+        self.current_lines.clear();
+        self.current_bytes.clear();
+        self.truncated.clear();
+        for port in ports {
+            let key = DeviceLogKey::from_port(port, batch);
+            self.current_keys.insert(port.name.clone(), key.clone());
+            let line = format!(
+                "{}  === 批次 {batch} · {chip} · SHA256 {firmware} ===",
+                timestamp()
+            );
+            self.history.entry(key).or_default().push_back(line.clone());
+            self.current_bytes.insert(port.name.clone(), line.len());
+            self.current_lines.insert(port.name.clone(), vec![line]);
+        }
+    }
+
+    fn append(&mut self, port: &str, state: &JobState, kind: BatchEventKind, message: &str) {
+        if kind == BatchEventKind::Progress {
+            return;
+        }
+        let line = format!("{}  [{}] {message}", timestamp(), state_label(state));
+        self.append_line(port, line);
+    }
+
+    fn append_line(&mut self, port: &str, line: String) {
+        let Some(key) = self.current_keys.get(port) else {
+            return;
+        };
+        let history = self.history.entry(key.clone()).or_default();
+        history.push_back(line.clone());
+        while history.len() > 10_000 {
+            history.pop_front();
+        }
+        if self.truncated.contains(port) {
+            return;
+        }
+        let bytes = self.current_bytes.entry(port.into()).or_default();
+        let current = self.current_lines.entry(port.into()).or_default();
+        if *bytes + line.len() + 1 > 512 * 1024 - 128 {
+            current.push("[日志已截断：本批设备日志超过 512 KiB，已保留最早身份信息；芯片结构化身份仍完整保留。]".into());
+            self.truncated.insert(port.into());
+        } else {
+            *bytes += line.len() + 1;
+            current.push(line);
+        }
+    }
+
+    fn remember_identity(&mut self, port: &str, identity: &DeviceIdentity) {
+        if let Some(key) = self.current_keys.get(port) {
+            let known = self
+                .identities
+                .entry(key.clone())
+                .or_insert_with(|| identity.clone());
+            if known.efuse_id.is_none() {
+                known.efuse_id = identity.efuse_id.clone();
+            }
+            if known.mac.is_none() {
+                known.mac = identity.mac.clone();
+            }
+        }
+    }
+}
+
+struct PendingRecord {
+    settings: TelemetrySettings,
+    draft: RecordDraft,
+    device: DeviceLogKey,
 }
 
 #[derive(Default)]
@@ -145,6 +248,31 @@ pub struct FlashApp {
     expected_jobs: usize,
     jobs: BTreeMap<String, JobRow>,
     logs: VecDeque<String>,
+    device_logs: DeviceLogBook,
+    log_windows: BTreeSet<DeviceLogKey>,
+    batch_summary_logged: bool,
+    batch_id: String,
+    batch_started_at: String,
+    settings_open: bool,
+    telemetry_settings: TelemetrySettings,
+    telemetry_draft: TelemetrySettings,
+    batch_telemetry_settings: TelemetrySettings,
+    telemetry_settings_error: Option<String>,
+    settings_headers: Vec<(String, String)>,
+    settings_auto_update: bool,
+    settings_saved: bool,
+    record_service: RecordService,
+    pending_records: VecDeque<PendingRecord>,
+    submitted_records: BTreeMap<String, PendingRecord>,
+    failed_records: VecDeque<PendingRecord>,
+    failed_uploads: VecDeque<PendingRecord>,
+    record_notes: BTreeMap<DeviceLogKey, String>,
+    record_submit_error: Option<String>,
+    close_confirm_open: bool,
+    allow_exit: bool,
+    diagnostics_running: bool,
+    diagnostics_result: Option<mpsc::Receiver<Result<String, String>>>,
+    diagnostics_text: String,
     error: Option<String>,
     notice: Option<String>,
     driver_result: Option<mpsc::Receiver<Result<String, String>>>,
@@ -214,6 +342,7 @@ impl FlashApp {
             ),
         };
         let repaint = cc.egui_ctx.clone();
+        let records_repaint = cc.egui_ctx.clone();
         let watcher_repaint = cc.egui_ctx.clone();
         let (watcher, watcher_error) =
             match DeviceWatcher::new(move || watcher_repaint.request_repaint()) {
@@ -221,6 +350,13 @@ impl FlashApp {
                 Err(error) => (None, Some(format!("设备插拔监听不可用：{error:#}"))),
             };
         let auto_refresh = watcher.is_some();
+        let (telemetry_settings, telemetry_settings_error) = match telemetry::load_settings() {
+            Ok(settings) => (settings, None),
+            Err(error) => (
+                TelemetrySettings::default(),
+                Some(format!("无法读取记录设置，当前使用本地默认配置：{error:#}")),
+            ),
+        };
         let mut app = Self {
             selected_chip: ChipModel::default(),
             pending_chip: ChipModel::default(),
@@ -243,6 +379,35 @@ impl FlashApp {
             expected_jobs: 0,
             jobs: BTreeMap::new(),
             logs: VecDeque::new(),
+            device_logs: DeviceLogBook::default(),
+            log_windows: BTreeSet::new(),
+            batch_summary_logged: true,
+            batch_id: String::new(),
+            batch_started_at: String::new(),
+            settings_open: false,
+            telemetry_draft: telemetry_settings.clone(),
+            batch_telemetry_settings: telemetry_settings.clone(),
+            settings_headers: telemetry_settings
+                .custom_headers
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            settings_auto_update: update_settings.auto_check,
+            settings_saved: false,
+            telemetry_settings,
+            telemetry_settings_error,
+            record_service: RecordService::new(move || records_repaint.request_repaint()),
+            pending_records: VecDeque::new(),
+            submitted_records: BTreeMap::new(),
+            failed_records: VecDeque::new(),
+            failed_uploads: VecDeque::new(),
+            record_notes: BTreeMap::new(),
+            record_submit_error: None,
+            close_confirm_open: false,
+            allow_exit: false,
+            diagnostics_running: false,
+            diagnostics_result: None,
+            diagnostics_text: String::new(),
             error: None,
             notice: None,
             driver_result: None,
@@ -287,6 +452,7 @@ impl FlashApp {
     }
 
     fn open_update_dialog(&mut self) {
+        self.settings_open = false;
         self.chip_picker_open = false;
         self.driver_dialog_open = false;
         self.pending_driver_license = None;
@@ -686,11 +852,24 @@ impl FlashApp {
                 self.batch_port_identities = batch_port_identities;
                 self.batch_port_snapshots = batch_port_snapshots;
                 self.batch_started = timestamp();
-                self.batch = Some(batch);
-                self.log(
-                    "批次开始。正在写入的设备会完成写入与校验；“停止排队”只取消尚未开始的任务。"
-                        .into(),
+                self.batch_started_at = chrono::Utc::now().to_rfc3339();
+                self.batch_id = telemetry::new_batch_id();
+                self.batch_telemetry_settings = self.telemetry_settings.clone();
+                self.batch_summary_logged = false;
+                self.device_logs.begin_batch(
+                    &self.batch_port_snapshots,
+                    &self.batch_id,
+                    self.batch_chip.label(),
+                    &self.firmware_hash,
                 );
+                for port in &self.batch_port_snapshots {
+                    let idle = DeviceLogKey::from_port(port, "");
+                    if self.log_windows.remove(&idle) {
+                        self.log_windows
+                            .insert(DeviceLogKey::from_port(port, &self.batch_id));
+                    }
+                }
+                self.batch = Some(batch);
             }
             Err(err) => self.error = Some(format!("无法启动批次：{err:#}")),
         }
@@ -715,6 +894,8 @@ impl FlashApp {
             state,
             message,
             progress,
+            kind,
+            identity,
         } in events
         {
             let now = timestamp();
@@ -726,15 +907,33 @@ impl FlashApp {
                 finished: String::new(),
                 elapsed: None,
                 duration_secs: None,
+                started_at: String::new(),
+                finished_at: String::new(),
+                chip_identity: None,
             });
-            let changed = row.state != state || row.message != message;
+            let first_terminal =
+                kind == BatchEventKind::State && is_terminal(&state) && row.finished_at.is_empty();
             if state == JobState::Connecting && row.started.is_empty() {
                 row.started = now.clone();
+                row.started_at = chrono::Utc::now().to_rfc3339();
                 row.elapsed = Some(Instant::now());
             }
-            if is_terminal(&state) && row.finished.is_empty() {
+            if first_terminal {
                 row.finished = now;
+                row.finished_at = chrono::Utc::now().to_rfc3339();
                 row.duration_secs = row.elapsed.map(|start| start.elapsed().as_secs_f64());
+            }
+            if let Some(reported) = &identity {
+                let known = row.chip_identity.get_or_insert(DeviceIdentity {
+                    efuse_id: None,
+                    mac: None,
+                });
+                if known.efuse_id.is_none() {
+                    known.efuse_id = reported.efuse_id.clone();
+                }
+                if known.mac.is_none() {
+                    known.mac = reported.mac.clone();
+                }
             }
             row.state = state.clone();
             let progress = progress.clamp(0.0, 1.0);
@@ -744,9 +943,41 @@ impl FlashApp {
                 progress
             };
             row.message = message.clone();
-            if changed && state != JobState::Writing {
-                self.log(format!("[{port}] {}  {message}", state_label(&state)));
+            self.device_logs.append(&port, &state, kind, &message);
+            if kind == BatchEventKind::Identity
+                && let Some(identity) = &identity
+            {
+                self.device_logs.remember_identity(&port, identity);
+                self.device_logs.append_line(
+                    &port,
+                    format!(
+                        "{}  EFUSE_ID={} MAC={}",
+                        timestamp(),
+                        identity.efuse_id.as_deref().unwrap_or("未知"),
+                        identity.mac.as_deref().unwrap_or("未知")
+                    ),
+                );
             }
+            if first_terminal {
+                if let Some(summary) = terminal_summary(&port, &state) {
+                    self.log(summary);
+                }
+                self.queue_terminal_record(&port);
+            }
+        }
+        if !self.batch_summary_logged
+            && self.jobs.len() == self.expected_jobs
+            && self.jobs.values().all(|row| is_terminal(&row.state))
+        {
+            self.batch_summary_logged = true;
+            let count = |state| self.jobs.values().filter(|row| row.state == state).count();
+            self.log(format!(
+                "批次完成：成功 {}，失败 {}，取消 {}，共 {} 台",
+                count(JobState::Success),
+                count(JobState::Failed),
+                count(JobState::Cancelled),
+                self.expected_jobs
+            ));
         }
         if let Some(receiver) = &self.driver_result {
             match receiver.try_recv() {
@@ -768,6 +999,656 @@ impl FlashApp {
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
+        }
+    }
+
+    fn queue_terminal_record(&mut self, port: &str) {
+        let Some(row) = self.jobs.get(port) else {
+            return;
+        };
+        let Some(device) = self.device_logs.current_keys.get(port).cloned() else {
+            return;
+        };
+        let status = match row.state {
+            JobState::Success => RecordStatus::Success,
+            JobState::Failed => RecordStatus::Failed,
+            JobState::Cancelled => RecordStatus::Cancelled,
+            _ => return,
+        };
+        let draft = RecordDraft {
+            batch_id: self.batch_id.clone(),
+            port: port.into(),
+            chip: self.batch_chip.slug().into(),
+            identity: row.chip_identity.clone(),
+            status,
+            started_at: if row.started_at.is_empty() {
+                self.batch_started_at.clone()
+            } else {
+                row.started_at.clone()
+            },
+            finished_at: row.finished_at.clone(),
+            duration_ms: row
+                .duration_secs
+                .map_or(0, |seconds| (seconds * 1_000.0).round() as u64),
+            firmware_sha256: self.firmware_hash.clone(),
+            logs: self
+                .device_logs
+                .current_lines
+                .get(port)
+                .cloned()
+                .unwrap_or_default(),
+        };
+        self.pending_records.push_back(PendingRecord {
+            settings: self.batch_telemetry_settings.clone(),
+            draft,
+            device,
+        });
+        self.retry_record_submissions();
+    }
+
+    fn retry_record_submissions(&mut self) {
+        while let Some(pending) = self.pending_records.front() {
+            match self
+                .record_service
+                .submit(&pending.settings, pending.draft.clone())
+            {
+                Ok(id) => {
+                    let pending = self
+                        .pending_records
+                        .pop_front()
+                        .expect("front record exists");
+                    self.submitted_records.insert(id, pending);
+                    self.record_submit_error = None;
+                }
+                Err(error) => {
+                    let error = format!("烧录记录等待保存，尚未丢弃：{error:#}");
+                    if self.record_submit_error.as_deref() != Some(error.as_str()) {
+                        self.log(error.clone());
+                    }
+                    self.record_submit_error = Some(error);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn poll_records(&mut self) {
+        let mut completed = false;
+        while let Some(result) = self.record_service.poll() {
+            completed = true;
+            let Some(pending) = self.submitted_records.remove(&result.record_id) else {
+                continue;
+            };
+            if pending.draft.batch_id != result.batch_id {
+                self.log(format!(
+                    "{} 记录响应批次不匹配，未关联到当前设备",
+                    result.port
+                ));
+                self.failed_records.push_back(pending);
+                continue;
+            }
+            let device = pending.device.clone();
+            let storage = result
+                .csv_path
+                .as_ref()
+                .map(|path| format!("CSV：{}", path.display()))
+                .unwrap_or_else(|| "本地 CSV 未保存".into());
+            let retry_upload = matches!(
+                &result.upload_state,
+                UploadState::Failed | UploadState::Deferred
+            );
+            let upload = match result.upload_state {
+                UploadState::Disabled => "上报关闭",
+                UploadState::SkippedIdentity => "未上报：设备身份未确认",
+                UploadState::Uploaded => "上报完成",
+                UploadState::Failed => "上报失败",
+                UploadState::Deferred => "未上报：上传队列暂不可用",
+            };
+            let note = format!("{storage} · {upload}");
+            self.device_logs
+                .history
+                .entry(device.clone())
+                .or_default()
+                .push_back(format!(
+                    "{}  [记录 {}] {note}",
+                    timestamp(),
+                    result.batch_id
+                ));
+            self.record_notes.insert(device, note);
+            if let Some(error) = result.error {
+                self.log(format!("{} 记录处理失败：{error}", result.port));
+            }
+            if result.csv_path.is_none() {
+                self.failed_records.push_back(pending);
+            } else if retry_upload {
+                self.failed_uploads.push_back(pending);
+            }
+        }
+        if completed || !self.pending_records.is_empty() {
+            self.retry_record_submissions();
+        }
+    }
+
+    fn device_log_windows(&mut self, ctx: &egui::Context) {
+        let windows: Vec<_> = self.log_windows.iter().cloned().collect();
+        for key in windows {
+            let mut open = true;
+            egui::Window::new(format!("{} · 详细日志", key.port))
+                .id(egui::Id::new((
+                    "device_log",
+                    &key.batch,
+                    &key.port,
+                    &key.identity,
+                )))
+                .open(&mut open)
+                .resizable(true)
+                .default_size([760.0, 460.0])
+                .min_size([460.0, 260.0])
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(if key.batch.is_empty() {
+                                "尚未开始烧录".into()
+                            } else {
+                                format!("批次 {}", key.batch)
+                            })
+                            .size(12.0)
+                            .color(MUTED),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if secondary_button(ui, "复制全部日志", [118.0, 32.0]).clicked() {
+                                let text = self
+                                    .device_logs
+                                    .history
+                                    .get(&key)
+                                    .map(|lines| {
+                                        lines.iter().cloned().collect::<Vec<_>>().join("\n")
+                                    })
+                                    .unwrap_or_default();
+                                ctx.copy_text(text);
+                            }
+                        });
+                    });
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("设备标识：{}", key.identity))
+                                .size(11.0)
+                                .color(MUTED),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&key.identity);
+                    if let Some(identity) = self.device_logs.identities.get(&key) {
+                        ui.label(
+                            RichText::new(format!(
+                                "eFuse 出厂 MAC：{}    MAC：{}",
+                                identity.efuse_id.as_deref().unwrap_or("未知"),
+                                identity.mac.as_deref().unwrap_or("未知")
+                            ))
+                            .monospace()
+                            .size(12.0),
+                        );
+                    }
+                    if let Some(note) = self.record_notes.get(&key) {
+                        ui.add(
+                            egui::Label::new(RichText::new(note).size(11.0).color(MUTED)).wrap(),
+                        );
+                    }
+                    egui::Frame::new()
+                        .fill(NAVY)
+                        .corner_radius(8.0)
+                        .inner_margin(12.0)
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            egui::ScrollArea::both()
+                                .id_salt(("detailed_log", &key))
+                                .stick_to_bottom(true)
+                                .max_height(ui.available_height().max(140.0))
+                                .show(ui, |ui| {
+                                    if let Some(lines) = self.device_logs.history.get(&key) {
+                                        for line in lines {
+                                            ui.label(
+                                                RichText::new(line)
+                                                    .monospace()
+                                                    .size(12.0)
+                                                    .color(Color32::from_rgb(195, 216, 222)),
+                                            );
+                                        }
+                                    } else {
+                                        ui.label(
+                                            RichText::new("尚无该设备的烧录日志。")
+                                                .size(12.0)
+                                                .color(Color32::from_rgb(137, 160, 181)),
+                                        );
+                                    }
+                                });
+                        });
+                });
+            if !open {
+                self.log_windows.remove(&key);
+            }
+        }
+    }
+
+    fn save_settings_from_ui(&mut self) -> bool {
+        let mut headers = BTreeMap::new();
+        let mut names = BTreeSet::new();
+        for (name, value) in &self.settings_headers {
+            let name = name.trim();
+            if name.is_empty() && value.is_empty() {
+                continue;
+            }
+            if name.is_empty() || !names.insert(name.to_ascii_lowercase()) {
+                self.telemetry_settings_error = Some("请求头名称不能为空或重复。".into());
+                return false;
+            }
+            headers.insert(name.into(), value.clone());
+        }
+        self.telemetry_draft.custom_headers = headers;
+        if let Err(error) = telemetry::validate_settings(&self.telemetry_draft)
+            .and_then(|_| telemetry::save_settings(&self.telemetry_draft))
+        {
+            self.telemetry_settings_error = Some(format!("设置未保存：{error:#}"));
+            return false;
+        }
+        self.telemetry_settings = self.telemetry_draft.clone();
+        let previous = self.update_settings.auto_check;
+        self.update_settings.auto_check = self.settings_auto_update;
+        if let Err(error) = updater::save_settings(&self.update_settings) {
+            self.update_settings.auto_check = previous;
+            self.telemetry_settings_error =
+                Some(format!("记录设置已保存，更新偏好未保存：{error:#}"));
+            return false;
+        }
+        self.telemetry_settings_error = None;
+        self.settings_saved = true;
+        self.record_submit_error = None;
+        self.retry_record_submissions();
+        true
+    }
+
+    fn retry_failed_local_records(&mut self) {
+        while let Some(mut pending) = self.failed_records.pop_front() {
+            pending.settings = self.telemetry_settings.clone();
+            self.pending_records.push_back(pending);
+        }
+        self.record_submit_error = None;
+        self.retry_record_submissions();
+    }
+
+    fn retry_failed_uploads(&mut self) {
+        while let Some(mut pending) = self.failed_uploads.pop_front() {
+            let original_directory = pending.settings.csv_directory.clone();
+            pending.settings = self.telemetry_settings.clone();
+            pending.settings.csv_directory = original_directory;
+            self.pending_records.push_back(pending);
+        }
+        self.record_submit_error = None;
+        self.retry_record_submissions();
+    }
+
+    fn start_diagnostics(&mut self, ctx: &egui::Context) {
+        if self.diagnostics_running {
+            return;
+        }
+        self.diagnostics_running = true;
+        let (sender, receiver) = mpsc::channel();
+        self.diagnostics_result = Some(receiver);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let result =
+                backend::port_diagnostics().map_err(|error| format!("串口诊断失败：{error:#}"));
+            let _ = sender.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_diagnostics(&mut self) {
+        let result = match self
+            .diagnostics_result
+            .as_ref()
+            .map(mpsc::Receiver::try_recv)
+        {
+            Some(Ok(result)) => result,
+            Some(Err(mpsc::TryRecvError::Disconnected)) => Err("串口诊断任务意外结束。".into()),
+            _ => return,
+        };
+        self.diagnostics_running = false;
+        self.diagnostics_result = None;
+        self.diagnostics_text = result.unwrap_or_else(|error| error);
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let mut open = true;
+        let mut check_updates = false;
+        egui::Window::new("软件设置")
+            .id(egui::Id::new("software_settings"))
+            .open(&mut open)
+            .default_size([720.0, 640.0])
+            .min_size([570.0, 420.0])
+            .max_height(ctx.screen_rect().height() - 50.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("settings_content")
+                    .min_scrolled_height(300.0)
+                    .max_height((ui.available_height() - 65.0).max(250.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("FlashTool {}", env!("CARGO_PKG_VERSION")))
+                                    .size(22.0)
+                                    .strong(),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if secondary_button(ui, "检查软件更新", [119.0, 33.0]).clicked()
+                                    {
+                                        check_updates = true;
+                                    }
+                                },
+                            );
+                        });
+                        ui.checkbox(&mut self.settings_auto_update, "启动时自动检查软件更新");
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.label(RichText::new("本地记录").size(16.0).strong());
+                        let directory = self
+                            .telemetry_draft
+                            .csv_directory
+                            .clone()
+                            .map(Ok)
+                            .unwrap_or_else(telemetry::default_records_directory);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("CSV 目录").size(12.0).color(MUTED));
+                            if secondary_button(ui, "选择目录", [89.0, 31.0]).clicked()
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .set_title("选择烧录记录 CSV 目录")
+                                    .pick_folder()
+                            {
+                                self.telemetry_draft.csv_directory = Some(path);
+                                self.settings_saved = false;
+                            }
+                            if text_button(ui, "默认目录").clicked() {
+                                self.telemetry_draft.csv_directory = None;
+                                self.settings_saved = false;
+                            }
+                            if let Ok(path) = &directory
+                                && ui
+                                    .add_enabled_ui(path.is_dir(), |ui| text_button(ui, "打开目录"))
+                                    .inner
+                                    .clicked()
+                                && let Err(error) = open_records_directory(path)
+                            {
+                                self.telemetry_settings_error =
+                                    Some(format!("无法打开记录目录：{error}"));
+                            }
+                        });
+                        match directory {
+                            Ok(path) => {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(path.display().to_string())
+                                            .monospace()
+                                            .size(12.0)
+                                            .color(MUTED),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                            Err(error) => {
+                                ui.label(
+                                    RichText::new(format!("默认目录不可用：{error}"))
+                                        .size(12.0)
+                                        .color(DANGER),
+                                );
+                            }
+                        }
+                        ui.label(
+                            RichText::new("每台设备任务结束后自动保存 CSV，上报关闭时仍会保存。")
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                        if !self.failed_records.is_empty() {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} 条本地记录保存失败",
+                                        self.failed_records.len()
+                                    ))
+                                    .size(12.0)
+                                    .color(DANGER),
+                                );
+                                if secondary_button(ui, "保存设置并重试", [140.0, 32.0]).clicked()
+                                    && self.save_settings_from_ui()
+                                {
+                                    self.retry_failed_local_records();
+                                }
+                            });
+                        }
+                        ui.add_space(9.0);
+                        ui.separator();
+                        ui.label(RichText::new("日志上报").size(16.0).strong());
+                        ui.checkbox(&mut self.telemetry_draft.upload_enabled, "启用烧录日志上报");
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("接口地址").size(12.0).color(MUTED));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.telemetry_draft.endpoint)
+                                    .desired_width(ui.available_width())
+                                    .hint_text("http:// 或 https://"),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("请求超时").size(12.0).color(MUTED));
+                            ui.add(
+                                egui::DragValue::new(&mut self.telemetry_draft.timeout_seconds)
+                                    .range(5..=30)
+                                    .suffix(" 秒"),
+                            );
+                        });
+                        if !self.failed_uploads.is_empty() {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} 条记录已保存，上传未完成",
+                                        self.failed_uploads.len()
+                                    ))
+                                    .size(12.0)
+                                    .color(MUTED),
+                                );
+                                if ui
+                                    .add_enabled_ui(self.telemetry_draft.upload_enabled, |ui| {
+                                        secondary_button(ui, "按当前设置重试上报", [172.0, 32.0])
+                                    })
+                                    .inner
+                                    .clicked()
+                                    && self.save_settings_from_ui()
+                                {
+                                    self.retry_failed_uploads();
+                                }
+                            });
+                        }
+                        egui::CollapsingHeader::new("高级设置 · 身份提取与请求头")
+                            .id_salt("advanced_record_settings")
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("eFuse 出厂 MAC 提取规则")
+                                        .size(12.0)
+                                        .color(MUTED),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(
+                                        &mut self.telemetry_draft.efuse_pattern,
+                                    )
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(ui.available_width()),
+                                );
+                                ui.label(RichText::new("MAC 提取规则").size(12.0).color(MUTED));
+                                ui.add(
+                                    egui::TextEdit::singleline(
+                                        &mut self.telemetry_draft.mac_pattern,
+                                    )
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(ui.available_width()),
+                                );
+                                ui.add_space(5.0);
+                                ui.label(RichText::new("自定义请求头").size(12.0).color(MUTED));
+                                let mut remove = None;
+                                for (index, (name, value)) in
+                                    self.settings_headers.iter_mut().enumerate()
+                                {
+                                    ui.push_id(index, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.add(
+                                                egui::TextEdit::singleline(name)
+                                                    .desired_width(160.0)
+                                                    .hint_text("Header-Name"),
+                                            );
+                                            ui.add(
+                                                egui::TextEdit::singleline(value)
+                                                    .password(true)
+                                                    .desired_width(
+                                                        (ui.available_width() - 63.0).max(120.0),
+                                                    )
+                                                    .hint_text("Header value"),
+                                            );
+                                            if text_button(ui, "移除").clicked() {
+                                                remove = Some(index);
+                                            }
+                                        });
+                                    });
+                                }
+                                if let Some(index) = remove {
+                                    self.settings_headers.remove(index);
+                                }
+                                if text_button(ui, "+ 添加请求头").clicked() {
+                                    self.settings_headers.push((String::new(), String::new()));
+                                }
+                            });
+                        egui::CollapsingHeader::new("设备诊断")
+                            .id_salt("serial_diagnostics")
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled_ui(!self.diagnostics_running, |ui| {
+                                            secondary_button(ui, "生成串口诊断", [124.0, 32.0])
+                                        })
+                                        .inner
+                                        .clicked()
+                                    {
+                                        self.start_diagnostics(ctx);
+                                    }
+                                    if ui
+                                        .add_enabled_ui(!self.diagnostics_text.is_empty(), |ui| {
+                                            text_button(ui, "复制诊断")
+                                        })
+                                        .inner
+                                        .clicked()
+                                    {
+                                        ctx.copy_text(self.diagnostics_text.clone());
+                                    }
+                                    if self.diagnostics_running {
+                                        ui.spinner();
+                                    }
+                                });
+                                if !self.diagnostics_text.is_empty() {
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut self.diagnostics_text)
+                                            .font(egui::TextStyle::Monospace)
+                                            .interactive(false)
+                                            .desired_width(ui.available_width())
+                                            .desired_rows(8),
+                                    );
+                                }
+                            });
+                        if let Some(error) = &self.telemetry_settings_error {
+                            banner(ui, error, true);
+                        }
+                        if let Some(error) = &self.record_submit_error {
+                            banner(ui, error, true);
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if primary_button(ui, "保存设置", [124.0, 38.0]).clicked() {
+                        self.save_settings_from_ui();
+                    }
+                    if self.settings_saved {
+                        ui.label(RichText::new("设置已保存").size(12.0).color(ACCENT));
+                    }
+                    let local =
+                        self.record_service.pending_local_count() + self.pending_records.len();
+                    if local > 0 {
+                        ui.label(
+                            RichText::new(format!("{local} 条记录等待本地保存"))
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                    }
+                });
+            });
+        self.settings_open = open;
+        if check_updates {
+            self.settings_open = false;
+            self.open_update_dialog();
+            self.start_update_check(true, ctx);
+        }
+    }
+
+    fn confirm_record_exit(&mut self, ctx: &egui::Context) {
+        if !self.close_confirm_open {
+            return;
+        }
+        let mut wait = false;
+        let mut exit = false;
+        let mut retry = false;
+        let response = egui::Modal::new(egui::Id::new("unfinished_record_exit"))
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::WHITE)
+                    .corner_radius(12.0)
+                    .inner_margin(24.0),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(480.0);
+                ui.label(RichText::new("仍有记录未处理完成").size(22.0).strong());
+                if !self.failed_records.is_empty() || !self.pending_records.is_empty() {
+                    ui.label(format!(
+                        "{} 条本地记录尚未保存。",
+                        self.failed_records.len() + self.pending_records.len()
+                    ));
+                    if secondary_button(ui, "返回设置重试保存", [164.0, 36.0]).clicked() {
+                        retry = true;
+                    }
+                } else {
+                    ui.label(format!(
+                        "本地已保存，仍有 {} 条上传未完成。",
+                        self.record_service.pending_count()
+                    ));
+                }
+                ui.horizontal(|ui| {
+                    if primary_button(ui, "继续等待", [116.0, 38.0]).clicked() {
+                        wait = true;
+                    }
+                    if secondary_button(ui, "仍然退出", [116.0, 38.0]).clicked() {
+                        exit = true;
+                    }
+                });
+            });
+        if exit {
+            self.allow_exit = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if retry {
+            self.close_confirm_open = false;
+            self.open_settings();
+        }
+        if wait || response.should_close() {
+            self.close_confirm_open = false;
         }
     }
 
@@ -893,199 +1774,169 @@ impl FlashApp {
         };
     }
 
+    fn open_settings(&mut self) {
+        self.update_dialog_open = false;
+        self.chip_picker_open = false;
+        self.driver_dialog_open = false;
+        self.pending_driver_license = None;
+        self.telemetry_draft = self.telemetry_settings.clone();
+        self.settings_headers = self
+            .telemetry_settings
+            .custom_headers
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        self.settings_auto_update = self.update_settings.auto_check;
+        self.settings_saved = false;
+        self.settings_open = true;
+    }
+
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(12.0);
+        let meta = Color32::from_rgb(144, 163, 184);
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
-            icon(ui, Icon::Chip, 24.0, Color32::from_rgb(79, 215, 191));
+            icon(ui, Icon::Chip, 23.0, Color32::from_rgb(79, 215, 191));
             ui.label(
                 RichText::new("FlashTool")
-                    .size(23.0)
+                    .size(22.0)
                     .strong()
                     .color(Color32::WHITE),
             );
         });
-        ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 3.0;
             ui.label(
                 RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                    .size(10.0)
-                    .color(Color32::from_rgb(123, 145, 169)),
+                    .size(12.0)
+                    .color(meta),
             );
             if ui
                 .add(
                     egui::Button::new(
                         RichText::new("检查更新")
-                            .size(11.0)
+                            .size(12.0)
                             .color(Color32::from_rgb(133, 209, 193)),
-                    )
-                    .frame(false)
-                    .min_size(egui::vec2(0.0, 23.0)),
-                )
-                .clicked()
-            {
-                self.open_update_dialog();
-                self.start_update_check(true, ui.ctx());
-            }
-        });
-        ui.add_space(30.0);
-        ui.label(
-            RichText::new("工作空间")
-                .size(11.0)
-                .color(Color32::from_rgb(103, 124, 150)),
-        );
-        ui.add_space(8.0);
-        egui::Frame::new()
-            .fill(Color32::from_rgb(27, 52, 70))
-            .corner_radius(8.0)
-            .inner_margin(egui::Margin::symmetric(12, 13))
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    icon(ui, Icon::Grid, 17.0, Color32::from_rgb(96, 222, 197));
-                    ui.label(
-                        RichText::new("批量烧录")
-                            .strong()
-                            .color(Color32::from_rgb(187, 244, 231)),
-                    );
-                });
-            });
-        ui.add_space(24.0);
-        ui.label(
-            RichText::new("当前配置")
-                .size(11.0)
-                .color(Color32::from_rgb(103, 124, 150)),
-        );
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new(self.selected_chip.label())
-                .size(16.0)
-                .strong()
-                .color(Color32::from_rgb(220, 230, 241)),
-        );
-        ui.label(
-            RichText::new(format!("{} · {} 台并发", self.baud, self.concurrency))
-                .size(11.0)
-                .color(Color32::from_rgb(133, 153, 177)),
-        );
-        if self.update_checking {
-            ui.add_space(15.0);
-            ui.label(
-                RichText::new("正在检查更新…")
-                    .size(11.0)
-                    .color(Color32::from_rgb(133, 153, 177)),
-            );
-        } else if let Some(version) = self
-            .update_available
-            .as_ref()
-            .map(|release| release.version.clone())
-        {
-            ui.add_space(20.0);
-            egui::Frame::new()
-                .fill(Color32::from_rgb(24, 63, 66))
-                .corner_radius(8.0)
-                .inner_margin(11.0)
-                .show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.label(
-                        RichText::new("发现新版本")
-                            .size(11.0)
-                            .color(Color32::from_rgb(130, 218, 196)),
-                    );
-                    ui.label(
-                        RichText::new(version)
-                            .size(15.0)
-                            .strong()
-                            .color(Color32::from_rgb(206, 247, 234)),
-                    );
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("查看更新  >")
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(130, 218, 196)),
-                            )
-                            .frame(false),
-                        )
-                        .clicked()
-                    {
-                        self.open_update_dialog();
-                    }
-                });
-        } else if self.update_settings_error.is_some() || self.update_error.is_some() {
-            ui.add_space(15.0);
-            let text = if self.update_settings_error.is_some() {
-                "更新设置需要检查"
-            } else {
-                "更新检查暂不可用"
-            };
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new(text)
-                            .size(10.0)
-                            .color(Color32::from_rgb(149, 163, 182)),
                     )
                     .frame(false),
                 )
                 .clicked()
             {
+                self.settings_open = false;
+                self.open_update_dialog();
+                self.start_update_check(true, ui.ctx());
+            }
+        });
+        ui.add_space(22.0);
+        ui.label(RichText::new("工作空间").size(12.0).color(meta));
+        if nav_item(ui, Icon::Grid, "批量烧录", !self.settings_open).clicked() {
+            self.settings_open = false;
+        }
+        if nav_item(ui, Icon::Settings, "软件设置", self.settings_open).clicked() {
+            self.open_settings();
+        }
+        ui.add_space(20.0);
+        ui.label(RichText::new("当前配置").size(12.0).color(meta));
+        ui.label(
+            RichText::new(self.selected_chip.label())
+                .size(12.0)
+                .strong()
+                .color(Color32::from_rgb(220, 230, 241)),
+        );
+        ui.label(
+            RichText::new(format!("{} · {} 台并发", self.baud, self.concurrency))
+                .size(12.0)
+                .color(meta),
+        );
+        if self.update_checking {
+            ui.add_space(12.0);
+            ui.label(RichText::new("正在检查更新…").size(12.0).color(meta));
+        } else if let Some(version) = self
+            .update_available
+            .as_ref()
+            .map(|release| release.version.clone())
+        {
+            ui.add_space(14.0);
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new(format!("发现新版本 {version}"))
+                            .size(12.0)
+                            .color(Color32::from_rgb(130, 218, 196)),
+                    )
+                    .fill(Color32::from_rgb(24, 63, 66))
+                    .corner_radius(7.0),
+                )
+                .clicked()
+            {
+                self.settings_open = false;
+                self.open_update_dialog();
+            }
+        } else if self.update_error.is_some() || self.update_settings_error.is_some() {
+            ui.add_space(12.0);
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("更新检查详情").size(12.0).color(meta))
+                        .frame(false),
+                )
+                .clicked()
+            {
+                self.settings_open = false;
                 self.open_update_dialog();
             }
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.add_space(10.0);
+            ui.add_space(8.0);
             ui.label(
-                RichText::new("写入校验 / 自动复位")
-                    .size(11.0)
-                    .color(Color32::from_rgb(103, 124, 150)),
+                RichText::new(format!(
+                    "{} 个串口在线",
+                    self.ports.iter().filter(|row| row.online).count()
+                ))
+                .size(12.0)
+                .color(meta),
             );
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let color = if self.ports.iter().all(|row| !row.online) {
-                    Color32::from_rgb(105, 123, 145)
-                } else {
-                    Color32::from_rgb(76, 204, 173)
-                };
-                dot(ui, color, 6.0);
-                ui.label(
-                    RichText::new(format!(
-                        "{} 个串口在线",
-                        self.ports.iter().filter(|row| row.online).count()
-                    ))
-                    .size(12.0)
-                    .color(Color32::from_rgb(168, 188, 207)),
-                );
-            });
+            if !self.failed_records.is_empty() {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(format!("{} 条记录未保存", self.failed_records.len()))
+                                .size(12.0)
+                                .color(Color32::from_rgb(245, 161, 153)),
+                        )
+                        .frame(false),
+                    )
+                    .clicked()
+                {
+                    self.open_settings();
+                }
+            } else if self.record_service.pending_local_count() + self.pending_records.len() > 0 {
+                ui.label(RichText::new("正在保存本地记录").size(12.0).color(meta));
+            }
         });
     }
 
     fn heading(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(
+        let mut title_rect = egui::Rect::NOTHING;
+        let mut controls_left = ui.max_rect().right();
+        let row = ui.horizontal(|ui| {
+            title_rect = ui
+                .label(
                     RichText::new("设备烧录工作台")
-                        .size(27.0)
+                        .size(22.0)
                         .strong()
                         .color(INK),
-                );
-                ui.add_space(3.0);
-                ui.label(
-                    RichText::new("每个 COM 独立进度，整批设备一目了然。")
-                        .size(13.0)
-                        .color(MUTED),
-                );
-            });
+                )
+                .rect;
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
+                let driver = ui
                     .add_enabled_ui(!self.busy(), |ui| {
                         secondary_button(ui, "安装驱动", [94.0, 35.0])
                     })
-                    .inner
-                    .clicked()
-                {
+                    .inner;
+                controls_left = controls_left.min(driver.rect.left());
+                if driver.clicked() {
                     self.chip_picker_open = false;
                     self.update_dialog_open = false;
+                    self.settings_open = false;
                     self.driver_dialog_open = true;
                 }
                 let (text, color) = if self.running() {
@@ -1097,9 +1948,32 @@ impl FlashApp {
                 } else {
                     ("设备已就绪", ACCENT)
                 };
-                status_pill(ui, text, color);
+                controls_left = controls_left.min(status_pill(ui, text, color).left());
             });
         });
+        let modal_open = self.settings_open
+            || self.update_dialog_open
+            || self.chip_picker_open
+            || self.driver_dialog_open
+            || self.pending_driver_license.is_some()
+            || self.close_confirm_open;
+        if !modal_open
+            && let Some(blank) = header_drag_region(row.response.rect, title_rect, controls_left)
+        {
+            let drag = ui.interact(
+                blank,
+                ui.id().with("blank_header_drag"),
+                egui::Sense::drag(),
+            );
+            if drag.drag_started_by(egui::PointerButton::Primary)
+                && ui
+                    .ctx()
+                    .pointer_interact_pos()
+                    .is_some_and(|position| ui.ctx().layer_id_at(position) == Some(ui.layer_id()))
+            {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+        }
     }
 
     fn chip_panel(&mut self, ui: &mut egui::Ui) {
@@ -1112,6 +1986,7 @@ impl FlashApp {
         .clicked()
         {
             self.pending_chip = self.selected_chip;
+            self.settings_open = false;
             self.driver_dialog_open = false;
             self.update_dialog_open = false;
             self.chip_picker_open = true;
@@ -1328,18 +2203,10 @@ impl FlashApp {
         if let Some(index) = remove {
             self.firmware.remove(index);
         }
-        ui.label(
-            RichText::new(format!(
-                "HEX 写入地址 · {} Bootloader 默认 0x{:X} · USB Hub 建议从 4 台并发开始",
-                self.selected_chip.label(),
-                self.selected_chip.bootloader_address()
-            ))
-            .size(10.0)
-            .color(MUTED),
-        );
     }
 
     fn ports_panel(&mut self, ui: &mut egui::Ui) {
+        let mut requested_logs = Vec::new();
         let locked = self.busy();
         let online = self.ports.iter().filter(|row| row.online).count();
         let selected = self
@@ -1458,6 +2325,7 @@ impl FlashApp {
             let columns = if ui.available_width() >= 780.0 { 3 } else { 2 };
             let jobs = &self.jobs;
             let batch_ports = &self.batch_port_identities;
+            let log_keys = &self.device_logs.current_keys;
             egui::ScrollArea::vertical()
                 .id_salt("device_workstations")
                 .max_height(360.0)
@@ -1472,7 +2340,14 @@ impl FlashApp {
                                 } else {
                                     None
                                 };
-                                device_tile(&mut uis[index], row, job, in_batch, locked, false);
+                                if device_tile(&mut uis[index], row, job, in_batch, locked, false) {
+                                    let key = log_keys
+                                        .get(&row.port.name)
+                                        .filter(|key| key.identity == row.port.identity)
+                                        .cloned()
+                                        .unwrap_or_else(|| DeviceLogKey::from_port(&row.port, ""));
+                                    requested_logs.push(key);
+                                }
                             }
                         });
                         ui.add_space(7.0);
@@ -1515,30 +2390,34 @@ impl FlashApp {
                                     selected: false,
                                     online: false,
                                 };
-                                device_tile(
+                                if device_tile(
                                     &mut uis[index],
                                     &mut history,
                                     record.job,
                                     true,
                                     true,
                                     true,
-                                );
+                                ) {
+                                    requested_logs
+                                        .push(DeviceLogKey::from_port(record.port, &self.batch_id));
+                                }
                             }
                         });
                         ui.add_space(7.0);
                     }
                 });
         }
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(if self.running() {
-                "本批端口已锁定。新接入设备不会加入当前批次；离线任务在只读记录中继续显示。"
-            } else {
-                "新识别的端口不会自动勾选。勾选在线设备后开始烧录。"
-            })
-            .size(10.0)
-            .color(MUTED),
-        );
+        self.log_windows.extend(requested_logs);
+        if self.running() {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "本批端口已锁定。新接入设备不会加入当前批次；离线任务在只读记录中继续显示。",
+                )
+                .size(10.0)
+                .color(MUTED),
+            );
+        }
     }
 
     fn driver_panel(&mut self, ui: &mut egui::Ui) {
@@ -1662,11 +2541,6 @@ impl FlashApp {
                             .size(16.0)
                             .strong(),
                     );
-                    ui.label(
-                        RichText::new("写入后校验，通过后报告成功")
-                            .size(11.0)
-                            .color(MUTED),
-                    );
                 } else {
                     ui.label(
                         RichText::new(format!(
@@ -1711,7 +2585,6 @@ impl FlashApp {
                         batch.cancel_queued();
                         self.notice =
                             Some("已停止排队；正在烧录的设备将完成写入与校验，请保持连接。".into());
-                        self.log("用户停止排队。当前任务继续完成写入与校验。".into());
                     }
                 } else if !self.jobs.is_empty() && text_button(ui, "导出 CSV").clicked() {
                     self.export_csv();
@@ -1722,7 +2595,7 @@ impl FlashApp {
 
     fn logs_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            panel_title(ui, Icon::Grid, "运行日志", "03");
+            panel_title(ui, Icon::Grid, "烧录汇总", "03");
             ui.label(
                 RichText::new(format!("{} 条", self.logs.len()))
                     .size(10.0)
@@ -1731,7 +2604,7 @@ impl FlashApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add_enabled_ui(!self.logs.is_empty(), |ui| {
-                        secondary_button(ui, "清空日志", [88.0, 29.0])
+                        secondary_button(ui, "清空汇总", [88.0, 29.0])
                     })
                     .inner
                     .clicked()
@@ -1784,7 +2657,7 @@ impl FlashApp {
                         .show(ui, |ui| {
                             if self.logs.is_empty() {
                                 ui.label(
-                                    RichText::new("暂无日志，新的任务事件会显示在这里。")
+                                    RichText::new("暂无烧录结果")
                                         .size(11.0)
                                         .color(Color32::from_rgb(126, 149, 172)),
                                 );
@@ -1822,6 +2695,9 @@ impl FlashApp {
             "批次开始",
             "串口",
             "芯片",
+            "批次ID",
+            "eFuse出厂MAC",
+            "MAC",
             "状态",
             "进度",
             "开始时间",
@@ -1844,6 +2720,15 @@ impl FlashApp {
                     self.batch_started.as_str(),
                     port.as_str(),
                     self.batch_chip.label(),
+                    self.batch_id.as_str(),
+                    row.chip_identity
+                        .as_ref()
+                        .and_then(|identity| identity.efuse_id.as_deref())
+                        .unwrap_or(""),
+                    row.chip_identity
+                        .as_ref()
+                        .and_then(|identity| identity.mac.as_deref())
+                        .unwrap_or(""),
                     state_label(&row.state),
                     progress.as_str(),
                     row.started.as_str(),
@@ -1865,14 +2750,27 @@ impl FlashApp {
 impl eframe::App for FlashApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.collect_events();
+        self.poll_records();
+        self.poll_diagnostics();
         self.collect_update_events(ctx);
         self.poll_ports();
         let busy = self.busy();
-        if ctx.input(|input| input.viewport().close_requested()) && busy {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.error = Some(
-                "任务正在进行，暂时不能关闭。可先停止排队，等待当前烧录或驱动安装完成。".into(),
-            );
+        if ctx.input(|input| input.viewport().close_requested()) && !self.allow_exit {
+            if busy {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.error = Some(
+                    "任务正在进行，暂时不能关闭。可先停止排队，等待当前烧录或驱动安装完成。".into(),
+                );
+            } else if self.record_service.pending_local_count() > 0 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.notice = Some("正在保存本地烧录记录，请稍候再关闭。".into());
+            } else if self.record_service.pending_count() > 0
+                || !self.pending_records.is_empty()
+                || !self.failed_records.is_empty()
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.close_confirm_open = true;
+            }
         }
         egui::SidePanel::left("workspace_sidebar")
             .exact_width(174.0)
@@ -1928,12 +2826,117 @@ impl eframe::App for FlashApp {
             self.driver_license_dialog(ctx);
         }
         self.update_dialog(ctx);
-        if self.busy() || self.update_checking || self.scanner.is_scanning() {
+        self.settings_window(ctx);
+        self.device_log_windows(ctx);
+        self.confirm_record_exit(ctx);
+        if self.busy()
+            || self.update_checking
+            || self.scanner.is_scanning()
+            || self.diagnostics_running
+        {
             ctx.request_repaint_after(Duration::from_millis(100));
         } else if let Some(delay) = self.scan_schedule.repaint_delay(Instant::now()) {
             ctx.request_repaint_after(delay);
         }
     }
+}
+
+fn header_drag_region(
+    header: egui::Rect,
+    title: egui::Rect,
+    controls_left: f32,
+) -> Option<egui::Rect> {
+    let left = title.right() + 12.0;
+    let right = controls_left - 12.0;
+    (right > left).then(|| {
+        egui::Rect::from_min_max(
+            egui::pos2(left, header.top()),
+            egui::pos2(right, header.bottom()),
+        )
+    })
+}
+
+fn terminal_summary(port: &str, state: &JobState) -> Option<String> {
+    match state {
+        JobState::Success => Some(format!("{port}烧录成功")),
+        JobState::Failed => Some(format!("{port}烧录失败")),
+        JobState::Cancelled => Some(format!("{port}已取消烧录")),
+        _ => None,
+    }
+}
+
+fn nav_item(ui: &mut egui::Ui, kind: Icon, title: &str, selected: bool) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 43.0), egui::Sense::click());
+    if selected || response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            8.0,
+            if selected {
+                Color32::from_rgb(27, 52, 70)
+            } else {
+                Color32::from_rgb(25, 39, 59)
+            },
+        );
+    }
+    let color = if selected {
+        Color32::from_rgb(187, 244, 231)
+    } else {
+        Color32::from_rgb(166, 185, 204)
+    };
+    paint_icon(
+        ui.painter(),
+        rect.left_center() + egui::vec2(20.0, 0.0),
+        17.0,
+        kind,
+        color,
+    );
+    ui.painter().text(
+        rect.left_center() + egui::vec2(39.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        title,
+        egui::FontId::proportional(16.0),
+        color,
+    );
+    response
+}
+
+fn terminal_icon_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 25.0), egui::Sense::click());
+    ui.painter().rect_filled(
+        rect,
+        5.0,
+        if response.hovered() {
+            ACCENT_LIGHT
+        } else {
+            Color32::WHITE
+        },
+    );
+    ui.painter().rect_stroke(
+        rect,
+        5.0,
+        egui::Stroke::new(1.0_f32, BORDER),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        ">_",
+        egui::FontId::monospace(12.0),
+        ACCENT,
+    );
+    response
+}
+
+fn open_records_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let command = "explorer.exe";
+    #[cfg(not(windows))]
+    let command = "xdg-open";
+    std::process::Command::new(command)
+        .arg(path)
+        .spawn()
+        .map(|_| ())
 }
 
 fn reconcile_scan_result(
@@ -2013,7 +3016,8 @@ fn device_tile(
     in_batch: bool,
     locked: bool,
     history: bool,
-) {
+) -> bool {
+    let mut open_log = false;
     let progress = job.map_or(0.0, |job| job.progress);
     let stage = job.map_or_else(
         || {
@@ -2073,6 +3077,12 @@ fn device_tile(
                     );
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if terminal_icon_button(ui)
+                        .on_hover_text(format!("打开 {} 详细日志", row.port.name))
+                        .clicked()
+                    {
+                        open_log = true;
+                    }
                     ui.label(
                         RichText::new(if row.online { "在线" } else { "已离线" })
                             .size(10.0)
@@ -2151,6 +3161,7 @@ fn device_tile(
             )
             .on_hover_text(message);
         });
+    open_log
 }
 
 #[derive(Clone, Copy)]
@@ -2160,12 +3171,28 @@ enum Icon {
     File,
     Grid,
     Shield,
+    Settings,
 }
 
 fn paint_icon(painter: &egui::Painter, center: egui::Pos2, size: f32, kind: Icon, color: Color32) {
     let p = |x: f32, y: f32| center + egui::vec2(x * size, y * size);
     let stroke = egui::Stroke::new(1.65_f32, color);
     match kind {
+        Icon::Settings => {
+            painter.circle_stroke(center, size * 0.29, stroke);
+            painter.circle_stroke(center, size * 0.10, stroke);
+            for step in 0..8 {
+                let angle = step as f32 * std::f32::consts::TAU / 8.0;
+                let direction = egui::vec2(angle.cos(), angle.sin());
+                painter.line_segment(
+                    [
+                        center + direction * size * 0.30,
+                        center + direction * size * 0.45,
+                    ],
+                    stroke,
+                );
+            }
+        }
         Icon::Chip => {
             painter.rect_stroke(
                 egui::Rect::from_center_size(center, egui::vec2(size * 0.58, size * 0.58)),
@@ -2256,7 +3283,7 @@ fn dot(ui: &mut egui::Ui, color: Color32, size: f32) {
     ui.painter().circle_filled(rect.center(), size / 2.0, color);
 }
 
-fn status_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
+fn status_pill(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Rect {
     egui::Frame::new()
         .fill(Color32::from_rgba_unmultiplied(
             color.r(),
@@ -2270,9 +3297,11 @@ fn status_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 dot(ui, color, 5.0);
-                ui.label(RichText::new(text).size(11.0).color(color));
+                ui.label(RichText::new(text).size(12.0).color(color));
             });
-        });
+        })
+        .response
+        .rect
 }
 
 fn panel_title(ui: &mut egui::Ui, kind: Icon, title: &str, index: &str) {
@@ -2599,11 +3628,171 @@ fn install_fonts(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::{
-        JobRow, JobState, Port, PortRow, ScanSchedule, append_csv, missing_batch_jobs,
-        reconcile_ports, reconcile_scan_result,
+        BatchEventKind, DeviceIdentity, DeviceLogBook, DeviceLogKey, JobRow, JobState, Port,
+        PortRow, ScanSchedule, append_csv, header_drag_region, missing_batch_jobs, reconcile_ports,
+        reconcile_scan_result, terminal_summary,
     };
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn device_logs_are_isolated_between_ports() {
+        let a = port("COM11", "adapter A");
+        let b = port("COM12", "adapter B");
+        let mut logs = DeviceLogBook::default();
+        logs.begin_batch(&[a.clone(), b.clone()], "batch-a", "esp32c3", "hash");
+        logs.append(
+            "COM11",
+            &JobState::Connecting,
+            BatchEventKind::Log,
+            "only-device-a",
+        );
+        logs.append(
+            "COM12",
+            &JobState::Failed,
+            BatchEventKind::State,
+            "only-device-b",
+        );
+        let text = |key| {
+            logs.history[&key]
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(text(DeviceLogKey::from_port(&a, "batch-a")).contains("only-device-a"));
+        assert!(!text(DeviceLogKey::from_port(&a, "batch-a")).contains("only-device-b"));
+        assert!(!text(DeviceLogKey::from_port(&b, "batch-a")).contains("only-device-a"));
+    }
+
+    #[test]
+    fn new_batch_resets_extraction_logs_without_reassigning_old_device_history() {
+        let old = port("COM3", "old device");
+        let new = port("COM3", "new device");
+        let mut logs = DeviceLogBook::default();
+        logs.begin_batch(std::slice::from_ref(&old), "batch-old", "esp32c3", "hash");
+        logs.append_line("COM3", "EFUSE_ID=102030405060 old-only".into());
+        logs.remember_identity(
+            "COM3",
+            &DeviceIdentity {
+                efuse_id: Some("102030405060".into()),
+                mac: None,
+            },
+        );
+        logs.begin_batch(std::slice::from_ref(&new), "batch-new", "esp32c3", "hash");
+        assert!(!logs.current_lines["COM3"].join("\n").contains("old-only"));
+        assert_eq!(
+            logs.current_keys["COM3"],
+            DeviceLogKey::from_port(&new, "batch-new")
+        );
+        assert!(
+            logs.history[&DeviceLogKey::from_port(&old, "batch-old")]
+                .iter()
+                .any(|line| line.contains("old-only"))
+        );
+        assert!(
+            !logs
+                .identities
+                .contains_key(&DeviceLogKey::from_port(&new, "batch-new"))
+        );
+    }
+
+    #[test]
+    fn same_adapter_new_batch_keeps_old_terminal_bound_to_old_run() {
+        let device = port("COM3", "same adapter");
+        let mut logs = DeviceLogBook::default();
+        logs.begin_batch(
+            std::slice::from_ref(&device),
+            "batch-one",
+            "esp32c3",
+            "hash",
+        );
+        logs.append_line("COM3", "first chip".into());
+        let old_window = DeviceLogKey::from_port(&device, "batch-one");
+        logs.begin_batch(
+            std::slice::from_ref(&device),
+            "batch-two",
+            "esp32c3",
+            "hash",
+        );
+        logs.append_line("COM3", "second chip".into());
+        assert_ne!(old_window, logs.current_keys["COM3"]);
+        assert!(
+            logs.history[&old_window]
+                .iter()
+                .all(|line| !line.contains("second chip"))
+        );
+    }
+
+    #[test]
+    fn progress_updates_do_not_spam_device_logs_or_terminal_summary() {
+        let mut logs = DeviceLogBook::default();
+        logs.begin_batch(&[port("COM11", "adapter")], "batch", "esp32c3", "hash");
+        let initial = logs.current_lines["COM11"].len();
+        for _ in 0..1_000 {
+            logs.append(
+                "COM11",
+                &JobState::Writing,
+                BatchEventKind::Progress,
+                "progress",
+            );
+        }
+        assert_eq!(logs.current_lines["COM11"].len(), initial);
+        for state in [
+            JobState::Queued,
+            JobState::Connecting,
+            JobState::Writing,
+            JobState::Verifying,
+        ] {
+            assert!(terminal_summary("COM11", &state).is_none());
+        }
+        assert_eq!(
+            terminal_summary("COM11", &JobState::Success).as_deref(),
+            Some("COM11烧录成功")
+        );
+        assert_eq!(
+            terminal_summary("COM12", &JobState::Failed).as_deref(),
+            Some("COM12烧录失败")
+        );
+    }
+
+    #[test]
+    fn raw_log_limit_is_explicit_and_preserves_structured_identity() {
+        let device = port("COM3", "adapter");
+        let mut logs = DeviceLogBook::default();
+        logs.begin_batch(std::slice::from_ref(&device), "batch", "esp32c3", "hash");
+        logs.remember_identity(
+            "COM3",
+            &DeviceIdentity {
+                efuse_id: Some("102030405060".into()),
+                mac: None,
+            },
+        );
+        logs.append_line("COM3", "字".repeat(200_000));
+        let text = logs.current_lines["COM3"].join("\n");
+        assert!(text.contains("日志已截断") && text.len() <= 512 * 1024);
+        assert_eq!(
+            logs.identities[&DeviceLogKey::from_port(&device, "batch")]
+                .efuse_id
+                .as_deref(),
+            Some("102030405060")
+        );
+    }
+
+    #[test]
+    fn header_drag_region_excludes_title_and_action_buttons() {
+        let header = eframe::egui::Rect::from_min_size(
+            eframe::egui::Pos2::ZERO,
+            eframe::egui::vec2(900.0, 40.0),
+        );
+        let title = eframe::egui::Rect::from_min_size(
+            eframe::egui::Pos2::ZERO,
+            eframe::egui::vec2(200.0, 40.0),
+        );
+        let blank = header_drag_region(header, title, 700.0).unwrap();
+        assert!(blank.left() > title.right() && blank.right() < 700.0);
+        assert!(header_drag_region(header, title, 210.0).is_none());
+    }
 
     #[test]
     fn idle_device_schedule_never_requests_periodic_enumeration() {
@@ -2736,6 +3925,9 @@ mod tests {
             finished: String::new(),
             elapsed: None,
             duration_secs: Some(1.25),
+            started_at: "2026-11-19T00:00:00Z".into(),
+            finished_at: "2026-11-19T00:00:01.250Z".into(),
+            chip_identity: None,
         }
     }
 

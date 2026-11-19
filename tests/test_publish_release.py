@@ -179,6 +179,7 @@ class PublishReleaseTests(unittest.TestCase):
             "src/lib.rs":"pub fn fixture() {}\n", "assets/drivers/cp210x.zip":"fixture driver ZIP bytes",
             "assets/drivers/ch343.exe":"fixture original driver",
             "scripts/build.ps1":"Write-Host fixture\n", "tests/source.rs":"// fixture test\n",
+            "docs/log-upload-api.md":"# Device log upload API\n",
             ".github/workflows/windows.yml":"name: fixture\n", "LICENSE-MIT":"Fixture licence.\n",
             "Package-Tool-Setup-0.2.220.exe":"legacy unrelated installer"*1000,
             "attachments/private.bin":"private input", "dist/private.log":"private build log",
@@ -205,11 +206,30 @@ class PublishReleaseTests(unittest.TestCase):
         raw=base64.b64decode(self.load()["payloads"]["FlashTool-v0.4.2-source.zip"])
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             names=set(archive.namelist());prefix="FlashTool-v0.4.2/"
-            excluded={"Package-Tool-Setup-0.2.220.exe","attachments/private.bin","dist/private.log"}
+            excluded={"Package-Tool-Setup-0.2.220.exe","attachments/private.bin","dist/private.log","docs/log-upload-api.md"}
             for name in files:
                 if name in excluded:self.assertNotIn(prefix+name,names)
                 else:self.assertEqual(archive.read(prefix+name),files[name].encode())
             self.assertFalse(any("attachments/" in name or "/dist/" in name for name in names))
+
+    def test_050_source_archive_contains_api_documentation(self):
+        files=self.prepare_source_version("0.5.0")
+        result=self.invoke()
+        self.assertEqual(result.returncode,0,result.stderr)
+        raw=base64.b64decode(self.load()["payloads"]["FlashTool-v0.5.0-source.zip"])
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            self.assertEqual(archive.read("FlashTool-v0.5.0/docs/log-upload-api.md"),files["docs/log-upload-api.md"].encode())
+            self.assertNotIn("FlashTool-v0.5.0/Package-Tool-Setup-0.2.220.exe",archive.namelist())
+
+    def test_043_source_archive_keeps_its_existing_path_policy(self):
+        self.prepare_source_version("0.4.3")
+        result=self.invoke()
+        self.assertEqual(result.returncode,0,result.stderr)
+        raw=base64.b64decode(self.load()["payloads"]["FlashTool-v0.4.3-source.zip"])
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            self.assertNotIn("FlashTool-v0.4.3/docs/log-upload-api.md",archive.namelist())
+            self.assertIn("FlashTool-v0.4.3/README.md",archive.namelist())
+            self.assertNotIn("FlashTool-v0.4.3/Package-Tool-Setup-0.2.220.exe",archive.namelist())
 
     def test_legacy_041_source_archive_remains_byte_identical(self):
         self.prepare_source_version("0.4.1")

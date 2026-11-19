@@ -16,10 +16,24 @@ use crate::firmware::PreparedFirmware;
 const SECTOR_SIZE: u64 = 4096;
 
 #[derive(Clone, Debug)]
+struct DetectedPort {
+    info: SerialPortInfo,
+    instance_id: Option<String>,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug)]
+struct PresentPort {
+    info: SerialPortInfo,
+    instance_id: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct Port {
     pub name: String,
-    /// Stable metadata identity, including a USB serial number when available.
-    /// A port without a USB serial still needs observed-disconnect invalidation
+    /// Windows uses the full PnP instance ID plus COM name; other platforms use
+    /// native USB metadata. No VID/PID/product/serial-number deduplication.
+    /// A device without a unique serial still needs observed-disconnect invalidation
     /// before queued work may continue on the same OS port name.
     pub identity: String,
     pub description: String,
@@ -31,7 +45,7 @@ pub struct Port {
 pub fn list_ports() -> Result<Vec<Port>> {
     let mut ports: Vec<_> = available_port_infos()?
         .into_iter()
-        .map(describe_port)
+        .map(describe_detected_port)
         .collect();
     ports.sort_by(|a, b| {
         port_number(&a.name)
@@ -41,53 +55,238 @@ pub fn list_ports() -> Result<Vec<Port>> {
     Ok(ports)
 }
 
-fn available_port_infos() -> Result<Vec<SerialPortInfo>> {
-    let ports = serialport::available_ports().context("无法枚举串口，请检查操作系统设备管理器")?;
+/// Operator-requested diagnostics only: metadata enumeration, no serial open,
+/// device probe, network request, or automatic telemetry upload.
+pub fn port_diagnostics() -> Result<String> {
     #[cfg(windows)]
-    let ports = retain_present_ports(ports, present_ports::names())?;
-    Ok(ports)
+    {
+        let metadata = serialport::available_ports();
+        let present = present_ports::entries()?;
+        Ok(format_windows_diagnostics(&metadata, &present))
+    }
+    #[cfg(not(windows))]
+    {
+        let ports = list_ports()?;
+        let mut report = format!(
+            "FlashTool {}\nOS={}\nSYSTEM_COM_COUNT={}\n",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            ports.len()
+        );
+        for port in ports {
+            report.push_str(&format!(
+                "{}\t{}\tIDENTITY={}\n",
+                port.name, port.description, port.identity
+            ));
+        }
+        Ok(report)
+    }
 }
 
 #[cfg(any(windows, test))]
-fn retain_present_ports(
-    ports: Vec<SerialPortInfo>,
-    present_names: Result<std::collections::HashSet<String>>,
-) -> Result<Vec<SerialPortInfo>> {
-    let present: std::collections::HashSet<_> = present_names
+fn format_windows_diagnostics(
+    metadata: &serialport::Result<Vec<SerialPortInfo>>,
+    present: &[PresentPort],
+) -> String {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut nodes = BTreeMap::new();
+    for node in present {
+        let name = port_name_key(&node.info.port_name);
+        if is_com_name(&name) {
+            nodes
+                .entry((name, node.instance_id.to_ascii_uppercase()))
+                .or_insert(node);
+        }
+    }
+    let names: BTreeSet<_> = nodes.keys().map(|(name, _)| name.clone()).collect();
+    let library_names: BTreeSet<_> = metadata
+        .as_ref()
+        .map(|ports| {
+            ports
+                .iter()
+                .map(|port| port_name_key(&port.port_name))
+                .collect()
+        })
+        .unwrap_or_default();
+    let missing: Vec<_> = names.difference(&library_names).cloned().collect();
+    let stale: Vec<_> = library_names.difference(&names).cloned().collect();
+    let mut report = format!(
+        "FlashTool {}\nOS=windows\nSOURCE=SetupAPI DIGCF_PRESENT healthy Ports/Modem/COMPORT\nWINDOWS_HEALTHY_COM_COUNT={}\nWINDOWS_PNP_NODE_COUNT={}\n",
+        env!("CARGO_PKG_VERSION"),
+        names.len(),
+        nodes.len(),
+    );
+    match metadata {
+        Ok(ports) => report.push_str(&format!("LIBRARY_METADATA_COUNT={}\n", ports.len())),
+        Err(error) => report.push_str(&format!("LIBRARY_METADATA_ERROR={error}\n")),
+    }
+    report.push_str(&format!(
+        "PNP_WITHOUT_LIBRARY_METADATA={}\nLIBRARY_ONLY_NOT_PRESENT={}\n",
+        missing.join(","),
+        stale.join(",")
+    ));
+    for ((name, id), node) in nodes {
+        let adapter = match &node.info.port_type {
+            SerialPortType::UsbPort(usb) => format!("USB VID={:04X} PID={:04X}", usb.vid, usb.pid),
+            _ => "USB_METADATA=unavailable".into(),
+        };
+        report.push_str(&format!("{name}\t{adapter}\tPNP_INSTANCE_ID={id}\n"));
+    }
+    report.push_str(
+        "仅列出 Windows 实际枚举且健康的串口；若系统只报告一个 COM，软件不能创建第二个物理串口。\n",
+    );
+    report
+}
+
+fn available_port_infos() -> Result<Vec<DetectedPort>> {
+    #[cfg(windows)]
+    {
+        // Library metadata is enrichment, not the authoritative device count.
+        // Its registry fallback can omit a COM or keep a removed one; complete
+        // present PnP records supply every usable COM independently instead.
+        let metadata = serialport::available_ports();
+        merge_present_ports(metadata, present_ports::entries())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(serialport::available_ports()
+            .context("无法枚举串口，请检查操作系统设备管理器")?
+            .into_iter()
+            .map(|info| DetectedPort {
+                info,
+                instance_id: None,
+            })
+            .collect())
+    }
+}
+
+#[cfg(any(windows, test))]
+fn merge_present_ports(
+    metadata: serialport::Result<Vec<SerialPortInfo>>,
+    present_ports: Result<Vec<PresentPort>>,
+) -> Result<Vec<DetectedPort>> {
+    use std::collections::{HashMap, hash_map::Entry};
+    let present = present_ports
         .context("无法确认 Windows 当前在线串口；保留上次设备状态")?
-        .into_iter()
-        .map(|name| port_name_key(&name))
-        .collect();
-    // serialport 4.10.1 supplements its DIGCF_PRESENT enumeration with raw
-    // SERIALCOMM registry entries. Those can outlive a removal notification.
-    // Intersect every entry with actual present device nodes, without probing
-    // or opening COM ports. A genuinely present Unknown port stays available.
-    Ok(ports
-        .into_iter()
-        .filter(|port| present.contains(&port_name_key(&port.port_name)))
-        .collect())
+        .into_iter();
+    let mut known = HashMap::new();
+    // Failure of optional friendly/USB metadata must not hide healthy PnP
+    // devices. All actual presence/query failures above still propagate.
+    for info in metadata.unwrap_or_default() {
+        let key = port_name_key(&info.port_name);
+        let prefer = matches!(info.port_type, SerialPortType::UsbPort(_));
+        match known.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(info);
+            }
+            Entry::Occupied(mut entry) if prefer => {
+                entry.insert(info);
+            }
+            Entry::Occupied(_) => {}
+        }
+    }
+    let mut used: HashMap<String, String> = HashMap::new();
+    let mut result = Vec::new();
+    for current in present {
+        let key = port_name_key(&current.info.port_name);
+        if !is_com_name(&key) {
+            continue;
+        }
+        if let Some(previous) = used.get(&key) {
+            if !previous.eq_ignore_ascii_case(&current.instance_id) {
+                bail!(
+                    "多台在线设备同时占用 {}，请在 Windows 设备管理器中分配不同 COM 号",
+                    current.info.port_name
+                );
+            }
+            continue;
+        }
+        used.insert(key.clone(), current.instance_id.clone());
+        let mut info = known
+            .remove(&key)
+            .filter(|info| metadata_matches_device(info, &current.info))
+            .unwrap_or_else(|| current.info.clone());
+        info.port_name = current.info.port_name;
+        result.push(DetectedPort {
+            info,
+            instance_id: Some(current.instance_id),
+        });
+    }
+    Ok(result)
+}
+
+#[cfg(any(windows, test))]
+fn metadata_matches_device(metadata: &SerialPortInfo, present: &SerialPortInfo) -> bool {
+    match (&metadata.port_type, &present.port_type) {
+        (SerialPortType::UsbPort(old), SerialPortType::UsbPort(current)) => {
+            old.vid == current.vid && old.pid == current.pid
+        }
+        (SerialPortType::UsbPort(_), _) => false,
+        (_, SerialPortType::UsbPort(_)) => false,
+        _ => true,
+    }
+}
+
+#[cfg(any(windows, test))]
+fn is_com_name(name: &str) -> bool {
+    name.strip_prefix("COM")
+        .is_some_and(|number| !number.is_empty() && number.bytes().all(|c| c.is_ascii_digit()))
+}
+
+#[cfg(any(windows, test))]
+fn serial_info_from_instance(name: String, instance_id: &str) -> SerialPortInfo {
+    let upper = instance_id.to_ascii_uppercase();
+    let hex_id = |prefix: &str| {
+        let start = upper.find(prefix)? + prefix.len();
+        u16::from_str_radix(upper.get(start..start + 4)?, 16).ok()
+    };
+    let usb_ids = if upper.starts_with("USB\\") || upper.starts_with("FTDIBUS\\") {
+        hex_id("VID_").zip(hex_id("PID_"))
+    } else {
+        None
+    };
+    let port_type = if let Some((vid, pid)) = usb_ids {
+        SerialPortType::UsbPort(UsbPortInfo {
+            vid,
+            pid,
+            // An instance ID suffix can be a generated location identifier,
+            // not a factory USB serial. Do not fabricate a serial number.
+            serial_number: None,
+            manufacturer: None,
+            product: None,
+        })
+    } else {
+        SerialPortType::Unknown
+    };
+    SerialPortInfo {
+        port_name: name,
+        port_type,
+    }
 }
 
 #[cfg(windows)]
 mod present_ports {
+    use super::{PresentPort, serial_info_from_instance};
     use anyhow::{Context, Result, bail, ensure};
     use std::{
-        collections::HashSet,
         mem,
         ptr::{null, null_mut},
     };
-    use windows_sys::Win32::{
-        Devices::DeviceAndDriverInstallation::{
-            CM_Get_DevNode_Status, CR_SUCCESS, DICS_FLAG_GLOBAL, DIGCF_PRESENT, DIREG_DEV,
-            GUID_DEVCLASS_MODEM, GUID_DEVCLASS_PORTS, HDEVINFO, SP_DEVINFO_DATA,
-            SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
-            SetupDiOpenDevRegKey,
+    use windows_sys::{
+        Win32::{
+            Devices::DeviceAndDriverInstallation::{
+                CM_Get_DevNode_Status, CR_SUCCESS, DICS_FLAG_GLOBAL, DIGCF_DEVICEINTERFACE,
+                DIGCF_PRESENT, DIREG_DEV, GUID_DEVCLASS_MODEM, GUID_DEVCLASS_PORTS, HDEVINFO,
+                SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
+                SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiOpenDevRegKey,
+            },
+            Foundation::{
+                ERROR_FILE_NOT_FOUND, ERROR_KEY_DOES_NOT_EXIST, ERROR_NO_MORE_ITEMS,
+                ERROR_PATH_NOT_FOUND, INVALID_HANDLE_VALUE,
+            },
+            System::Registry::{HKEY, KEY_QUERY_VALUE, REG_SZ, RegCloseKey, RegQueryValueExW},
         },
-        Foundation::{
-            ERROR_FILE_NOT_FOUND, ERROR_KEY_DOES_NOT_EXIST, ERROR_NO_MORE_ITEMS,
-            ERROR_PATH_NOT_FOUND, INVALID_HANDLE_VALUE,
-        },
-        System::Registry::{HKEY, KEY_QUERY_VALUE, REG_SZ, RegCloseKey, RegQueryValueExW},
+        core::GUID,
     };
 
     struct DeviceSet(HDEVINFO);
@@ -108,10 +307,17 @@ mod present_ports {
         }
     }
 
-    pub(super) fn names() -> Result<HashSet<String>> {
-        let mut names = HashSet::new();
-        for class in [GUID_DEVCLASS_PORTS, GUID_DEVCLASS_MODEM] {
-            let raw = unsafe { SetupDiGetClassDevsW(&class, null(), null_mut(), DIGCF_PRESENT) };
+    pub(super) fn entries() -> Result<Vec<PresentPort>> {
+        let mut ports = Vec::new();
+        // Include COM interfaces for drivers that use a nonstandard setup
+        // class. Duplicate views of one node are reconciled by COM+instance ID.
+        let comport = GUID::from_u128(0x86e0d1e0_8089_11d0_9ce4_08003e301f73);
+        for (class, flags) in [
+            (GUID_DEVCLASS_PORTS, DIGCF_PRESENT),
+            (GUID_DEVCLASS_MODEM, DIGCF_PRESENT),
+            (comport, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE),
+        ] {
+            let raw = unsafe { SetupDiGetClassDevsW(&class, null(), null_mut(), flags) };
             if raw == INVALID_HANDLE_VALUE as HDEVINFO {
                 return Err(std::io::Error::last_os_error())
                     .context("无法读取当前在线的 Ports/Modem 设备集合");
@@ -140,12 +346,45 @@ mod present_ports {
                 if problem == 0
                     && let Some(name) = port_name(&devices, &device)?
                 {
-                    names.insert(name);
+                    let instance_id = instance_id(&devices, &device)?;
+                    ports.push(PresentPort {
+                        info: serial_info_from_instance(name, &instance_id),
+                        instance_id,
+                    });
                 }
                 index = index.checked_add(1).context("在线设备数量超出支持范围")?;
             }
         }
-        Ok(names)
+        Ok(ports)
+    }
+
+    fn instance_id(devices: &DeviceSet, device: &SP_DEVINFO_DATA) -> Result<String> {
+        // Windows instance IDs are bounded by MAX_DEVICE_ID_LEN (200 WCHARs).
+        // Keep a larger bounded buffer, and fail explicitly on an API error.
+        let mut buffer = [0u16; 512];
+        let mut required = 0u32;
+        if unsafe {
+            SetupDiGetDeviceInstanceIdW(
+                devices.0,
+                device,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                &mut required,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("无法读取在线串口的 PnP 设备实例 ID");
+        }
+        let length = buffer
+            .iter()
+            .position(|word| *word == 0)
+            .context("PnP 设备实例 ID 未终止")?;
+        ensure!(
+            length > 0 && required as usize <= buffer.len(),
+            "PnP 设备实例 ID 长度无效"
+        );
+        String::from_utf16(&buffer[..length]).context("PnP 设备实例 ID 不是有效 UTF-16")
     }
 
     fn port_name(devices: &DeviceSet, device: &SP_DEVINFO_DATA) -> Result<Option<String>> {
@@ -251,6 +490,13 @@ fn describe_port(info: SerialPortInfo) -> Port {
     }
 }
 
+fn describe_detected_port(detected: DetectedPort) -> Port {
+    let identity = identity_for_detected(&detected.info, detected.instance_id.as_deref());
+    let mut port = describe_port(detected.info);
+    port.identity = identity;
+    port
+}
+
 pub(crate) fn port_name_key(name: &str) -> String {
     if cfg!(windows) {
         name.strip_prefix("\\\\.\\")
@@ -275,15 +521,28 @@ fn identity_for_info(info: &SerialPortInfo) -> String {
     .to_string()
 }
 
+fn identity_for_detected(info: &SerialPortInfo, instance_id: Option<&str>) -> String {
+    if let Some(instance_id) = instance_id {
+        serde_json::json!({
+            "kind": "windows_pnp", "port": port_name_key(&info.port_name),
+            "instance_id": instance_id.to_ascii_uppercase(),
+        })
+        .to_string()
+    } else {
+        identity_for_info(info)
+    }
+}
+
 fn open_checked<T>(
     expected: Option<&Port>,
     actual: &SerialPortInfo,
+    instance_id: Option<&str>,
     open: impl FnOnce(&SerialPortInfo) -> Result<T>,
 ) -> Result<T> {
     if let Some(expected) = expected
         && (expected.identity.is_empty()
             || port_name_key(&expected.name) != port_name_key(&actual.port_name)
-            || expected.identity != identity_for_info(actual))
+            || expected.identity != identity_for_detected(actual, instance_id))
     {
         bail!(
             "{} 的设备身份已变化；为避免烧录新接入设备，本任务已停止，请重新选择设备并启动新批次",
@@ -296,9 +555,73 @@ fn open_checked<T>(
 #[derive(Clone, Debug)]
 pub enum FlashProgress {
     Connecting,
+    Identity(DeviceIdentity),
     Writing { fraction: f32, address: u32 },
     Verifying,
     Message(String),
+}
+
+/// Both fields are representations of the same read-only factory eFuse MAC.
+/// This is not an eFuse dump or a separate chip serial/key identifier.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct DeviceIdentity {
+    pub efuse_id: Option<String>,
+    pub mac: Option<String>,
+}
+
+fn factory_identity(mac: Option<&str>) -> Result<DeviceIdentity> {
+    let Some(mac) = mac else {
+        return Ok(DeviceIdentity::default());
+    };
+    let parts: Vec<_> = mac.split(':').collect();
+    if parts.len() != 6
+        || parts
+            .iter()
+            .any(|part| part.len() != 2 || !part.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        bail!("芯片返回的 factory eFuse MAC 格式无效，未生成设备标识");
+    }
+    let bytes = parts
+        .into_iter()
+        .map(|part| u8::from_str_radix(part, 16))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("芯片返回的 factory eFuse MAC 不是有效十六进制")?;
+    if bytes.iter().all(|byte| *byte == 0) || bytes.iter().all(|byte| *byte == 0xff) {
+        bail!("芯片的 factory eFuse MAC 未分配或无效，不能作为唯一设备标识");
+    }
+    Ok(DeviceIdentity {
+        efuse_id: Some(
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>(),
+        ),
+        mac: Some(
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<Vec<_>>()
+                .join(":"),
+        ),
+    })
+}
+
+fn emit_factory_identity(mac: Option<&str>, callback: &mut dyn FnMut(FlashProgress)) -> Result<()> {
+    let identity = factory_identity(mac)?;
+    callback(FlashProgress::Identity(identity.clone()));
+    if let (Some(efuse_id), Some(mac)) = (&identity.efuse_id, &identity.mac) {
+        callback(FlashProgress::Message(
+            "芯片标识来源：factory eFuse MAC；EFUSE_ID 为相同 MAC 的原始 48 位".into(),
+        ));
+        callback(FlashProgress::Message(format!(
+            "EFUSE_ID={efuse_id} MAC={mac}"
+        )));
+    } else {
+        callback(FlashProgress::Message(
+            "factory eFuse MAC 不可用，未生成设备标识".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Runs synchronously on one worker. Separate invocations never share a port.
@@ -346,16 +669,21 @@ fn flash_impl(
     let info = available_port_infos()
         .context("连接前无法重新枚举在线串口")?
         .into_iter()
-        .find(|info| port_name_key(&info.port_name) == port_name_key(port))
+        .find(|detected| port_name_key(&detected.info.port_name) == port_name_key(port))
         .with_context(|| format!("串口 {port} 已断开或不存在，请刷新设备列表"))?;
-    let serial = open_checked(expected, &info, |actual| {
-        serialport::new(&actual.port_name, 115_200)
-            .flow_control(FlowControl::None)
-            .timeout(Duration::from_secs(3))
-            .open_native()
-            .with_context(|| format!("无法打开 {port}，请检查驱动、连接及串口占用"))
-    })?;
-    let usb = match info.port_type {
+    let serial = open_checked(
+        expected,
+        &info.info,
+        info.instance_id.as_deref(),
+        |actual| {
+            serialport::new(&actual.port_name, 115_200)
+                .flow_control(FlowControl::None)
+                .timeout(Duration::from_secs(3))
+                .open_native()
+                .with_context(|| format!("无法打开 {port}，请检查驱动、连接及串口占用"))
+        },
+    )?;
+    let usb = match info.info.port_type {
         SerialPortType::UsbPort(usb) => usb,
         _ => UsbPortInfo {
             vid: 0,
@@ -402,6 +730,9 @@ fn flash_impl(
     let device = flasher
         .device_info()
         .with_context(|| format!("{port} 无法读取芯片和实际 Flash 容量"))?;
+    // espflash Chip::mac_address reads only the chip-specific MAC0/MAC1 eFuse
+    // fields. Do not read secret blocks, change keys, or program any eFuse.
+    emit_factory_identity(device.mac_address.as_deref(), callback)?;
     // espflash 4.7.0 silently substitutes 4 MiB for an unknown JEDEC size.
     // Do not treat that fallback as actual hardware capacity. In this pinned
     // version flash_detect leaves its raw 0x9F read result in SPI W0. Read it
@@ -598,8 +929,218 @@ mod tests {
         }
     }
 
-    fn present(names: &[&str]) -> Result<std::collections::HashSet<String>> {
-        Ok(names.iter().map(|name| (*name).to_owned()).collect())
+    fn present(names: &[&str]) -> Result<Vec<PresentPort>> {
+        Ok(names
+            .iter()
+            .map(|name| PresentPort {
+                info: serial_info_from_instance((*name).to_owned(), &format!("ROOT\\PORT\\{name}")),
+                instance_id: format!("ROOT\\PORT\\{name}"),
+            })
+            .collect())
+    }
+
+    fn retain_present_ports(
+        ports: Vec<SerialPortInfo>,
+        present: Result<Vec<PresentPort>>,
+    ) -> Result<Vec<SerialPortInfo>> {
+        Ok(merge_present_ports(Ok(ports), present)?
+            .into_iter()
+            .map(|port| port.info)
+            .collect())
+    }
+
+    fn pnp(name: &str, instance: &str) -> PresentPort {
+        PresentPort {
+            info: serial_info_from_instance(name.into(), instance),
+            instance_id: instance.into(),
+        }
+    }
+
+    #[test]
+    fn every_distinct_com_is_preserved_for_identical_drivers_and_duplicate_or_missing_usb_serials()
+    {
+        for serial in [None, Some("cloned-driver-serial")] {
+            let first = usb_info("COM3", serial);
+            let second = usb_info("COM4", serial);
+            assert_eq!(first.port_type, second.port_type);
+            let ports = merge_present_ports(
+                Ok(vec![first, second]),
+                Ok(vec![
+                    pnp("COM3", "USB\\VID_10C4&PID_EA60\\NODE_A"),
+                    pnp("COM4", "USB\\VID_10C4&PID_EA60\\NODE_B"),
+                ]),
+            )
+            .unwrap();
+            assert_eq!(ports.len(), 2);
+            let first = describe_detected_port(ports[0].clone());
+            let second = describe_detected_port(ports[1].clone());
+            assert_ne!(first.name, second.name);
+            assert_ne!(first.identity, second.identity);
+            assert!(first.usb && second.usb && first.suggested && second.suggested);
+        }
+    }
+
+    #[test]
+    fn supplements_a_missing_library_port_from_authoritative_pnp_without_a_fake_usb_serial() {
+        let ports = merge_present_ports(
+            Ok(vec![usb_info("COM3", None)]),
+            Ok(vec![
+                pnp("COM3", "USB\\VID_10C4&PID_EA60\\NODE_A"),
+                pnp("COM4", "USB\\VID_10C4&PID_EA60\\NODE_B"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(ports.len(), 2);
+        let extra = ports
+            .iter()
+            .find(|port| port.info.port_name == "COM4")
+            .unwrap();
+        let SerialPortType::UsbPort(usb) = &extra.info.port_type else {
+            panic!("PnP USB IDs must identify the adapter")
+        };
+        assert_eq!((usb.vid, usb.pid), (0x10c4, 0xea60));
+        assert!(usb.serial_number.is_none());
+    }
+
+    #[test]
+    fn optional_library_metadata_failure_does_not_hide_authoritative_present_devices() {
+        let ports = merge_present_ports(
+            Err(serialport::Error::new(
+                serialport::ErrorKind::Unknown,
+                "metadata unavailable",
+            )),
+            Ok(vec![pnp("COM4", "USB\\VID_1A86&PID_55D4\\NODE_B")]),
+        )
+        .unwrap();
+        let port = describe_detected_port(ports[0].clone());
+        assert_eq!(port.name, "COM4");
+        assert!(port.usb && port.suggested);
+    }
+
+    #[test]
+    fn stale_library_usb_metadata_cannot_choose_the_wrong_reset_pid_for_a_replaced_com() {
+        let old = SerialPortInfo {
+            port_name: "COM3".into(),
+            port_type: SerialPortType::UsbPort(UsbPortInfo {
+                vid: 0x303a,
+                pid: 0x1001,
+                serial_number: None,
+                manufacturer: None,
+                product: None,
+            }),
+        };
+        let ports = merge_present_ports(
+            Ok(vec![old.clone()]),
+            Ok(vec![pnp("COM3", "USB\\VID_10C4&PID_EA60\\REPLACEMENT")]),
+        )
+        .unwrap();
+        let SerialPortType::UsbPort(actual) = &ports[0].info.port_type else {
+            panic!("USB metadata expected")
+        };
+        assert_eq!((actual.vid, actual.pid), (0x10c4, 0xea60));
+        let non_usb =
+            merge_present_ports(Ok(vec![old]), Ok(vec![pnp("COM3", "ACPI\\PNP0501\\UART")]))
+                .unwrap();
+        assert!(matches!(non_usb[0].info.port_type, SerialPortType::Unknown));
+    }
+
+    #[test]
+    fn duplicate_pnp_views_merge_only_the_same_com_and_same_instance() {
+        let node = pnp("COM3", "USB\\VID_10C4&PID_EA60\\NODE_A");
+        assert_eq!(
+            merge_present_ports(Ok(vec![]), Ok(vec![node.clone(), node.clone()]))
+                .unwrap()
+                .len(),
+            1
+        );
+        let conflict = pnp("COM3", "USB\\VID_10C4&PID_EA60\\NODE_B");
+        assert!(merge_present_ports(Ok(vec![]), Ok(vec![node, conflict])).is_err());
+    }
+
+    #[test]
+    fn pnp_identity_survives_metadata_enrichment_but_rejects_a_replacement_before_opening() {
+        let old = pnp("COM3", "USB\\VID_10C4&PID_EA60\\NODE_A");
+        let expected = describe_detected_port(DetectedPort {
+            info: old.info.clone(),
+            instance_id: Some(old.instance_id.clone()),
+        });
+        let metadata = usb_info("COM3", Some("newly available friendly metadata"));
+        let mut opened = false;
+        open_checked(Some(&expected), &metadata, Some(&old.instance_id), |_| {
+            opened = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(opened);
+        opened = false;
+        assert!(
+            open_checked(
+                Some(&expected),
+                &metadata,
+                Some("USB\\VID_10C4&PID_EA60\\NODE_B"),
+                |_| {
+                    opened = true;
+                    Ok(())
+                }
+            )
+            .is_err()
+        );
+        assert!(!opened);
+    }
+
+    #[test]
+    fn factory_identifiers_emit_typed_metadata_and_the_canonical_log_line() {
+        let mut events = Vec::new();
+        emit_factory_identity(Some("aa:bb:0c:00:01:02"), &mut |event| events.push(event)).unwrap();
+        let FlashProgress::Identity(identity) = &events[0] else {
+            panic!("typed identity must be emitted")
+        };
+        assert_eq!(identity.efuse_id.as_deref(), Some("AABB0C000102"));
+        assert_eq!(identity.mac.as_deref(), Some("AA:BB:0C:00:01:02"));
+        assert!(events.iter().any(|event| matches!(event, FlashProgress::Message(line) if line == "EFUSE_ID=AABB0C000102 MAC=AA:BB:0C:00:01:02")));
+        assert_eq!(factory_identity(None).unwrap(), DeviceIdentity::default());
+    }
+
+    #[test]
+    fn invalid_or_unassigned_factory_mac_does_not_fabricate_an_identifier() {
+        for invalid in [
+            "00:00:00:00:00:00",
+            "ff:ff:ff:ff:ff:ff",
+            "1:22:33:44:55:66",
+            "+1:22:33:44:55:66",
+            "not-a-mac",
+        ] {
+            assert!(factory_identity(Some(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn diagnostics_report_only_the_com_devices_actually_enumerated_by_windows() {
+        let metadata = Ok(vec![usb_info("COM3", None), usb_info("COM4", None)]);
+        let report =
+            format_windows_diagnostics(&metadata, &[pnp("COM3", "USB\\VID_10C4&PID_EA60\\NODE_A")]);
+        assert!(report.contains("WINDOWS_HEALTHY_COM_COUNT=1\n"));
+        assert!(report.contains("LIBRARY_ONLY_NOT_PRESENT=COM4\n"));
+        assert!(!report.lines().any(|line| line.starts_with("COM4\t")));
+    }
+
+    #[test]
+    fn diagnostics_explain_missing_library_metadata_without_hiding_the_second_present_com() {
+        let metadata = Ok(vec![usb_info("COM3", None)]);
+        let report = format_windows_diagnostics(
+            &metadata,
+            &[
+                pnp("COM3", "USB\\VID_10C4&PID_EA60\\NODE_A"),
+                pnp("COM4", "USB\\VID_10C4&PID_EA60\\NODE_B"),
+            ],
+        );
+        assert!(report.contains("WINDOWS_HEALTHY_COM_COUNT=2\n"));
+        assert!(report.contains("PNP_WITHOUT_LIBRARY_METADATA=COM4\n"));
+        assert!(
+            report
+                .lines()
+                .any(|line| line.starts_with("COM4\tUSB VID=10C4 PID=EA60"))
+        );
     }
 
     #[test]
@@ -608,9 +1149,11 @@ mod tests {
             port_name: "COM99".into(),
             port_type: SerialPortType::Unknown,
         };
-        let ports =
-            retain_present_ports(vec![usb_info("COM3", Some("A")), ghost], present(&["COM3"]))
-                .unwrap();
+        let ports = retain_present_ports(
+            vec![usb_info("COM3", Some("A")), ghost],
+            Ok(vec![pnp("COM3", "USB\\VID_10C4&PID_EA60\\A")]),
+        )
+        .unwrap();
         assert_eq!(ports.len(), 1);
         assert_eq!(ports[0].port_name, "COM3");
         assert!(matches!(ports[0].port_type, SerialPortType::UsbPort(_)));
@@ -634,9 +1177,11 @@ mod tests {
 
     #[test]
     fn unplugged_usb_does_not_reappear_as_registry_unknown_before_reinsertion() {
-        let connected =
-            retain_present_ports(vec![usb_info("COM3", Some("original"))], present(&["COM3"]))
-                .unwrap();
+        let connected = retain_present_ports(
+            vec![usb_info("COM3", Some("original"))],
+            Ok(vec![pnp("COM3", "USB\\VID_10C4&PID_EA60\\ORIGINAL")]),
+        )
+        .unwrap();
         let original = describe_port(connected[0].clone());
         let stale_registry = SerialPortInfo {
             port_name: "COM3".into(),
@@ -646,7 +1191,7 @@ mod tests {
         assert!(removed.is_empty());
         let reinserted = retain_present_ports(
             vec![usb_info("COM3", Some("replacement"))],
-            present(&["COM3"]),
+            Ok(vec![pnp("COM3", "USB\\VID_10C4&PID_EA60\\REPLACEMENT")]),
         )
         .unwrap();
         let replacement = describe_port(reinserted[0].clone());
@@ -675,16 +1220,21 @@ mod tests {
             describe_port(replacement.clone()).description
         );
         let mut opened = false;
-        let result = open_checked(Some(&expected), &replacement, |_| {
+        let result = open_checked(Some(&expected), &replacement, None, |_| {
             opened = true;
             Ok(())
         });
         assert!(result.is_err());
         assert!(!opened);
-        let result = open_checked(Some(&expected), &usb_info("COM3", Some("device-A")), |_| {
-            opened = true;
-            Ok(())
-        });
+        let result = open_checked(
+            Some(&expected),
+            &usb_info("COM3", Some("device-A")),
+            None,
+            |_| {
+                opened = true;
+                Ok(())
+            },
+        );
         assert!(result.is_ok());
         assert!(opened);
     }

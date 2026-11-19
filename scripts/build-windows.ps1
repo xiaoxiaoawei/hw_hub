@@ -174,6 +174,12 @@ try {
     foreach ($Name in @('README.md', 'CHANGELOG.md')) {
         Copy-Item -LiteralPath $Name -Destination $Staging
     }
+    if ([version]$Version -ge [version]'0.5.0') {
+        if (-not (Test-Path -LiteralPath 'docs/log-upload-api.md' -PathType Leaf)) {
+            throw 'The release requires docs/log-upload-api.md for its README link.'
+        }
+        Copy-Item -LiteralPath docs -Destination $Staging -Recurse
+    }
     foreach ($File in Get-ChildItem -File | Where-Object { $_.Name -match '^(LICENSE|COPYING|NOTICE|THIRD_PARTY)' }) {
         Copy-Item -LiteralPath $File.FullName -Destination $Staging
     }

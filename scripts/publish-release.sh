@@ -125,6 +125,9 @@ try:
             "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "build.rs", "README.md", "CHANGELOG.md",
             ".gitattributes", ".gitignore", "src", "assets", "scripts", "tests", ".github",
         }
+        # Preserve the exact path selection used by published 0.4.x archives.
+        if stable_tag_version(tag) >= (0, 5, 0):
+            allowed.add("docs")
         entries = subprocess.run(["git", "ls-tree", "-z", commit], cwd=root, capture_output=True, check=True).stdout
         paths = []
         for entry in entries.split(b"\0"):

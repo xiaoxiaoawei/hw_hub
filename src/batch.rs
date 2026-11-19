@@ -1,6 +1,6 @@
 //! A bounded device queue. Cancellation and invalidation never interrupt active writes.
 use crate::{
-    backend::{self, FlashProgress, Port},
+    backend::{self, DeviceIdentity, FlashProgress, Port},
     firmware::PreparedFirmware,
 };
 use anyhow::{Context, Result, ensure};
@@ -33,6 +33,113 @@ pub struct BatchEvent {
     pub state: JobState,
     pub message: String,
     pub progress: f32,
+    pub kind: BatchEventKind,
+    /// Per-task hardware metadata. Once read, it is carried through subsequent
+    /// progress/log events and the terminal event, including failures.
+    pub identity: Option<DeviceIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchEventKind {
+    State,
+    Progress,
+    Log,
+    Identity,
+}
+
+/// Each claimed task has its own accumulator; neither driver VID/PID nor a
+/// different port's progress/identity can merge two physical workstations.
+struct JobEvents {
+    port: String,
+    sender: Sender<BatchEvent>,
+    state: JobState,
+    progress: f32,
+    writing_address: Option<u32>,
+    identity: Option<DeviceIdentity>,
+}
+
+impl JobEvents {
+    fn new(port: &str, sender: &Sender<BatchEvent>) -> Self {
+        Self {
+            port: port.into(),
+            sender: sender.clone(),
+            state: JobState::Connecting,
+            progress: 0.0,
+            writing_address: None,
+            identity: None,
+        }
+    }
+
+    fn snapshot(&self, kind: BatchEventKind, message: String) -> BatchEvent {
+        BatchEvent {
+            port: self.port.clone(),
+            state: self.state.clone(),
+            message,
+            progress: self.progress,
+            kind,
+            identity: self.identity.clone(),
+        }
+    }
+
+    fn send(&self, kind: BatchEventKind, message: String) {
+        let _ = self.sender.send(self.snapshot(kind, message));
+    }
+
+    fn progress(&mut self, event: FlashProgress, chip_label: &str) {
+        let (kind, message) = match event {
+            FlashProgress::Connecting => {
+                self.state = JobState::Connecting;
+                (BatchEventKind::State, format!("正在连接 {chip_label}"))
+            }
+            FlashProgress::Writing { fraction, address } => {
+                let kind =
+                    if self.state == JobState::Writing && self.writing_address == Some(address) {
+                        BatchEventKind::Progress
+                    } else {
+                        BatchEventKind::State
+                    };
+                self.state = JobState::Writing;
+                self.writing_address = Some(address);
+                self.progress = fraction.clamp(0.0, 0.99).max(self.progress);
+                (kind, format!("正在写入 0x{address:X}"))
+            }
+            FlashProgress::Verifying => {
+                self.state = JobState::Verifying;
+                (BatchEventKind::State, "正在校验 Flash 内容".into())
+            }
+            FlashProgress::Message(message) => (BatchEventKind::Log, message),
+            FlashProgress::Identity(identity) => {
+                if let Some(previous) = &mut self.identity {
+                    if identity.mac.is_some() {
+                        previous.mac = identity.mac;
+                    }
+                    if identity.efuse_id.is_some() {
+                        previous.efuse_id = identity.efuse_id;
+                    }
+                } else {
+                    self.identity = Some(identity);
+                }
+                let identity = self.identity.as_ref().unwrap();
+                (
+                    BatchEventKind::Identity,
+                    format!(
+                        "只读设备身份：MAC {}；eFuse ID {}（工厂 MAC）",
+                        identity.mac.as_deref().unwrap_or("未提供"),
+                        identity.efuse_id.as_deref().unwrap_or("未提供"),
+                    ),
+                )
+            }
+        };
+        self.send(kind, message);
+    }
+
+    fn terminal(&mut self, state: JobState, message: String) -> BatchEvent {
+        if state == JobState::Success {
+            self.progress = 1.0;
+        }
+        self.state = state;
+        self.snapshot(BatchEventKind::State, message)
+    }
 }
 
 struct QueueState {
@@ -102,36 +209,9 @@ impl Batch {
             "同一串口不能重复排队"
         );
         let fw = firmware;
-        Ok(start_workers(ports, concurrency, move |port, tx| {
+        Ok(start_workers(ports, concurrency, move |port, events| {
             let chip_label = fw.chip.label();
-            let mut last_state = JobState::Connecting;
-            let mut last_progress = 0.0f32;
-            let mut callback = |event| {
-                let (state, message, progress) = match event {
-                    FlashProgress::Connecting => {
-                        (JobState::Connecting, format!("正在连接 {chip_label}"), 0.0)
-                    }
-                    FlashProgress::Writing { fraction, address } => (
-                        JobState::Writing,
-                        format!("正在写入 0x{address:X}"),
-                        fraction.clamp(0.0, 0.99).max(last_progress),
-                    ),
-                    FlashProgress::Verifying => (
-                        JobState::Verifying,
-                        "正在校验 Flash 内容".into(),
-                        last_progress,
-                    ),
-                    FlashProgress::Message(message) => (last_state.clone(), message, last_progress),
-                };
-                last_state = state.clone();
-                last_progress = progress;
-                let _ = tx.send(BatchEvent {
-                    port: port.into(),
-                    state,
-                    message,
-                    progress,
-                });
-            };
+            let mut callback = |event| events.progress(event, chip_label);
             if let Some(expected) = &expected {
                 let snapshot = expected
                     .get(&backend::port_name_key(port))
@@ -175,7 +255,7 @@ impl Batch {
 
 fn start_workers<F>(ports: Vec<String>, concurrency: usize, operation: F) -> Batch
 where
-    F: Fn(&str, &Sender<BatchEvent>) -> Result<()> + Send + Sync + 'static,
+    F: Fn(&str, &mut JobEvents) -> Result<()> + Send + Sync + 'static,
 {
     let (tx, receiver) = mpsc::channel();
     for port in &ports {
@@ -184,6 +264,8 @@ where
             state: JobState::Queued,
             message: "等待烧录".into(),
             progress: 0.0,
+            kind: BatchEventKind::State,
+            identity: None,
         });
     }
     let worker_count = concurrency.min(ports.len());
@@ -227,34 +309,19 @@ where
                         state,
                         message,
                         progress: 0.0,
+                        kind: BatchEventKind::State,
+                        identity: None,
                     }
                 } else {
-                    let _ = tx.send(BatchEvent {
-                        port: port.clone(),
-                        state: JobState::Connecting,
-                        message: "正在连接".into(),
-                        progress: 0.0,
-                    });
-                    match catch_unwind(AssertUnwindSafe(|| operation(&port, &tx))) {
-                        Ok(Ok(())) => BatchEvent {
-                            port,
-                            state: JobState::Success,
-                            message: "写入与校验完成".into(),
-                            progress: 1.0,
-                        },
-                        Ok(Err(error)) => BatchEvent {
-                            port,
-                            state: JobState::Failed,
-                            message: format!("{error:#}"),
-                            progress: 0.0,
-                        },
-                        Err(_) => BatchEvent {
-                            port,
-                            state: JobState::Failed,
-                            message: "烧录库发生异常；请重连设备后重试".into(),
-                            progress: 0.0,
-                        },
-                    }
+                    let mut events = JobEvents::new(&port, &tx);
+                    events.send(BatchEventKind::State, "正在连接".into());
+                    let (state, message) =
+                        match catch_unwind(AssertUnwindSafe(|| operation(&port, &mut events))) {
+                            Ok(Ok(())) => (JobState::Success, "写入与校验完成".into()),
+                            Ok(Err(error)) => (JobState::Failed, format!("{error:#}")),
+                            Err(_) => (JobState::Failed, "烧录库发生异常；请重连设备后重试".into()),
+                        };
+                    events.terminal(state, message)
                 };
                 let _ = tx.send(result);
                 remaining.fetch_sub(1, Ordering::SeqCst);
@@ -278,6 +345,165 @@ mod tests {
             state,
             JobState::Success | JobState::Failed | JobState::Cancelled
         )
+    }
+
+    fn identity(port: &str) -> DeviceIdentity {
+        let suffix = if port == "COM1" { "01" } else { "02" };
+        DeviceIdentity {
+            mac: Some(format!("AA:BB:CC:DD:EE:{suffix}")),
+            efuse_id: Some(format!("AABBCCDDEE{suffix}")),
+        }
+    }
+
+    #[test]
+    fn independent_device_identity_survives_logs_progress_and_terminal_results() {
+        let batch = start_workers(vec!["COM1".into(), "COM2".into()], 2, |port, events| {
+            events.progress(FlashProgress::Identity(identity(port)), "ESP32-C3");
+            events.progress(
+                FlashProgress::Message("设备连接、芯片识别完成".into()),
+                "ESP32-C3",
+            );
+            events.progress(
+                FlashProgress::Writing {
+                    fraction: 0.25,
+                    address: 0,
+                },
+                "ESP32-C3",
+            );
+            events.progress(
+                FlashProgress::Writing {
+                    fraction: 0.5,
+                    address: 0,
+                },
+                "ESP32-C3",
+            );
+            events.progress(FlashProgress::Verifying, "ESP32-C3");
+            if port == "COM2" {
+                anyhow::bail!("mock per-device verify failure")
+            }
+            Ok(())
+        });
+        let mut all = Vec::new();
+        let mut finished = HashSet::new();
+        while finished.len() < 2 {
+            let event = batch.receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+            if terminal(&event.state) {
+                finished.insert(event.port.clone());
+            }
+            all.push(event);
+        }
+        for port in ["COM1", "COM2"] {
+            let events: Vec<_> = all.iter().filter(|event| event.port == port).collect();
+            let identity_event = events
+                .iter()
+                .position(|event| event.kind == BatchEventKind::Identity)
+                .unwrap();
+            for event in &events[identity_event..] {
+                assert_eq!(event.identity, Some(identity(port)));
+            }
+            assert!(events.iter().any(|event| event.kind == BatchEventKind::Log));
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.kind == BatchEventKind::Progress && event.progress == 0.5)
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.kind == BatchEventKind::State
+                        && event.state == JobState::Verifying)
+            );
+            let last = events.last().unwrap();
+            assert_eq!(last.kind, BatchEventKind::State);
+            if port == "COM1" {
+                assert_eq!(last.state, JobState::Success);
+                assert_eq!(last.progress, 1.0);
+            } else {
+                assert_eq!(last.state, JobState::Failed);
+                assert_eq!(last.progress, 0.5);
+                assert!(last.message.contains("mock per-device verify failure"));
+            }
+        }
+    }
+
+    #[test]
+    fn one_workers_next_task_never_reuses_the_previous_devices_identity() {
+        let batch = start_workers(vec!["COM1".into(), "COM2".into()], 1, |port, events| {
+            if port == "COM1" {
+                events.progress(FlashProgress::Identity(identity(port)), "ESP32-C3");
+            }
+            events.progress(FlashProgress::Message("独立设备日志".into()), "ESP32-C3");
+            Ok(())
+        });
+        let mut finals = HashMap::new();
+        while finals.len() < 2 {
+            let event = batch.receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+            if event.port == "COM2" {
+                assert!(event.identity.is_none());
+            }
+            if terminal(&event.state) {
+                finals.insert(event.port.clone(), event);
+            }
+        }
+        assert_eq!(finals["COM1"].identity, Some(identity("COM1")));
+        assert!(finals["COM2"].identity.is_none());
+    }
+
+    #[test]
+    fn partial_identity_and_failed_progress_are_retained_without_inventing_values() {
+        let (sender, receiver) = mpsc::channel();
+        let mut events = JobEvents::new("COM1", &sender);
+        events.progress(
+            FlashProgress::Identity(DeviceIdentity {
+                mac: Some("AA:BB:CC:DD:EE:01".into()),
+                efuse_id: None,
+            }),
+            "ESP32-C3",
+        );
+        events.progress(
+            FlashProgress::Identity(DeviceIdentity {
+                mac: None,
+                efuse_id: Some("AABBCCDDEE01".into()),
+            }),
+            "ESP32-C3",
+        );
+        events.progress(
+            FlashProgress::Writing {
+                fraction: 0.8,
+                address: 0x10000,
+            },
+            "ESP32-C3",
+        );
+        events.progress(
+            FlashProgress::Writing {
+                fraction: 0.2,
+                address: 0x10000,
+            },
+            "ESP32-C3",
+        );
+        let final_event = events.terminal(JobState::Failed, "mock disconnect".into());
+        assert_eq!(final_event.identity, Some(identity("COM1")));
+        assert_eq!(final_event.progress, 0.8);
+        let first = receiver.try_recv().unwrap();
+        assert!(first.identity.unwrap().efuse_id.is_none());
+    }
+
+    #[test]
+    fn writing_segment_changes_are_detailed_states_without_logging_each_packet() {
+        let (sender, receiver) = mpsc::channel();
+        let mut events = JobEvents::new("COM1", &sender);
+        for (fraction, address) in [(0.1, 0), (0.2, 0), (0.3, 0x8000)] {
+            events.progress(FlashProgress::Writing { fraction, address }, "ESP32-C3");
+        }
+        let kinds: Vec<_> = receiver.try_iter().map(|event| event.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                BatchEventKind::State,
+                BatchEventKind::Progress,
+                BatchEventKind::State
+            ]
+        );
     }
 
     #[test]

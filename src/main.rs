@@ -9,6 +9,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("FlashTool")
+            .with_decorations(true)
+            .with_resizable(true)
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!("../assets/app.png"))
                     .expect("embedded application icon"),
