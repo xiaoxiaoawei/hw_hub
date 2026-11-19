@@ -1,3 +1,4 @@
+mod firmware_drop;
 mod settings;
 mod software_update;
 
@@ -24,6 +25,7 @@ use esp32c3_flashtool::{
     telemetry::{self, RecordDraft, RecordService, RecordStatus, TelemetrySettings, UploadState},
     updater::{self, CheckResult, ReleaseUpdate, UpdateSettings},
 };
+use firmware_drop::FirmwareFileDrop;
 
 const ACCENT: Color32 = Color32::from_rgb(22, 139, 245);
 const ACCENT_LIGHT: Color32 = Color32::from_rgb(29, 52, 74);
@@ -881,11 +883,19 @@ impl FlashApp {
     }
 
     fn device_log_windows(&mut self, ctx: &egui::Context) {
+        let viewport = ctx.screen_rect().shrink(12.0);
         let windows: Vec<_> = self.log_windows.iter().cloned().collect();
         for key in windows {
             let mut open = true;
             let mut close = false;
-            egui::Window::new(format!("{} log", key.port))
+            let frame = egui::Frame::new()
+                .fill(NAVY)
+                .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                .corner_radius(4.0)
+                .inner_margin(12.0);
+            let max_size =
+                (viewport.size() - frame.total_margin().sum()).max(egui::Vec2::splat(1.0));
+            egui::Window::new(format!("{} LOG", key.port))
                 .id(egui::Id::new((
                     "device_log",
                     &key.batch,
@@ -894,20 +904,17 @@ impl FlashApp {
                 )))
                 .open(&mut open)
                 .title_bar(false)
-                .resizable(true)
-                .frame(
-                    egui::Frame::new()
-                        .fill(NAVY)
-                        .stroke(egui::Stroke::new(1.0_f32, BORDER))
-                        .corner_radius(4.0)
-                        .inner_margin(12.0),
-                )
-                .default_size([700.0, 430.0])
-                .min_size([420.0, 230.0])
+                .movable(true)
+                .resizable([true, true])
+                .constrain_to(viewport)
+                .frame(frame)
+                .default_size(egui::vec2(900.0, 560.0).min(max_size))
+                .min_size(egui::vec2(600.0, 360.0).min(max_size))
+                .max_size(max_size)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new(format!("{} log", key.port))
+                            RichText::new(format!("{} LOG", key.port))
                                 .size(16.0)
                                 .strong(),
                         );
@@ -929,16 +936,29 @@ impl FlashApp {
                         });
                     });
                     ui.separator();
+                    let body_size = ui.available_size().max(egui::Vec2::splat(1.0));
                     egui::ScrollArea::both()
                         .id_salt(("detailed_log", &key))
-                        .min_scrolled_height(160.0)
+                        .auto_shrink([false, false])
+                        .min_scrolled_width(0.0)
+                        .min_scrolled_height(0.0)
+                        .max_width(body_size.x)
+                        .max_height(body_size.y)
                         .stick_to_bottom(true)
-                        .max_height(ui.available_height().max(120.0))
                         .show(ui, |ui| {
-                            ui.set_min_width(ui.available_width());
-                            if let Some(lines) = self.device_logs.history.get(&key) {
+                            if let Some(lines) = self
+                                .device_logs
+                                .history
+                                .get(&key)
+                                .filter(|lines| !lines.is_empty())
+                            {
                                 for line in lines {
-                                    ui.label(RichText::new(line).monospace().size(12.0).color(INK));
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(line).monospace().size(12.0).color(INK),
+                                        )
+                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                    );
                                 }
                             } else {
                                 ui.label(RichText::new("暂无日志").size(12.0).color(MUTED));
@@ -1577,26 +1597,59 @@ impl FlashApp {
         ui.add_space(3.0);
         let mut remove = None;
         let segmented = self.layout == FirmwareLayout::Segments;
+        let address_font = egui::FontId::monospace(13.0);
+        let field_height = ui.fonts(|fonts| fonts.row_height(&address_font)).max(18.0) + 12.0;
+        let label_width = self
+            .firmware
+            .iter()
+            .map(|row| {
+                ui.fonts(|fonts| {
+                    fonts
+                        .layout_no_wrap(row.label.to_owned(), egui::FontId::proportional(15.0), INK)
+                        .size()
+                        .x
+                })
+            })
+            .fold(94.0_f32, f32::max)
+            .ceil();
+        let mut file_drop = FirmwareFileDrop::read(ui.ctx());
         for (index, row) in self.firmware.iter_mut().enumerate() {
             ui.push_id(index, |ui| {
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut row.enabled, "");
+                    green_checkbox(ui, &mut row.enabled, "");
                     if segmented {
                         ui.add_sized(
-                            [75.0, 22.0],
-                            egui::Label::new(RichText::new(row.label).size(11.0)),
+                            [label_width, field_height],
+                            egui::Label::new(
+                                RichText::new(row.label).heading().size(15.0).strong(),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Extend),
                         );
                     }
                     let width =
                         (ui.available_width() - if segmented { 190.0 } else { 160.0 }).max(160.0);
-                    if ui
+                    let picker = ui
                         .allocate_ui_with_layout(
-                            egui::vec2(width, 48.0),
+                            egui::vec2(width, field_height),
                             egui::Layout::top_down(egui::Align::Min),
-                            |ui| file_picker(ui, &row.path, false),
+                            |ui| file_picker(ui, &row.path, field_height),
                         )
-                        .inner
-                        .clicked()
+                        .inner;
+                    if file_drop.is_hovering(ui, picker.rect) {
+                        ui.painter().rect_stroke(
+                            picker.rect,
+                            4.0,
+                            egui::Stroke::new(2.0_f32, ACCENT),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    if let Some(result) = file_drop.take_for_target(ui, picker.rect) {
+                        match result {
+                            Ok(path) => row.path = path,
+                            Err(error) => self.error = Some(error),
+                        }
+                    }
+                    if picker.clicked()
                         && let Some(path) = rfd::FileDialog::new()
                             .add_filter("固件 BIN", &["bin"])
                             .add_filter("所有文件", &["*"])
@@ -1606,10 +1659,11 @@ impl FlashApp {
                     }
                     ui.label(RichText::new("地址").size(11.0).color(MUTED));
                     ui.add_sized(
-                        [89.0, 30.0],
+                        [89.0, field_height],
                         egui::TextEdit::singleline(&mut row.address)
-                            .font(egui::TextStyle::Monospace)
-                            .margin(egui::vec2(7.0, 6.0)),
+                            .font(address_font.clone())
+                            .margin(egui::vec2(7.0, 6.0))
+                            .min_size(egui::vec2(89.0, field_height)),
                     );
                     if segmented && text_button(ui, "移除").clicked() {
                         remove = Some(index);
@@ -1643,13 +1697,14 @@ impl FlashApp {
                     self.scan_ports();
                 }
                 if ui
-                    .add_enabled(
-                        self.watcher.is_some(),
-                        egui::Checkbox::new(
+                    .add_enabled_ui(self.watcher.is_some(), |ui| {
+                        green_checkbox(
+                            ui,
                             &mut self.auto_refresh,
                             RichText::new("设备插拔自动识别").size(11.0),
-                        ),
-                    )
+                        )
+                    })
+                    .inner
                     .changed()
                 {
                     self.scan_schedule.disable_auto();
@@ -2422,16 +2477,16 @@ fn device_tile(
                             .strong(),
                     );
                 } else {
-                    ui.add_enabled(
-                        !locked && row.online,
-                        egui::Checkbox::new(
+                    ui.add_enabled_ui(!locked && row.online, |ui| {
+                        green_checkbox(
+                            ui,
                             &mut row.selected,
                             RichText::new(&row.port.name)
                                 .monospace()
                                 .size(15.0)
                                 .strong(),
-                        ),
-                    );
+                        )
+                    });
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if terminal_icon_button(ui)
@@ -2653,6 +2708,27 @@ fn panel_title(ui: &mut egui::Ui, kind: Icon, title: &str) {
     });
 }
 
+fn green_checkbox(
+    ui: &mut egui::Ui,
+    value: &mut bool,
+    label: impl Into<RichText>,
+) -> egui::Response {
+    ui.scope(|ui| {
+        let label = label.into().color(ui.visuals().text_color());
+        let widgets = &mut ui.visuals_mut().widgets;
+        for state in [
+            &mut widgets.noninteractive,
+            &mut widgets.inactive,
+            &mut widgets.hovered,
+            &mut widgets.active,
+        ] {
+            state.fg_stroke = egui::Stroke::new(1.7_f32, SUCCESS);
+        }
+        ui.add(egui::Checkbox::new(value, label))
+    })
+    .inner
+}
+
 fn primary_button(ui: &mut egui::Ui, text: &str, size: [f32; 2]) -> egui::Response {
     ui.add(
         egui::Button::new(
@@ -2682,16 +2758,15 @@ fn text_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(egui::Button::new(RichText::new(text).size(12.0).color(ACCENT)).frame(false))
 }
 
-fn file_picker(ui: &mut egui::Ui, path: &Path, large: bool) -> egui::Response {
+fn file_picker(ui: &mut egui::Ui, path: &Path, height: f32) -> egui::Response {
     let empty = path.as_os_str().is_empty();
-    let height = if large { 111.0 } else { 48.0 };
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), height),
         egui::Sense::click(),
     );
     ui.painter().rect_filled(
         rect,
-        8.0,
+        4.0,
         if response.hovered() {
             ACCENT_LIGHT
         } else {
@@ -2700,76 +2775,29 @@ fn file_picker(ui: &mut egui::Ui, path: &Path, large: bool) -> egui::Response {
     );
     ui.painter().rect_stroke(
         rect,
-        8.0,
+        4.0,
         egui::Stroke::new(1.0_f32, if response.hovered() { ACCENT } else { BORDER }),
         egui::StrokeKind::Inside,
     );
     let filename = path
         .file_name()
         .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "点击选择固件文件".into());
-    if large {
-        paint_icon(
-            ui.painter(),
-            rect.center_top() + egui::vec2(0.0, 27.0),
-            24.0,
-            Icon::File,
-            ACCENT,
-        );
-        paint_text_ellipsis(
-            ui,
-            &filename,
-            egui::pos2(rect.left() + 15.0, rect.top() + 51.0),
-            rect.width() - 30.0,
-            14.0,
-            if empty { INK } else { ACCENT },
-            true,
-        );
-        ui.painter().text(
-            rect.center_bottom() - egui::vec2(0.0, 22.0),
-            egui::Align2::CENTER_CENTER,
-            if empty {
-                "支持 .bin 格式 · 本地文件"
-            } else {
-                "点击更换文件"
-            },
-            egui::FontId::proportional(11.0),
-            MUTED,
-        );
+        .unwrap_or_else(|| "选择固件".into());
+    let text_height = ui.fonts(|fonts| fonts.row_height(&egui::FontId::proportional(13.0)));
+    paint_text_ellipsis(
+        ui,
+        &filename,
+        rect.left_center() + egui::vec2(10.0, -text_height / 2.0),
+        (rect.width() - 20.0).max(0.0),
+        13.0,
+        INK,
+        false,
+    );
+    if empty {
+        response
     } else {
-        paint_icon(
-            ui.painter(),
-            rect.left_center() + egui::vec2(22.0, 0.0),
-            20.0,
-            Icon::File,
-            ACCENT,
-        );
-        paint_text_ellipsis(
-            ui,
-            &filename,
-            rect.left_top() + egui::vec2(42.0, 12.0),
-            rect.width() - 55.0,
-            13.0,
-            INK,
-            false,
-        );
-        ui.painter().text(
-            rect.left_bottom() + egui::vec2(42.0, -15.0),
-            egui::Align2::LEFT_CENTER,
-            if empty {
-                "选择本地 .bin 文件"
-            } else {
-                "点击更换文件"
-            },
-            egui::FontId::proportional(10.0),
-            MUTED,
-        );
+        response.on_hover_text(path.display().to_string())
     }
-    response.on_hover_text(if empty {
-        "选择本地固件文件".into()
-    } else {
-        path.display().to_string()
-    })
 }
 
 fn paint_text_ellipsis(

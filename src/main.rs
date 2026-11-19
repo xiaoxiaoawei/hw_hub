@@ -14,6 +14,7 @@ fn main() -> eframe::Result<()> {
             .with_title("FlashTool")
             .with_decorations(true)
             .with_resizable(true)
+            .with_drag_and_drop(true)
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!("../assets/app.png"))
                     .expect("embedded application icon"),

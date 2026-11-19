@@ -188,7 +188,7 @@ impl FlashApp {
                 }
             });
         });
-        ui.checkbox(&mut self.settings_auto_update, "启动时自动检查更新");
+        green_checkbox(ui, &mut self.settings_auto_update, "启动时自动检查更新");
         ui.label(
             RichText::new(format!(
                 "上次成功检查：{}",
@@ -350,7 +350,11 @@ impl FlashApp {
     fn settings_advanced_page(&mut self, ui: &mut egui::Ui) {
         page_heading(ui, "高级配置");
         ui.label(RichText::new("日志上报").heading().size(16.0).strong());
-        ui.checkbox(&mut self.telemetry_draft.upload_enabled, "启用烧录日志上报");
+        green_checkbox(
+            ui,
+            &mut self.telemetry_draft.upload_enabled,
+            "启用烧录日志上报",
+        );
         ui.label(RichText::new("POST 接口地址").size(12.0).color(MUTED));
         ui.add(
             egui::TextEdit::singleline(&mut self.telemetry_draft.endpoint)
