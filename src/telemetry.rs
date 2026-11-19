@@ -3,7 +3,10 @@
 use crate::{backend::DeviceIdentity, telemetry_http};
 use anyhow::{Context, Result, anyhow, ensure};
 use regex::{Regex, RegexBuilder};
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize,
+    de::{MapAccess, Visitor},
+};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
@@ -28,6 +31,9 @@ const LOCAL_QUEUE_CAPACITY: usize = 64;
 const UPLOAD_QUEUE_CAPACITY: usize = 32;
 const RECENT_RECORDS: usize = 4096;
 const MAX_ATTEMPTS: usize = 3;
+const MAX_EXTRACTION_RULES: usize = 32;
+const MAX_EXTRACTION_RULE_BYTES: usize = 32 * 1024;
+const MAX_CUSTOM_VALUE_BYTES: usize = 4096;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -37,6 +43,8 @@ pub struct TelemetrySettings {
     pub timeout_seconds: u64,
     pub efuse_pattern: String,
     pub mac_pattern: String,
+    #[serde(deserialize_with = "deserialize_extraction_rules")]
+    pub extraction_rules: BTreeMap<String, String>,
     pub custom_headers: BTreeMap<String, String>,
     pub csv_directory: Option<PathBuf>,
 }
@@ -51,6 +59,7 @@ impl fmt::Debug for TelemetrySettings {
             .field("timeout_seconds", &self.timeout_seconds)
             .field("efuse_pattern_bytes", &self.efuse_pattern.len())
             .field("mac_pattern_bytes", &self.mac_pattern.len())
+            .field("extraction_rule_count", &self.extraction_rules.len())
             .field("custom_header_count", &self.custom_headers.len())
             .field("csv_directory", &self.csv_directory)
             .finish()
@@ -65,6 +74,7 @@ impl Default for TelemetrySettings {
             timeout_seconds: 10,
             efuse_pattern: r"EFUSE_ID=([0-9A-Fa-f]{12})".into(),
             mac_pattern: r"MAC=([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})".into(),
+            extraction_rules: BTreeMap::new(),
             custom_headers: BTreeMap::new(),
             csv_directory: None,
         }
@@ -86,6 +96,7 @@ pub fn validate_settings(settings: &TelemetrySettings) -> Result<()> {
     telemetry_http::validate_custom_headers(&settings.custom_headers)?;
     compile_pattern(&settings.efuse_pattern, "eFuse ID")?;
     compile_pattern(&settings.mac_pattern, "MAC")?;
+    validate_extraction_rules(&settings.extraction_rules)?;
     if let Some(directory) = &settings.csv_directory {
         ensure!(directory.is_absolute(), "CSV 目录必须是绝对路径");
     }
@@ -108,6 +119,177 @@ fn compile_pattern(pattern: &str, label: &str) -> Result<Regex> {
         "{label} 提取规则必须包含第 1 个捕获组"
     );
     Ok(regex)
+}
+
+/// Parse the advanced editor without silently accepting duplicate field keys.
+pub fn parse_extraction_rules_json(text: &str) -> Result<BTreeMap<String, String>> {
+    ensure!(
+        text.len() <= MAX_SETTINGS_BYTES as usize,
+        "提取规则 JSON 超过 64 KiB"
+    );
+    if text.trim().is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    let rules = deserialize_extraction_rules(&mut deserializer)
+        .map_err(|_| anyhow!("提取规则 JSON 必须是没有重复键的字符串对象（最多 32 条）"))?;
+    deserializer
+        .end()
+        .map_err(|_| anyhow!("提取规则 JSON 后存在多余内容"))?;
+    validate_extraction_rules(&rules)?;
+    Ok(rules)
+}
+
+fn deserialize_extraction_rules<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, String>, D::Error> {
+    struct RulesVisitor;
+    impl<'de> Visitor<'de> for RulesVisitor {
+        type Value = BTreeMap<String, String>;
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an object mapping unique field keys to regex strings")
+        }
+        fn visit_map<A: MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut rules = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<String, String>()? {
+                if rules.insert(key, value).is_some() {
+                    return Err(serde::de::Error::custom("duplicate extraction field key"));
+                }
+                if rules.len() > MAX_EXTRACTION_RULES {
+                    return Err(serde::de::Error::custom("too many extraction fields"));
+                }
+            }
+            Ok(rules)
+        }
+    }
+    deserializer.deserialize_map(RulesVisitor)
+}
+
+pub fn validate_extraction_rules(rules: &BTreeMap<String, String>) -> Result<()> {
+    CompiledExtractionRules::new(rules).map(|_| ())
+}
+
+/// One immutable matcher may be reused while a single device's UART is read.
+#[derive(Debug)]
+pub struct CompiledExtractionRules {
+    rules: BTreeMap<String, Regex>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtractionOutcome {
+    pub custom_fields: BTreeMap<String, String>,
+    pub errors: BTreeMap<String, String>,
+}
+
+impl CompiledExtractionRules {
+    pub fn new(rules: &BTreeMap<String, String>) -> Result<Self> {
+        ensure!(
+            rules.len() <= MAX_EXTRACTION_RULES,
+            "自定义提取规则最多 32 条"
+        );
+        let mut compiled = BTreeMap::new();
+        let mut total = 0usize;
+        for (key, pattern) in rules {
+            let mut bytes = key.bytes();
+            ensure!(
+                (1..=64).contains(&key.len())
+                    && bytes
+                        .next()
+                        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                    && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+                "自定义字段名必须为 1–64 字节 ASCII 字母、数字或下划线，且不能以数字开头"
+            );
+            total = total
+                .checked_add(key.len() + pattern.len())
+                .context("提取规则长度溢出")?;
+            ensure!(
+                total <= MAX_EXTRACTION_RULE_BYTES,
+                "自定义提取规则总长度超过 32 KiB"
+            );
+            compiled.insert(
+                key.clone(),
+                compile_pattern(pattern, &format!("自定义字段 {key}"))?,
+            );
+        }
+        Ok(Self { rules: compiled })
+    }
+
+    pub fn extract(&self, lines: &[String]) -> ExtractionOutcome {
+        let too_large = lines
+            .iter()
+            .try_fold(0usize, |sum, line| {
+                sum.checked_add(line.len())
+                    .and_then(|sum| sum.checked_add(1))
+            })
+            .is_none_or(|bytes| bytes > MAX_LOG_BYTES);
+        let text = if too_large {
+            String::new()
+        } else {
+            lines.join("\n")
+        };
+        let mut outcome = ExtractionOutcome::default();
+        for (key, regex) in &self.rules {
+            let result = if too_large {
+                Err(anyhow!("本设备日志超过 1 MiB"))
+            } else {
+                extract_custom_value(regex, &text)
+            };
+            match result {
+                Ok(value) => {
+                    outcome.custom_fields.insert(key.clone(), value);
+                }
+                Err(error) => {
+                    outcome.errors.insert(key.clone(), error.to_string());
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Recording/export boundary: credentials are removed before extraction,
+    /// using the same redaction policy as persisted device logs.
+    pub fn extract_record(
+        &self,
+        lines: &[String],
+        headers: &BTreeMap<String, String>,
+    ) -> ExtractionOutcome {
+        if headers.is_empty() {
+            self.extract(lines)
+        } else {
+            self.extract(&redact_header_credentials(lines.to_vec(), headers))
+        }
+    }
+}
+
+fn extract_custom_value(regex: &Regex, text: &str) -> Result<String> {
+    let mut value: Option<&str> = None;
+    for (index, captures) in regex.captures_iter(text).enumerate() {
+        ensure!(index < 4096, "本设备字段匹配超过 4096 次");
+        if let Some(capture) = captures.get(1) {
+            let captured = capture.as_str();
+            ensure!(
+                !captured.trim().is_empty()
+                    && captured.len() <= MAX_CUSTOM_VALUE_BYTES
+                    && !captured.contains('\0'),
+                "第 1 个捕获组为空、超过 4096 字节或含 NUL"
+            );
+            ensure!(
+                !captured.contains("[redacted]"),
+                "捕获值包含已脱敏的请求头凭据"
+            );
+            ensure!(
+                value.is_none_or(|previous| previous == captured),
+                "本设备日志包含多个不同的捕获值"
+            );
+            value = Some(captured);
+        }
+    }
+    value
+        .map(str::to_owned)
+        .context("本设备日志未找到第 1 个捕获组")
 }
 
 pub fn load_settings() -> Result<TelemetrySettings> {
@@ -212,6 +394,23 @@ impl RecordStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordOperation {
+    #[default]
+    Flash,
+    ReadOnly,
+}
+
+impl RecordOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Flash => "flash",
+            Self::ReadOnly => "read_only",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RecordDraft {
     pub batch_id: String,
@@ -243,6 +442,9 @@ pub struct RecordResult {
     pub csv_path: Option<PathBuf>,
     pub upload_state: UploadState,
     pub error: Option<String>,
+    pub operation: RecordOperation,
+    pub custom_fields: BTreeMap<String, String>,
+    pub custom_field_errors: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -263,6 +465,9 @@ struct DeviceRecord {
     logs: Vec<String>,
     identity_error: Option<String>,
     validation_error: Option<String>,
+    operation: RecordOperation,
+    custom_fields: BTreeMap<String, String>,
+    custom_field_errors: BTreeMap<String, String>,
 }
 
 static NEXT_BATCH: AtomicU64 = AtomicU64::new(0);
@@ -281,9 +486,12 @@ pub fn new_batch_id() -> String {
     format!("batch-{:x}", hash.finalize())
 }
 
-fn record_id(draft: &RecordDraft) -> String {
+fn record_id(draft: &RecordDraft, operation: RecordOperation) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"FlashTool record v1\0");
+    hash.update(match operation {
+        RecordOperation::Flash => b"FlashTool record v1\0".as_slice(),
+        RecordOperation::ReadOnly => b"FlashTool read-only record v1\0".as_slice(),
+    });
     hash.update((draft.batch_id.len() as u64).to_le_bytes());
     hash.update(draft.batch_id.as_bytes());
     hash.update(draft.port.as_bytes());
@@ -294,6 +502,7 @@ struct LocalTask {
     settings: TelemetrySettings,
     draft: RecordDraft,
     record_id: String,
+    operation: RecordOperation,
 }
 struct UploadTask {
     settings: TelemetrySettings,
@@ -352,6 +561,9 @@ impl RecordService {
                         csv_path: None,
                         upload_state: UploadState::Failed,
                         error: Some("本地记录工作线程出现异常；未进行上传".into()),
+                        operation: task.operation,
+                        custom_fields: BTreeMap::new(),
+                        custom_field_errors: BTreeMap::new(),
                     };
                     let outcome = catch_unwind(AssertUnwindSafe(|| persist_task(task)));
                     match outcome {
@@ -406,6 +618,15 @@ impl RecordService {
     /// blocking the UI. An Err leaves the caller responsible for retaining and
     /// retrying its draft. Duplicate successful submissions are rejected.
     pub fn submit(&mut self, settings: &TelemetrySettings, draft: RecordDraft) -> Result<String> {
+        self.submit_with_operation(settings, draft, RecordOperation::Flash)
+    }
+
+    pub fn submit_with_operation(
+        &mut self,
+        settings: &TelemetrySettings,
+        draft: RecordDraft,
+        operation: RecordOperation,
+    ) -> Result<String> {
         ensure!(self.startup_error.is_none(), "无法启动本地 CSV 保存线程");
         ensure!(
             self.pending.len() < LOCAL_QUEUE_CAPACITY,
@@ -437,7 +658,7 @@ impl RecordService {
             bytes <= MAX_LOG_BYTES,
             "单条设备记录日志超过 1 MiB，请保留记录并缩短日志后重试"
         );
-        let id = record_id(&draft);
+        let id = record_id(&draft, operation);
         ensure!(
             !self.accepted.contains(&id),
             "同一批次和串口的记录已经提交，未重复保存或上传"
@@ -447,6 +668,7 @@ impl RecordService {
             settings: settings.clone(),
             draft,
             record_id: id.clone(),
+            operation,
         };
         if self.sender.try_send(task).is_err() {
             self.local_pending.fetch_sub(1, Ordering::AcqRel);
@@ -511,7 +733,7 @@ enum LocalOutcome {
 }
 
 fn persist_task(task: LocalTask) -> Result<LocalOutcome> {
-    let record = prepare_record(task.record_id, task.draft, &task.settings);
+    let record = prepare_record(task.record_id, task.draft, &task.settings, task.operation);
     let directory = match &task.settings.csv_directory {
         Some(path) => path.clone(),
         None => default_records_directory()?,
@@ -556,23 +778,48 @@ fn persist_task(task: LocalTask) -> Result<LocalOutcome> {
     })))
 }
 
-fn prepare_record(id: String, draft: RecordDraft, settings: &TelemetrySettings) -> DeviceRecord {
-    let identity = verified_identity(&draft, settings);
+fn prepare_record(
+    id: String,
+    draft: RecordDraft,
+    settings: &TelemetrySettings,
+    operation: RecordOperation,
+) -> DeviceRecord {
+    let logs = redact_header_credentials(draft.logs.clone(), &settings.custom_headers);
+    let extracted = match CompiledExtractionRules::new(&settings.extraction_rules) {
+        Ok(rules) => rules.extract(&logs),
+        Err(error) => ExtractionOutcome {
+            custom_fields: BTreeMap::new(),
+            errors: BTreeMap::from([("_rules".into(), error.to_string())]),
+        },
+    };
+    let identity = if operation == RecordOperation::ReadOnly && draft.identity.is_none() {
+        Err(anyhow!("本次只读日志未提取到无歧义的自定义字段"))
+    } else {
+        verified_identity(&draft, settings)
+    };
     let (efuse_id, mac, identity_error) = match identity {
         Ok((efuse, mac)) => (Some(efuse), Some(mac), None),
+        Err(_) if operation == RecordOperation::ReadOnly && !extracted.custom_fields.is_empty() => {
+            (None, None, None)
+        }
         Err(error) => (None, None, Some(error.to_string())),
     };
     let validation_error = if chrono::DateTime::parse_from_rfc3339(&draft.started_at).is_err()
         || chrono::DateTime::parse_from_rfc3339(&draft.finished_at).is_err()
     {
         Some("起止时间不是有效的 RFC3339 时间".into())
-    } else if draft.firmware_sha256.len() != 64
-        || !draft
-            .firmware_sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
+    } else if operation == RecordOperation::Flash
+        && (draft.firmware_sha256.len() != 64
+            || !draft
+                .firmware_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()))
     {
         Some("固件 SHA256 缺失或格式无效".into())
+    } else if operation == RecordOperation::ReadOnly && draft.status != RecordStatus::Success {
+        Some("只读任务未成功完成，仅保存本地记录".into())
+    } else if operation == RecordOperation::ReadOnly && extracted.custom_fields.is_empty() {
+        Some("只读任务未提取到无歧义的自定义字段，仅保存本地记录".into())
     } else {
         None
     };
@@ -590,9 +837,12 @@ fn prepare_record(id: String, draft: RecordDraft, settings: &TelemetrySettings) 
         finished_at: draft.finished_at,
         duration_ms: draft.duration_ms,
         firmware_sha256: draft.firmware_sha256.to_ascii_lowercase(),
-        logs: redact_header_credentials(draft.logs, &settings.custom_headers),
+        logs,
         identity_error,
         validation_error,
+        operation,
+        custom_fields: extracted.custom_fields,
+        custom_field_errors: extracted.errors,
     }
 }
 
@@ -740,6 +990,9 @@ fn csv_bytes(record: &DeviceRecord) -> Vec<u8> {
         "identity_error",
         "validation_error",
         "logs",
+        "operation",
+        "custom_fields",
+        "custom_field_errors",
     ];
     let values = vec![
         record.schema_version.to_string(),
@@ -758,6 +1011,9 @@ fn csv_bytes(record: &DeviceRecord) -> Vec<u8> {
         record.identity_error.clone().unwrap_or_default(),
         record.validation_error.clone().unwrap_or_default(),
         record.logs.join("\n"),
+        record.operation.as_str().to_owned(),
+        serde_json::to_string(&record.custom_fields).expect("string maps are valid JSON"),
+        serde_json::to_string(&record.custom_field_errors).expect("string maps are valid JSON"),
     ];
     let mut output = vec![0xef, 0xbb, 0xbf];
     output.extend_from_slice(
@@ -841,6 +1097,9 @@ fn result_for(
         csv_path,
         upload_state,
         error,
+        operation: record.operation,
+        custom_fields: record.custom_fields.clone(),
+        custom_field_errors: record.custom_field_errors.clone(),
     }
 }
 

@@ -4,7 +4,7 @@
 
 ## 记录与设备身份
 
-每条记录对应一个 batch_id 内的一台设备，port、身份、烧录结果和日志来自同一次任务。record_id 是客户端根据 batch_id 和 port 生成的稳定标识，格式为 record- 加 64 位 SHA256 十六进制值。服务端将它作为不透明标识使用。自动重试继续使用同一记录和同一标识；服务端应按 record_id 或 Idempotency-Key 幂等落库。
+每条记录对应一个 batch_id 内的一台设备，port、身份、任务结果和日志来自同一次任务。operation 区分烧录 flash 与只读采集 read_only。record_id 是客户端根据 batch_id、port 和操作类别生成的稳定标识，格式为 record- 加 64 位 SHA256 十六进制值。服务端将它作为不透明标识使用。自动重试继续使用同一记录、操作类别和标识；服务端应按 record_id 或 Idempotency-Key 幂等落库。
 
 efuse_id 是芯片出厂 factory eFuse MAC 的 48 位原始值，以 12 位大写十六进制表示；mac 是同一值的冒号分隔表示。例如：
 
@@ -14,7 +14,15 @@ EFUSE_ID=246F28112233 MAC=24:6F:28:11:22:33
 
 这两个字段表示同一个 factory_mac，不是两组独立的 eFuse bank。记录不包含安全密钥、Flash 加密密钥或其他任意 eFuse 内容。
 
-上传前同时检查后端提供的 DeviceIdentity 和本次设备日志的正则提取结果。两类标识必须完整、唯一、一致，且 efuse_id 去格式后的值必须与 mac 相同。全 0、全 FF 也视为无效身份。身份缺失、出现冲突、日志与后端身份不匹配时，只保存本地 CSV，跳过上传并保留原因；不会拿其他 COM 的值补齐。
+flash 上传前同时检查后端提供的 DeviceIdentity 和本次设备日志的正则提取结果。两类标识必须完整、唯一、一致，且 efuse_id 去格式后的值必须与 mac 相同。全 0、全 FF 也视为无效身份。身份缺失、出现冲突、日志与后端身份不匹配时，只保存本地 CSV，跳过上传并保留原因；不会拿其他 COM 的值补齐。自定义提取规则独立保存到 custom_fields，不替代这两项出厂身份检查。
+
+## 只读采集设备日志
+
+先在“软件设置 → 高级配置”配置需要的 JSON 提取规则，再勾选在线设备，点击底部“批量读取日志”；也可先使用“选择已识别 USB”。此操作不需要固件，不写 Flash，也不探测芯片或读取 eFuse。日志波特率单独设置，默认 115200，每个端口最多采集 10 秒，按当前 1–16 台并发设置执行。
+
+“读取前复位设备”默认关闭；选中后会尝试让设备重新输出启动日志。是否支持取决于串口适配器、EN 等接线和原生 USB 行为，不能保证所有板卡都能通过该选项复位。
+
+每台任务仍先自动保存独立 CSV。read_only 记录的 chip 和 firmware_sha256 为空，出厂身份可以为空；提取值只来自本台设备本次采集的日志。只有任务 success 且至少一个自定义字段提取有效时，才允许按上传开关发送 HTTP。其他配置字段未匹配时写入 custom_field_errors，不抹掉已经成功的字段；任务失败、取消或所有字段均未提取到时，只保存本地 CSV。
 
 ## 请求与响应
 
@@ -33,27 +41,31 @@ Idempotency-Key: <record_id>
 | schema_version | integer | 当前固定为 1。 |
 | record_id | string | 稳定记录标识，同时作为 Idempotency-Key。 |
 | batch_id | string | 批次标识；同批设备共享此值。 |
+| operation | string | flash 表示烧录；read_only 表示只读采集设备日志。 |
 | port | string | 本次任务的端口，例如 COM7。 |
-| chip | string | 芯片标识，例如 esp32c3。 |
+| chip | string | 烧录时的芯片标识，例如 esp32c3；read_only 未探测芯片，使用空字符串。 |
 | efuse_field | string | 固定为 factory_mac，说明 efuse_id 的实际来源。 |
 | efuse_id | string 或 null | 12 位十六进制出厂 MAC；身份异常记录可为空。 |
 | mac | string 或 null | 同一出厂 MAC 的冒号分隔格式。 |
-| status | string | success、failed 或 cancelled，表示烧录任务结果。 |
+| status | string | success、failed 或 cancelled，表示对应 operation 的任务结果。 |
 | started_at | string | RFC 3339 时间。 |
 | finished_at | string | RFC 3339 时间。 |
 | duration_ms | integer | 任务耗时，单位毫秒。 |
-| firmware_sha256 | string | 本批次已冻结的固件内容及地址布局摘要。 |
+| firmware_sha256 | string | flash 使用本批次已冻结的固件内容及地址布局摘要；read_only 使用空字符串。 |
 | logs | array of string | 该设备本次任务的日志行快照。 |
-| identity_error | string 或 null | 身份校验异常原因；实际上传要求身份校验通过。 |
-| validation_error | string 或 null | 时间或固件 SHA256 格式异常原因；异常记录仅存 CSV，不上传。 |
+| custom_fields | object of string | 自定义规则成功提取的字段名和值；未配置时为 {}。 |
+| custom_field_errors | object of string | 未匹配、捕获冲突或值无效的字段名及原因；没有错误时为 {}。 |
+| identity_error | string 或 null | flash 出厂身份校验异常原因；read_only 不要求该身份。 |
+| validation_error | string 或 null | 时间、flash 固件 SHA256 或 read_only 成功状态/提取结果校验异常原因；异常记录仅存 CSV，不上传。 |
 
-请求正文示例；示例中的固件摘要用于说明格式：
+请求正文示例；下面的设备标识、MAC 和固件摘要均为虚构，仅用于说明格式：
 
 ~~~json
 {
   "schema_version": 1,
   "record_id": "record-8880d857e744ac27d8ae46954d2866f58620d6082fb8c6f5222eeae783029b7c",
   "batch_id": "batch-example-20261119-001",
+  "operation": "flash",
   "port": "COM7",
   "chip": "esp32c3",
   "efuse_id": "246F28112233",
@@ -66,14 +78,19 @@ Idempotency-Key: <record_id>
   "firmware_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "logs": [
     "EFUSE_ID=246F28112233 MAC=24:6F:28:11:22:33",
+    "UNIQUE DEVICE ID: 00112233445566778899AABBCCDDEEFF",
     "Flash verified"
   ],
+  "custom_fields": {
+    "unique_device_id": "00112233445566778899AABBCCDDEEFF"
+  },
+  "custom_field_errors": {},
   "identity_error": null,
   "validation_error": null
 }
 ~~~
 
-烧录失败与上传失败是不同结果：身份有效的 failed 任务也可以上报。HTTP 2xx 表示服务端已接收记录，不会把烧录结果改为 success。
+任务失败与上传失败是不同结果：flash 中身份有效的 failed 任务也可以上报；read_only 只有 success 且至少一个自定义字段有效时可以上报。HTTP 2xx 表示服务端已接收记录，不会改变任务 status。
 
 服务端可返回 204 空响应，或不超过 64 KiB 的 2xx 响应正文。客户端只检查 HTTP 状态码，不依赖某个响应 JSON 字段。请求 JSON 上限为 1 MiB。
 
@@ -97,6 +114,7 @@ TelemetrySettings 的默认配置：
   "timeout_seconds": 10,
   "efuse_pattern": "EFUSE_ID=([0-9A-Fa-f]{12})",
   "mac_pattern": "MAC=([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})",
+  "extraction_rules": {},
   "custom_headers": {},
   "csv_directory": null
 }
@@ -105,6 +123,32 @@ TelemetrySettings 的默认配置：
 在“软件设置 → 通用设置”选择本地记录目录，在“高级配置”编辑日志上传、请求头及身份提取规则。点击“保存设置”后生效。批次使用启动时的设置快照，显式重试按下面的规则选择设置。
 
 正则的第 1 个捕获组用于提取身份，不能代替后端身份校验。规则长度为 1–4096 字节，使用 Rust regex 支持的语法。重复出现同一个规范化值可以通过，出现多个不同值则拒绝绑定。调整正则后仍执行完整性、唯一性和两种 MAC 格式的一致性检查。
+
+### JSON 自定义字段规则
+
+“高级配置 → 自定义字段提取（JSON）”提供多行等宽编辑器、语法着色和即时校验。填写的是 extraction_rules 对象本身，不是整个设置文件。例如：
+
+~~~json
+{
+  "unique_device_id": "UNIQUE DEVICE ID:\\s*([0-9A-Fa-f]{32})\\b"
+}
+~~~
+
+该规则从虚构示例 `UNIQUE DEVICE ID: 00112233445566778899AABBCCDDEEFF` 提取 32 位十六进制值，保存为 custom_fields.unique_device_id。JSON 中反斜杠必须转义：正则中的 `\s`、`\b` 在 JSON 字符串里分别写为 `\\s`、`\\b`。这只是设备输出文本的提取，不会为获取该字段额外读取芯片寄存器或 eFuse。
+
+规则默认是 {}；留空也表示不配置自定义字段。可“复制示例”，空配置可直接“填入示例”，已有规则不会被示例覆盖。点击“保存设置”才生效；无效 JSON、重复字段名或正则错误会阻止保存，“取消”或关闭设置会还原已保存配置。
+
+| 约束 | 规则 |
+| --- | --- |
+| JSON 格式 | 字符串键到字符串正则的对象，整个输入最多 64 KiB，重复键拒绝。 |
+| 字段数量与名称 | 最多 32 个；名称 1–64 字节，以 ASCII 字母或下划线开头，后续只允许 ASCII 字母、数字、下划线。 |
+| 正则 | 每项 1–4096 字节，必须包含第 1 个捕获组；字段名与正则总计最多 32 KiB。使用有资源限制的 Rust regex 语法。 |
+| 捕获值 | 非空、非纯空白、无 NUL，最长 4096 字节，保留原大小写和内容。 |
+| 重复匹配 | 每字段最多检查 4096 次匹配；重复同值可以通过，不同值或超限会省略该字段并记录原因。 |
+
+字段只在同一设备本次任务日志内匹配，不拼接其他 COM 或历史批次。成功值进入 custom_fields，缺失或冲突原因进入 custom_field_errors。两者都保存为本地 CSV 的 JSON 单元格并进入符合上传条件的 POST 正文；自定义字段不会覆盖 port、status、efuse_id 等顶层字段。
+
+匹配输入是本台设备日志行以换行连接的文本。跨行模式按 Rust regex 语法显式使用 `(?m)` 或 `(?s)`；规则不会自动获得这些模式。记录及导出前会先移除已配置请求头的凭据值，包含脱敏标记的捕获不作为有效业务字段。
 
 custom_headers 可用于服务端要求的 Authorization、X-API-Key 等请求头。客户端始终设置 Content-Type 和 Idempotency-Key，用户不能覆盖这些字段。请求头不写入上传 JSON 或设备 CSV。
 
@@ -128,12 +172,12 @@ csv_directory 可指定其他绝对路径。本地保存失败时不发送该记
 每个自动保存文件包含表头和一行设备记录，列顺序如下。logs 单元格用换行连接日志行；CSV 中缺失的身份或异常字段使用空字符串，HTTP JSON 中使用 null。
 
 ~~~text
-schema_version,record_id,batch_id,port,chip,efuse_id,efuse_field,mac,status,started_at,finished_at,duration_ms,firmware_sha256,identity_error,validation_error,logs
+schema_version,record_id,batch_id,port,chip,efuse_id,efuse_field,mac,status,started_at,finished_at,duration_ms,firmware_sha256,identity_error,validation_error,logs,operation,custom_fields,custom_field_errors
 ~~~
 
-RecordResult.csv_path 表示实际持久化路径，upload_state 分别为 Disabled、SkippedIdentity、Uploaded、Failed、Deferred。CSV 内容不会随着 HTTP 结果被覆盖。队列提交返回错误时，调用者应保留原 RecordDraft；上传队列暂满的 Deferred 结果仍有已保存的 CSV。
+RecordResult.csv_path 表示实际持久化路径，同时提供 operation、custom_fields 和 custom_field_errors。upload_state 分别为 Disabled、SkippedIdentity、Uploaded、Failed、Deferred。CSV 内容不会随着 HTTP 结果被覆盖。队列提交返回错误时，调用者应保留原 RecordDraft 和 operation；上传队列暂满的 Deferred 结果仍有已保存的 CSV。
 
-引擎提供显式重试：RecordService.poll() 取出 Failed、Deferred 或本地保存失败的结果后，可再次调用 RecordService.submit(&settings, same_draft)。同一 RecordDraft 保留原 record_id/Idempotency-Key；已有 CSV 只有逐字节一致时才复用，内容不一致则拒绝覆盖和上传。服务在内存中对近期已成功处理的记录去重，服务端仍需持久化幂等键。
+引擎提供显式重试：RecordService.poll() 取出 Failed、Deferred 或本地保存失败的结果后，再次调用 RecordService.submit_with_operation(&settings, same_draft, same_operation)；原有 submit(&settings, draft) 是 flash 的便捷入口。保留同一 RecordDraft 和 operation 才能继续使用原 record_id/Idempotency-Key；已有 CSV 只有逐字节一致时才复用，内容不一致则拒绝覆盖和上传。服务在内存中对近期已成功处理的记录去重，服务端仍需持久化幂等键。
 
 GUI 对本次运行保留的失败记录提供两类显式重试：
 
@@ -144,7 +188,7 @@ GUI 对本次运行保留的失败记录提供两类显式重试：
 
 客户端不会在下次启动时自动扫描并重传历史 CSV。补发同一条业务记录时保留原记录和幂等键；不需要重新烧录或生成新的批次。
 
-界面的“导出本批 CSV”是用户选择路径生成的批次汇总，包含原有的端口、芯片、状态、进度、起止时间、耗时、详情、固件及摘要，并追加批次 ID、eFuse 出厂 MAC 和 MAC。它与自动保存的逐记录 CSV 文件格式、保存时机不同；API 记录使用上面的 schema。
+界面的“导出本批 CSV”是用户选择路径生成的批次汇总，包含原有的端口、芯片、状态、进度、起止时间、耗时、详情、固件及摘要，并追加批次 ID、eFuse 出厂 MAC、MAC 与已配置自定义字段的列。它与自动保存的逐记录 CSV 文件格式、保存时机不同；API 记录使用上面的 schema。
 
 ## 服务端联调示例
 
@@ -177,4 +221,4 @@ def receive_record(headers, record, store):
     return 204 if result in ("inserted", "same_record") else 500
 ~~~
 
-业务服务端还应校验字段类型、身份格式、MAC 两种表示的一致性、允许的状态及正文大小。集成时以客户端发出的 schema_version 为版本判断依据，不从文件名或应用版本号推断 JSON 结构。
+业务服务端还应校验字段类型、operation、允许的状态及正文大小：flash 检查出厂身份和 MAC 两种表示的一致性；read_only 接受为空的芯片、固件摘要与出厂身份，并检查至少一个有效自定义字段。集成时以客户端发出的 schema_version 为版本判断依据，不从文件名或应用版本号推断 JSON 结构；同一 schema 内新增字段应按实际 JSON 合同处理。

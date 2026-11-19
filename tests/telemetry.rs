@@ -1,8 +1,9 @@
 use esp32c3_flashtool::{
     backend::DeviceIdentity,
     telemetry::{
-        RecordDraft, RecordResult, RecordService, RecordStatus, TelemetrySettings, UploadState,
-        load_settings_from, save_settings_at, validate_settings,
+        CompiledExtractionRules, RecordDraft, RecordOperation, RecordResult, RecordService,
+        RecordStatus, TelemetrySettings, UploadState, load_settings_from,
+        parse_extraction_rules_json, save_settings_at, validate_settings,
     },
     telemetry_http::{post_json, validate_custom_headers, validate_endpoint},
 };
@@ -25,6 +26,252 @@ use std::{
 const EFUSE: &str = "AABBCCDDEEFF";
 const MAC: &str = "AA:BB:CC:DD:EE:FF";
 const PRIVATE_TEST_HEADER: &str = "Bearer telemetry-local-test-secret";
+const CUSTOM_ID: &str = "00112233445566778899AABBCCDDEEFF";
+
+fn custom_rules() -> BTreeMap<String, String> {
+    BTreeMap::from([(
+        "unique_device_id".into(),
+        r"UNIQUE DEVICE ID:\s*([0-9A-Fa-f]{32})\b".into(),
+    )])
+}
+
+#[test]
+fn extraction_rules_json_is_bounded_strict_and_old_settings_remain_loadable() {
+    let rules = parse_extraction_rules_json(
+        r#"{"unique_device_id":"UNIQUE DEVICE ID:\\s*([0-9A-Fa-f]{32})\\b"}"#,
+    )
+    .unwrap();
+    assert_eq!(rules, custom_rules());
+    assert!(parse_extraction_rules_json("  ").unwrap().is_empty());
+    for text in [
+        r#"{"id":"(a)","id":"(b)"}"#,
+        r#"{"id":true}"#,
+        "[]",
+        "null",
+        r#"{"id":"(a)"} {}"#,
+        r#"{"bad-key":"(a)"}"#,
+        r#"{"1id":"(a)"}"#,
+        r#"{"id":"no capture"}"#,
+        r#"{"id":"("}"#,
+    ] {
+        assert!(parse_extraction_rules_json(text).is_err(), "{text}");
+    }
+    assert!(parse_extraction_rules_json(&" ".repeat(64 * 1024 + 1)).is_err());
+    let too_many: BTreeMap<_, _> = (0..33)
+        .map(|index| (format!("key{index}"), "(a)".into()))
+        .collect();
+    assert!(CompiledExtractionRules::new(&too_many).is_err());
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("telemetry.json");
+    fs::write(&path, "{\"upload_enabled\":false}").unwrap();
+    assert!(
+        load_settings_from(&path)
+            .unwrap()
+            .extraction_rules
+            .is_empty()
+    );
+    let mut settings = settings(root.path());
+    settings.extraction_rules = rules;
+    save_settings_at(&path, &settings).unwrap();
+    assert_eq!(load_settings_from(&path).unwrap(), settings);
+    fs::write(&path, r#"{"extraction_rules":{"id":"(a)","id":"(b)"}}"#).unwrap();
+    assert!(load_settings_from(&path).is_err());
+}
+
+#[test]
+fn reusable_matcher_keeps_ports_independent_and_reports_missing_or_ambiguous_fields() {
+    let rules = BTreeMap::from([
+        ("id".into(), r"ID=(\w+)".into()),
+        ("board".into(), r"BOARD=(\w+)".into()),
+    ]);
+    let matcher = CompiledExtractionRules::new(&rules).unwrap();
+    let a = matcher.extract(&["ID=AAA ID=AAA BOARD=c3".into()]);
+    assert_eq!(a.custom_fields["id"], "AAA");
+    assert_eq!(a.custom_fields["board"], "c3");
+    assert!(a.errors.is_empty());
+    let b = matcher.extract(&["ID=BBB ID=CCC".into()]);
+    assert!(b.custom_fields.is_empty());
+    assert!(b.errors["id"].contains("多个不同"));
+    assert!(b.errors["board"].contains("未找到"));
+    let c = matcher.extract(&["ID=DDD".into()]);
+    assert_eq!(c.custom_fields["id"], "DDD");
+    assert_eq!(c.errors.len(), 1);
+}
+
+#[test]
+fn custom_capture_limits_preserve_finite_work_and_reject_empty_values() {
+    let matcher =
+        CompiledExtractionRules::new(&BTreeMap::from([("id".into(), r"ID=([^\n]*)".into())]))
+            .unwrap();
+    for text in [
+        "ID=".into(),
+        "ID=   ".into(),
+        format!("ID={}", "a".repeat(4097)),
+        "ID=a\0b".into(),
+        "ID=a\n".repeat(4097),
+    ] {
+        let result = matcher.extract(&[text]);
+        assert!(result.custom_fields.is_empty());
+        assert_eq!(result.errors.len(), 1);
+    }
+    assert!(matcher.extract(&["a".repeat(1024 * 1024)]).errors["id"].contains("1 MiB"));
+}
+
+#[test]
+fn flash_custom_fields_are_saved_in_stable_json_columns_and_posted_with_factory_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = LocalServer::new(vec![Reply::status(201)], Some(directory.path().to_owned()));
+    let mut settings = settings(directory.path());
+    settings.upload_enabled = true;
+    settings.endpoint = server.endpoint.clone();
+    settings.extraction_rules = custom_rules();
+    let mut input = draft();
+    input.logs.push(format!("UNIQUE DEVICE ID: {CUSTOM_ID}"));
+    let mut service = RecordService::new(|| {});
+    service.submit(&settings, input).unwrap();
+    let result = receive_record(&mut service);
+    assert_eq!(result.operation, RecordOperation::Flash);
+    assert_eq!(result.upload_state, UploadState::Uploaded);
+    assert_eq!(result.custom_fields["unique_device_id"], CUSTOM_ID);
+    let fields = csv_fields(result.csv_path.as_ref().unwrap());
+    assert_eq!(fields["operation"], "flash");
+    assert_eq!(
+        serde_json::from_str::<Value>(&fields["custom_fields"]).unwrap()["unique_device_id"],
+        CUSTOM_ID
+    );
+    let header = &csv_rows(result.csv_path.as_ref().unwrap())[0];
+    assert_eq!(header[15], "logs");
+    assert_eq!(
+        &header[16..],
+        &["operation", "custom_fields", "custom_field_errors"]
+    );
+    let posted: Value = serde_json::from_slice(&server.request().body).unwrap();
+    assert_eq!(posted["efuse_id"], EFUSE);
+    assert_eq!(posted["custom_fields"]["unique_device_id"], CUSTOM_ID);
+    assert_eq!(posted["operation"], "flash");
+    server.assert_no_request();
+}
+
+#[test]
+fn readonly_custom_identity_can_upload_without_claiming_a_flash_or_factory_mac() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = LocalServer::new(vec![Reply::status(201)], Some(directory.path().to_owned()));
+    let mut settings = settings(directory.path());
+    settings.upload_enabled = true;
+    settings.endpoint = server.endpoint.clone();
+    settings.extraction_rules = custom_rules();
+    settings
+        .extraction_rules
+        .insert("optional_board".into(), r"BOARD=(\w+)".into());
+    let input = readonly_draft();
+    let mut service = RecordService::new(|| {});
+    let readonly_id = service
+        .submit_with_operation(&settings, input.clone(), RecordOperation::ReadOnly)
+        .unwrap();
+    let result = receive_record(&mut service);
+    assert_eq!(result.operation, RecordOperation::ReadOnly);
+    assert_eq!(result.upload_state, UploadState::Uploaded);
+    assert_eq!(result.custom_fields["unique_device_id"], CUSTOM_ID);
+    assert!(result.custom_field_errors.contains_key("optional_board"));
+    let fields = csv_fields(result.csv_path.as_ref().unwrap());
+    assert_eq!(fields["operation"], "read_only");
+    assert!(fields["firmware_sha256"].is_empty());
+    let posted: Value = serde_json::from_slice(&server.request().body).unwrap();
+    assert_eq!(posted["operation"], "read_only");
+    assert_eq!(posted["status"], "success");
+    assert!(posted["efuse_id"].is_null() && posted["mac"].is_null());
+    assert_eq!(posted["chip"], "");
+    assert!(posted["identity_error"].is_null());
+    // A custom field cannot bypass the original Flash operation's typed guard.
+    let flash_id = service.submit(&settings, input).unwrap();
+    assert_ne!(readonly_id, flash_id);
+    let flash = receive_record(&mut service);
+    assert_eq!(flash.upload_state, UploadState::SkippedIdentity);
+    server.assert_no_request();
+}
+
+#[test]
+fn unsuccessful_or_missing_readonly_capture_retains_csv_fields_and_never_posts() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = LocalServer::new(vec![], None);
+    let mut settings = settings(directory.path());
+    settings.upload_enabled = true;
+    settings.endpoint = server.endpoint.clone();
+    settings.extraction_rules = custom_rules();
+    let mut service = RecordService::new(|| {});
+    for (index, status, logs) in [
+        (
+            0,
+            RecordStatus::Failed,
+            vec![format!("UNIQUE DEVICE ID: {CUSTOM_ID}")],
+        ),
+        (
+            1,
+            RecordStatus::Cancelled,
+            vec![format!("UNIQUE DEVICE ID: {CUSTOM_ID}")],
+        ),
+        (2, RecordStatus::Success, vec!["no ID".into()]),
+        (
+            3,
+            RecordStatus::Success,
+            vec![
+                format!("UNIQUE DEVICE ID: {CUSTOM_ID}"),
+                "UNIQUE DEVICE ID: FFEEDDCCBBAA99887766554433221100".into(),
+            ],
+        ),
+    ] {
+        let mut input = readonly_draft();
+        input.batch_id = format!("readonly-failure-{index}");
+        input.status = status;
+        input.logs = logs;
+        service
+            .submit_with_operation(&settings, input, RecordOperation::ReadOnly)
+            .unwrap();
+        let result = receive_record(&mut service);
+        assert!(result.error.is_some());
+        assert_ne!(result.upload_state, UploadState::Uploaded);
+        assert!(result.csv_path.as_ref().unwrap().is_file());
+        if index < 2 {
+            assert_eq!(result.custom_fields["unique_device_id"], CUSTOM_ID);
+        } else {
+            assert!(result.custom_fields.is_empty());
+        }
+    }
+    server.assert_no_request();
+}
+
+#[test]
+fn custom_extraction_cannot_reintroduce_redacted_header_credentials() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut settings = settings(directory.path());
+    settings
+        .custom_headers
+        .insert("Authorization".into(), PRIVATE_TEST_HEADER.into());
+    settings.extraction_rules = BTreeMap::from([("token".into(), r"TOKEN=(.+)".into())]);
+    let mut input = draft();
+    input.logs.push(format!("TOKEN={PRIVATE_TEST_HEADER}"));
+    let matcher = CompiledExtractionRules::new(&settings.extraction_rules).unwrap();
+    let preview = matcher.extract_record(&input.logs, &settings.custom_headers);
+    assert!(preview.custom_fields.is_empty());
+    assert!(preview.errors.contains_key("token"));
+    let mut service = RecordService::new(|| {});
+    service.submit(&settings, input).unwrap();
+    let result = receive_record(&mut service);
+    assert!(result.custom_fields.is_empty());
+    assert!(result.custom_field_errors.contains_key("token"));
+    let content = fs::read_to_string(result.csv_path.unwrap()).unwrap();
+    assert!(!content.contains("telemetry-local-test-secret"));
+}
+
+fn readonly_draft() -> RecordDraft {
+    RecordDraft {
+        chip: String::new(),
+        identity: None,
+        firmware_sha256: String::new(),
+        logs: vec![format!("UNIQUE DEVICE ID: {CUSTOM_ID}")],
+        ..draft()
+    }
+}
 
 fn draft() -> RecordDraft {
     RecordDraft {

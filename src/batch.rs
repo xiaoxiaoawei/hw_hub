@@ -2,6 +2,8 @@
 use crate::{
     backend::{self, DeviceIdentity, FlashProgress, Port},
     firmware::PreparedFirmware,
+    serial_capture::{self, CaptureEnd, CaptureEvent, CaptureOptions},
+    telemetry::{CompiledExtractionRules, TelemetrySettings},
 };
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
@@ -10,7 +12,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -20,6 +22,7 @@ use std::{
 pub enum JobState {
     Queued,
     Connecting,
+    Reading,
     Writing,
     Verifying,
     Success,
@@ -44,6 +47,7 @@ pub enum BatchEventKind {
     State,
     Progress,
     Log,
+    DeviceLog,
     Identity,
 }
 
@@ -154,6 +158,21 @@ pub struct Batch {
     remaining: Arc<AtomicUsize>,
 }
 
+#[derive(Clone, Copy)]
+enum BatchKind {
+    Flash,
+    Read,
+}
+
+impl BatchKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Flash => "烧录",
+            Self::Read => "读取日志",
+        }
+    }
+}
+
 impl Batch {
     /// Legacy name-only entry point. User-facing batch workflows should bind
     /// tasks to selected device identities through start_guarded instead.
@@ -191,23 +210,9 @@ impl Batch {
         concurrency: usize,
         firmware: Arc<PreparedFirmware>,
     ) -> Result<Self> {
-        ensure!(!ports.is_empty(), "请选择至少一个串口");
-        ensure!((1..=16).contains(&concurrency), "并发数必须为 1–16");
-        ensure!([115200, 460800, 921600].contains(&baud), "不支持的波特率");
+        validate_queue(&ports, concurrency)?;
+        ensure!(baud >= 115_200, "烧录波特率必须至少为 115200");
         ensure!(!firmware.segments.is_empty(), "固件分段为空");
-        ensure!(
-            ports.iter().all(|p| !p.trim().is_empty()),
-            "串口名称不能为空"
-        );
-        ensure!(
-            ports
-                .iter()
-                .map(|port| backend::port_name_key(port))
-                .collect::<HashSet<_>>()
-                .len()
-                == ports.len(),
-            "同一串口不能重复排队"
-        );
         let fw = firmware;
         Ok(start_workers(ports, concurrency, move |port, events| {
             let chip_label = fw.chip.label();
@@ -221,6 +226,73 @@ impl Batch {
                 backend::flash(port, baud, &fw, &mut callback)
             }
         }))
+    }
+
+    pub fn start_reading(
+        ports: Vec<Port>,
+        concurrency: usize,
+        options: CaptureOptions,
+        settings: &TelemetrySettings,
+    ) -> Result<Self> {
+        let names: Vec<_> = ports.iter().map(|port| port.name.clone()).collect();
+        validate_queue(&names, concurrency)?;
+        ensure!(
+            !settings.extraction_rules.is_empty(),
+            "请先配置用于提取的日志字段"
+        );
+        let rules = CompiledExtractionRules::new(&settings.extraction_rules)?;
+        let headers = settings.custom_headers.clone();
+        ensure!(
+            ports.iter().all(|port| !port.identity.is_empty()),
+            "设备身份为空，请重新扫描后选择设备"
+        );
+        let expected: HashMap<_, _> = ports
+            .into_iter()
+            .map(|port| (port.name.clone(), port))
+            .collect();
+        Ok(start_workers_for(
+            names,
+            concurrency,
+            BatchKind::Read,
+            move |port, events| {
+                let snapshot = expected.get(port).context("本批设备身份快照丢失")?;
+                let mut lines = Vec::new();
+                let capture = serial_capture::capture(
+                    snapshot,
+                    &options,
+                    &AtomicBool::new(false),
+                    &mut |event| {
+                        match event {
+                            CaptureEvent::Opened => {
+                                events.state = JobState::Reading;
+                                events.send(BatchEventKind::State, "正在读取串口日志".into());
+                            }
+                            CaptureEvent::Resetting => {
+                                events.send(BatchEventKind::Log, "正在复位设备".into())
+                            }
+                            CaptureEvent::Line(line) => {
+                                events.send(BatchEventKind::DeviceLog, line.clone());
+                                lines.push(line);
+                            }
+                        }
+                        true
+                    },
+                )?;
+                ensure!(
+                    capture.end != CaptureEnd::LimitReached,
+                    "串口输出超过本次读取的日志上限"
+                );
+                ensure!(!lines.is_empty(), "未收到串口日志，请检查波特率和设备输出");
+                ensure!(
+                    !rules
+                        .extract_record(&lines, &headers)
+                        .custom_fields
+                        .is_empty(),
+                    "日志中没有匹配到唯一的配置字段"
+                );
+                Ok(())
+            },
+        ))
     }
 
     pub fn cancel_queued(&self) {
@@ -253,7 +325,38 @@ impl Batch {
     }
 }
 
+fn validate_queue(ports: &[String], concurrency: usize) -> Result<()> {
+    ensure!(!ports.is_empty(), "请选择至少一个串口");
+    ensure!((1..=16).contains(&concurrency), "并发数必须为 1–16");
+    ensure!(
+        ports.iter().all(|p| !p.trim().is_empty()),
+        "串口名称不能为空"
+    );
+    ensure!(
+        ports
+            .iter()
+            .map(|port| backend::port_name_key(port))
+            .collect::<HashSet<_>>()
+            .len()
+            == ports.len(),
+        "同一串口不能重复排队"
+    );
+    Ok(())
+}
+
 fn start_workers<F>(ports: Vec<String>, concurrency: usize, operation: F) -> Batch
+where
+    F: Fn(&str, &mut JobEvents) -> Result<()> + Send + Sync + 'static,
+{
+    start_workers_for(ports, concurrency, BatchKind::Flash, operation)
+}
+
+fn start_workers_for<F>(
+    ports: Vec<String>,
+    concurrency: usize,
+    kind: BatchKind,
+    operation: F,
+) -> Batch
 where
     F: Fn(&str, &mut JobEvents) -> Result<()> + Send + Sync + 'static,
 {
@@ -262,7 +365,7 @@ where
         let _ = tx.send(BatchEvent {
             port: port.clone(),
             state: JobState::Queued,
-            message: "等待烧录".into(),
+            message: format!("等待{}", kind.label()),
             progress: 0.0,
             kind: BatchEventKind::State,
             identity: None,
@@ -297,7 +400,11 @@ where
                     let rejection = if let Some(reason) = queue.invalidated.get(&key) {
                         Some((JobState::Failed, reason.clone()))
                     } else if queue.cancelled {
-                        Some((JobState::Cancelled, "已停止排队，未写入".into()))
+                        let message = match kind {
+                            BatchKind::Flash => "已停止排队，未写入",
+                            BatchKind::Read => "已停止排队，未读取日志",
+                        };
+                        Some((JobState::Cancelled, message.into()))
                     } else {
                         None
                     };
@@ -317,9 +424,19 @@ where
                     events.send(BatchEventKind::State, "正在连接".into());
                     let (state, message) =
                         match catch_unwind(AssertUnwindSafe(|| operation(&port, &mut events))) {
-                            Ok(Ok(())) => (JobState::Success, "写入与校验完成".into()),
+                            Ok(Ok(())) => (
+                                JobState::Success,
+                                match kind {
+                                    BatchKind::Flash => "写入与校验完成",
+                                    BatchKind::Read => "日志读取完成，已提取配置字段",
+                                }
+                                .into(),
+                            ),
                             Ok(Err(error)) => (JobState::Failed, format!("{error:#}")),
-                            Err(_) => (JobState::Failed, "烧录库发生异常；请重连设备后重试".into()),
+                            Err(_) => (
+                                JobState::Failed,
+                                format!("{}任务发生异常，请重连设备后重试", kind.label()),
+                            ),
                         };
                     events.terminal(state, message)
                 };

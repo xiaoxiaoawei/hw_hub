@@ -1,3 +1,4 @@
+mod device_read;
 mod firmware_drop;
 mod settings;
 mod software_update;
@@ -12,6 +13,7 @@ use std::{
 };
 
 use chrono::Local;
+use device_read::DeviceReadSetup;
 use eframe::egui::{self, Color32, RichText};
 use esp32c3_flashtool::{
     backend::{DeviceIdentity, Port},
@@ -22,7 +24,10 @@ use esp32c3_flashtool::{
     drivers::{self, DriverKind},
     firmware::{FirmwareInput, prepare_firmware},
     self_update::{self, PreparedUpdate, SelfUpdateEvent, SelfUpdateService},
-    telemetry::{self, RecordDraft, RecordService, RecordStatus, TelemetrySettings, UploadState},
+    telemetry::{
+        self, RecordDraft, RecordOperation, RecordService, RecordStatus, TelemetrySettings,
+        UploadState,
+    },
     updater::{self, CheckResult, ReleaseUpdate, UpdateSettings},
 };
 use firmware_drop::FirmwareFileDrop;
@@ -111,6 +116,14 @@ struct DeviceLogBook {
 
 impl DeviceLogBook {
     fn begin_batch(&mut self, ports: &[Port], batch: &str, chip: &str, firmware: &str) {
+        self.begin_run(ports, batch, &format!("{chip} · SHA256 {firmware}"), true);
+    }
+
+    fn begin_read(&mut self, ports: &[Port], batch: &str) {
+        self.begin_run(ports, batch, "读取串口日志", false);
+    }
+
+    fn begin_run(&mut self, ports: &[Port], batch: &str, operation: &str, record_header: bool) {
         self.current_keys.clear();
         self.current_lines.clear();
         self.current_bytes.clear();
@@ -118,13 +131,12 @@ impl DeviceLogBook {
         for port in ports {
             let key = DeviceLogKey::from_port(port, batch);
             self.current_keys.insert(port.name.clone(), key.clone());
-            let line = format!(
-                "{}  === 批次 {batch} · {chip} · SHA256 {firmware} ===",
-                timestamp()
-            );
-            self.history.entry(key).or_default().push_back(line.clone());
-            self.current_bytes.insert(port.name.clone(), line.len());
-            self.current_lines.insert(port.name.clone(), vec![line]);
+            let line = format!("{}  === 批次 {batch} · {operation} ===", timestamp());
+            if record_header {
+                self.append_line(&port.name, line);
+            } else {
+                self.append_history(&port.name, line);
+            }
         }
     }
 
@@ -136,15 +148,22 @@ impl DeviceLogBook {
         self.append_line(port, line);
     }
 
-    fn append_line(&mut self, port: &str, line: String) {
+    fn append_history(&mut self, port: &str, line: String) {
         let Some(key) = self.current_keys.get(port) else {
             return;
         };
         let history = self.history.entry(key.clone()).or_default();
-        history.push_back(line.clone());
+        history.push_back(line);
         while history.len() > 10_000 {
             history.pop_front();
         }
+    }
+
+    fn append_line(&mut self, port: &str, line: String) {
+        if !self.current_keys.contains_key(port) {
+            return;
+        }
+        self.append_history(port, line.clone());
         if self.truncated.contains(port) {
             return;
         }
@@ -179,6 +198,18 @@ struct PendingRecord {
     settings: TelemetrySettings,
     draft: RecordDraft,
     device: DeviceLogKey,
+    operation: RecordOperation,
+}
+
+impl PendingRecord {
+    fn refresh_upload_settings(&mut self, settings: &TelemetrySettings) {
+        self.settings.upload_enabled = settings.upload_enabled;
+        self.settings.endpoint.clone_from(&settings.endpoint);
+        self.settings.timeout_seconds = settings.timeout_seconds;
+        self.settings
+            .custom_headers
+            .clone_from(&settings.custom_headers);
+    }
 }
 
 #[derive(Default)]
@@ -254,8 +285,11 @@ pub struct FlashApp {
     scan_schedule: ScanSchedule,
     scan_error: Option<String>,
     baud: u32,
+    baud_input: String,
     concurrency: usize,
     batch: Option<Batch>,
+    batch_operation: RecordOperation,
+    device_read_setup: DeviceReadSetup,
     expected_jobs: usize,
     jobs: BTreeMap<String, JobRow>,
     logs: VecDeque<String>,
@@ -270,6 +304,7 @@ pub struct FlashApp {
     batch_telemetry_settings: TelemetrySettings,
     telemetry_settings_error: Option<String>,
     settings_headers: Vec<(String, String)>,
+    settings_extraction_rules_json: String,
     settings_auto_update: bool,
     settings_saved: bool,
     record_service: RecordService,
@@ -395,8 +430,11 @@ impl FlashApp {
             scan_schedule: ScanSchedule::default(),
             scan_error: None,
             baud: 460_800,
+            baud_input: "460800".into(),
             concurrency: 4,
             batch: None,
+            batch_operation: RecordOperation::Flash,
+            device_read_setup: DeviceReadSetup::default(),
             expected_jobs: 0,
             jobs: BTreeMap::new(),
             logs: VecDeque::new(),
@@ -413,6 +451,10 @@ impl FlashApp {
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
+            settings_extraction_rules_json: serde_json::to_string_pretty(
+                &telemetry_settings.extraction_rules,
+            )
+            .expect("string map serializes to JSON"),
             settings_auto_update: update_settings.auto_check,
             settings_saved: false,
             telemetry_settings,
@@ -540,12 +582,14 @@ impl FlashApp {
     fn start_batch(&mut self) {
         self.error = None;
         self.notice = None;
-        let ports: Vec<_> = self
-            .ports
-            .iter()
-            .filter(|r| r.selected && r.online)
-            .map(|r| r.port.clone())
-            .collect();
+        self.baud = match parse_baud_input(&self.baud_input, 115_200) {
+            Ok(baud) => baud,
+            Err(error) => {
+                self.error = Some(error);
+                return;
+            }
+        };
+        let ports = self.selected_online_ports();
         if ports.is_empty() {
             self.error = Some("请先勾选在线的待烧录串口。".into());
             return;
@@ -586,46 +630,64 @@ impl FlashApp {
             .map(|input| format!("{}@0x{:X}", input.path.display(), input.address))
             .collect::<Vec<_>>()
             .join("; ");
-        let expected_jobs = ports.len();
-        let batch_port_snapshots = ports.clone();
-        let batch_port_identities = self
-            .ports
-            .iter()
-            .filter(|row| row.selected && row.online)
-            .map(|row| (row.port.name.clone(), row.port.identity.clone()))
-            .collect();
-        match Batch::start_guarded(ports, self.baud, self.concurrency, Arc::new(firmware)) {
+        match Batch::start_guarded(
+            ports.clone(),
+            self.baud,
+            self.concurrency,
+            Arc::new(firmware),
+        ) {
             Ok(batch) => {
-                self.jobs.clear();
-                self.expected_jobs = expected_jobs;
-                self.logs.clear();
                 self.firmware_hash = firmware_hash;
                 self.batch_firmware = batch_firmware;
                 self.batch_chip = self.selected_chip;
-                self.batch_port_identities = batch_port_identities;
-                self.batch_port_snapshots = batch_port_snapshots;
-                self.batch_started = timestamp();
-                self.batch_started_at = chrono::Utc::now().to_rfc3339();
-                self.batch_id = telemetry::new_batch_id();
-                self.batch_telemetry_settings = self.telemetry_settings.clone();
-                self.batch_summary_logged = false;
-                self.device_logs.begin_batch(
-                    &self.batch_port_snapshots,
-                    &self.batch_id,
-                    self.batch_chip.label(),
-                    &self.firmware_hash,
-                );
-                for port in &self.batch_port_snapshots {
-                    let idle = DeviceLogKey::from_port(port, "");
-                    if self.log_windows.remove(&idle) {
-                        self.log_windows
-                            .insert(DeviceLogKey::from_port(port, &self.batch_id));
-                    }
-                }
-                self.batch = Some(batch);
+                self.attach_batch(batch, ports, RecordOperation::Flash);
             }
             Err(err) => self.error = Some(format!("无法启动批次：{err:#}")),
         }
+    }
+
+    fn selected_online_ports(&self) -> Vec<Port> {
+        self.ports
+            .iter()
+            .filter(|row| row.selected && row.online)
+            .map(|row| row.port.clone())
+            .collect()
+    }
+
+    fn attach_batch(&mut self, batch: Batch, ports: Vec<Port>, operation: RecordOperation) {
+        self.jobs.clear();
+        self.expected_jobs = ports.len();
+        self.logs.clear();
+        self.batch_operation = operation;
+        self.batch_port_identities = ports
+            .iter()
+            .map(|port| (port.name.clone(), port.identity.clone()))
+            .collect();
+        self.batch_port_snapshots = ports;
+        self.batch_started = timestamp();
+        self.batch_started_at = chrono::Utc::now().to_rfc3339();
+        self.batch_id = telemetry::new_batch_id();
+        self.batch_telemetry_settings = self.telemetry_settings.clone();
+        self.batch_summary_logged = false;
+        match operation {
+            RecordOperation::Flash => self.device_logs.begin_batch(
+                &self.batch_port_snapshots,
+                &self.batch_id,
+                self.batch_chip.label(),
+                &self.firmware_hash,
+            ),
+            RecordOperation::ReadOnly => self
+                .device_logs
+                .begin_read(&self.batch_port_snapshots, &self.batch_id),
+        }
+        for port in &self.batch_port_snapshots {
+            let idle = DeviceLogKey::from_port(port, "");
+            if self.log_windows.remove(&idle) {
+                self.log_windows
+                    .insert(DeviceLogKey::from_port(port, &self.batch_id));
+            }
+        }
+        self.batch = Some(batch);
     }
 
     fn log(&mut self, message: String) {
@@ -651,6 +713,10 @@ impl FlashApp {
             identity,
         } in events
         {
+            if kind == BatchEventKind::DeviceLog {
+                self.device_logs.append_line(&port, message);
+                continue;
+            }
             let now = timestamp();
             let row = self.jobs.entry(port.clone()).or_insert_with(|| JobRow {
                 state: JobState::Queued,
@@ -696,7 +762,14 @@ impl FlashApp {
                 progress
             };
             row.message = message.clone();
-            self.device_logs.append(&port, &state, kind, &message);
+            if self.batch_operation == RecordOperation::Flash {
+                self.device_logs.append(&port, &state, kind, &message);
+            } else if kind != BatchEventKind::Progress {
+                self.device_logs.append_history(
+                    &port,
+                    format!("{}  [{}] {message}", timestamp(), state_label(&state)),
+                );
+            }
             if kind == BatchEventKind::Identity
                 && let Some(identity) = &identity
             {
@@ -712,7 +785,7 @@ impl FlashApp {
                 );
             }
             if first_terminal {
-                if let Some(summary) = terminal_summary(&port, &state) {
+                if let Some(summary) = terminal_summary(&port, &state, self.batch_operation) {
                     self.log(summary);
                 }
                 self.queue_terminal_record(&port);
@@ -771,7 +844,11 @@ impl FlashApp {
         let draft = RecordDraft {
             batch_id: self.batch_id.clone(),
             port: port.into(),
-            chip: self.batch_chip.slug().into(),
+            chip: if self.batch_operation == RecordOperation::Flash {
+                self.batch_chip.slug().into()
+            } else {
+                String::new()
+            },
             identity: row.chip_identity.clone(),
             status,
             started_at: if row.started_at.is_empty() {
@@ -795,16 +872,18 @@ impl FlashApp {
             settings: self.batch_telemetry_settings.clone(),
             draft,
             device,
+            operation: self.batch_operation,
         });
         self.retry_record_submissions();
     }
 
     fn retry_record_submissions(&mut self) {
         while let Some(pending) = self.pending_records.front() {
-            match self
-                .record_service
-                .submit(&pending.settings, pending.draft.clone())
-            {
+            match self.record_service.submit_with_operation(
+                &pending.settings,
+                pending.draft.clone(),
+                pending.operation,
+            ) {
                 Ok(id) => {
                     let pending = self
                         .pending_records
@@ -814,7 +893,7 @@ impl FlashApp {
                     self.record_submit_error = None;
                 }
                 Err(error) => {
-                    let error = format!("烧录记录等待保存，尚未丢弃：{error:#}");
+                    let error = format!("设备记录等待保存：{error:#}");
                     if self.record_submit_error.as_deref() != Some(error.as_str()) {
                         self.log(error.clone());
                     }
@@ -846,18 +925,29 @@ impl FlashApp {
                 .as_ref()
                 .map(|path| format!("CSV：{}", path.display()))
                 .unwrap_or_else(|| "本地 CSV 未保存".into());
-            let retry_upload = matches!(
-                &result.upload_state,
-                UploadState::Failed | UploadState::Deferred
-            );
+            let incomplete_read = pending.operation == RecordOperation::ReadOnly
+                && pending.draft.status != RecordStatus::Success;
+            let retry_upload = !incomplete_read
+                && matches!(
+                    &result.upload_state,
+                    UploadState::Failed | UploadState::Deferred
+                );
             let upload = match result.upload_state {
                 UploadState::Disabled => "上报关闭",
                 UploadState::SkippedIdentity => "未上报：设备身份未确认",
                 UploadState::Uploaded => "上报完成",
+                UploadState::Failed if incomplete_read => "未上报：读取未完成",
                 UploadState::Failed => "上报失败",
                 UploadState::Deferred => "未上报：上传队列暂不可用",
             };
-            let note = format!("{storage} · {upload}");
+            let note = if result.custom_fields.is_empty() {
+                format!("{storage} · {upload}")
+            } else {
+                format!(
+                    "{storage} · 提取字段 {} 个 · {upload}",
+                    result.custom_fields.len()
+                )
+            };
             self.device_logs
                 .history
                 .entry(device.clone())
@@ -972,6 +1062,14 @@ impl FlashApp {
     }
 
     fn save_settings_from_ui(&mut self) -> bool {
+        self.telemetry_draft.extraction_rules =
+            match telemetry::parse_extraction_rules_json(&self.settings_extraction_rules_json) {
+                Ok(rules) => rules,
+                Err(error) => {
+                    self.telemetry_settings_error = Some(format!("提取规则未保存：{error:#}"));
+                    return false;
+                }
+            };
         let mut headers = BTreeMap::new();
         let mut names = BTreeSet::new();
         for (name, value) in &self.settings_headers {
@@ -993,6 +1091,9 @@ impl FlashApp {
             return false;
         }
         self.telemetry_settings = self.telemetry_draft.clone();
+        self.settings_extraction_rules_json =
+            serde_json::to_string_pretty(&self.telemetry_settings.extraction_rules)
+                .expect("string map serializes to JSON");
         let previous = self.update_settings.auto_check;
         self.update_settings.auto_check = self.settings_auto_update;
         if let Err(error) = updater::save_settings(&self.update_settings) {
@@ -1010,7 +1111,8 @@ impl FlashApp {
 
     fn retry_failed_local_records(&mut self) {
         while let Some(mut pending) = self.failed_records.pop_front() {
-            pending.settings = self.telemetry_settings.clone();
+            pending.settings.csv_directory = self.telemetry_settings.csv_directory.clone();
+            pending.refresh_upload_settings(&self.telemetry_settings);
             self.pending_records.push_back(pending);
         }
         self.record_submit_error = None;
@@ -1019,9 +1121,7 @@ impl FlashApp {
 
     fn retry_failed_uploads(&mut self) {
         while let Some(mut pending) = self.failed_uploads.pop_front() {
-            let original_directory = pending.settings.csv_directory.clone();
-            pending.settings = self.telemetry_settings.clone();
-            pending.settings.csv_directory = original_directory;
+            pending.refresh_upload_settings(&self.telemetry_settings);
             self.pending_records.push_back(pending);
         }
         self.record_submit_error = None;
@@ -1271,9 +1371,17 @@ impl FlashApp {
                 .color(Color32::from_rgb(220, 230, 241)),
         );
         ui.label(
-            RichText::new(format!("{} · {} 台并发", self.baud, self.concurrency))
-                .size(12.0)
-                .color(meta),
+            RichText::new(format!(
+                "{} · {} 台并发",
+                if parse_baud_input(&self.baud_input, 115_200).is_ok() {
+                    self.baud.to_string()
+                } else {
+                    "波特率无效".into()
+                },
+                self.concurrency
+            ))
+            .size(12.0)
+            .color(meta),
         );
         if self.update_in_progress() {
             ui.add_space(12.0);
@@ -1395,6 +1503,7 @@ impl FlashApp {
             });
         });
         let modal_open = self.settings_open
+            || self.device_read_setup.open
             || self.update_dialog_open
             || self.chip_picker_open
             || self.pending_driver_license.is_some()
@@ -1574,14 +1683,11 @@ impl FlashApp {
             }
             ui.separator();
             ui.label(RichText::new("波特率").size(11.0).color(MUTED));
-            egui::ComboBox::from_id_salt("baud")
-                .selected_text(self.baud.to_string())
-                .width(101.0)
-                .show_ui(ui, |ui| {
-                    for baud in [115_200, 460_800, 921_600] {
-                        ui.selectable_value(&mut self.baud, baud, baud.to_string());
-                    }
-                });
+            if baud_editor(ui, &mut self.baud_input, "flash_baud", 115_200).changed()
+                && let Ok(baud) = parse_baud_input(&self.baud_input, 115_200)
+            {
+                self.baud = baud;
+            }
             ui.label(RichText::new("并发").size(11.0).color(MUTED));
             ui.add_sized(
                 [76.0, 30.0],
@@ -1648,6 +1754,7 @@ impl FlashApp {
                             Ok(path) => row.path = path,
                             Err(error) => self.error = Some(error),
                         }
+                        ui.ctx().request_repaint();
                     }
                     if picker.clicked()
                         && let Some(path) = rfd::FileDialog::new()
@@ -1656,6 +1763,7 @@ impl FlashApp {
                             .pick_file()
                     {
                         row.path = path;
+                        ui.ctx().request_repaint();
                     }
                     ui.label(RichText::new("地址").size(11.0).color(MUTED));
                     ui.add_sized(
@@ -1894,6 +2002,7 @@ impl FlashApp {
 
     fn actions_panel(&mut self, ui: &mut egui::Ui) {
         let running = self.running();
+        let reading = self.batch_operation == RecordOperation::ReadOnly;
         let selected = self
             .ports
             .iter()
@@ -1927,10 +2036,11 @@ impl FlashApp {
                         .strong(),
                     );
                     ui.label(
-                        RichText::new(if running {
-                            "请保持设备连接，当前任务会完成校验。"
-                        } else {
-                            "本批已结束，可调整配置继续烧录。"
+                        RichText::new(match (running, reading) {
+                            (true, true) => "正在读取所选设备的日志，请保持连接。",
+                            (true, false) => "请保持设备连接，当前任务会完成校验。",
+                            (false, true) => "本批读取已结束。",
+                            (false, false) => "本批已结束，可调整配置继续烧录。",
                         })
                         .size(11.0)
                         .color(MUTED),
@@ -1938,7 +2048,9 @@ impl FlashApp {
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label = if running {
+                let label = if running && reading {
+                    "正在读取日志…"
+                } else if running {
                     "批次正在运行…"
                 } else if self.driver_busy {
                     "等待驱动安装…"
@@ -1959,11 +2071,25 @@ impl FlashApp {
                         && let Some(batch) = &self.batch
                     {
                         batch.cancel_queued();
-                        self.notice =
-                            Some("已停止排队；正在烧录的设备将完成写入与校验，请保持连接。".into());
+                        self.notice = Some(if reading {
+                            "已停止排队。当前设备继续读取，请保持连接。".into()
+                        } else {
+                            "已停止排队；正在烧录的设备将完成写入与校验，请保持连接。".into()
+                        });
                     }
-                } else if !self.jobs.is_empty() && text_button(ui, "导出 CSV").clicked() {
-                    self.export_csv();
+                } else {
+                    if ui
+                        .add_enabled_ui(!self.busy() && selected > 0, |ui| {
+                            secondary_button(ui, "批量读取日志", [112.0, 47.0])
+                        })
+                        .inner
+                        .clicked()
+                    {
+                        self.device_read_setup.open = true;
+                    }
+                    if !self.jobs.is_empty() && text_button(ui, "导出 CSV").clicked() {
+                        self.export_csv();
+                    }
                 }
             });
         });
@@ -1971,7 +2097,15 @@ impl FlashApp {
 
     fn logs_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            panel_title(ui, Icon::Grid, "烧录汇总");
+            panel_title(
+                ui,
+                Icon::Grid,
+                if self.batch_operation == RecordOperation::ReadOnly {
+                    "读取汇总"
+                } else {
+                    "烧录汇总"
+                },
+            );
             ui.label(
                 RichText::new(format!("{} 条", self.logs.len()))
                     .size(10.0)
@@ -1999,12 +2133,15 @@ impl FlashApp {
                 {
                     self.logs_visible = !self.logs_visible;
                 }
-                if !self.jobs.is_empty() && text_button(ui, "导出本批 CSV").clicked() {
+                if !self.jobs.is_empty()
+                    && (self.batch_operation == RecordOperation::Flash || !self.running())
+                    && text_button(ui, "导出本批 CSV").clicked()
+                {
                     self.export_csv();
                 }
             });
         });
-        if !self.jobs.is_empty() {
+        if !self.jobs.is_empty() && self.batch_operation == RecordOperation::Flash {
             ui.label(
                 RichText::new(format!(
                     "本批 {} · {} · 固件 SHA256 {}…",
@@ -2033,9 +2170,15 @@ impl FlashApp {
                         .show(ui, |ui| {
                             if self.logs.is_empty() {
                                 ui.label(
-                                    RichText::new("暂无烧录结果")
-                                        .size(11.0)
-                                        .color(Color32::from_rgb(126, 149, 172)),
+                                    RichText::new(
+                                        if self.batch_operation == RecordOperation::ReadOnly {
+                                            "暂无读取结果"
+                                        } else {
+                                            "暂无烧录结果"
+                                        },
+                                    )
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(126, 149, 172)),
                                 );
                             }
                             for line in &self.logs {
@@ -2055,8 +2198,17 @@ impl FlashApp {
     }
 
     fn export_csv(&mut self) {
+        let settings = &self.batch_telemetry_settings;
+        let rules = match telemetry::CompiledExtractionRules::new(&settings.extraction_rules) {
+            Ok(rules) => rules,
+            Err(error) => {
+                self.error = Some(format!("无法导出字段：{error:#}"));
+                return;
+            }
+        };
+        let reading = self.batch_operation == RecordOperation::ReadOnly;
         let Some(path) = rfd::FileDialog::new()
-            .set_title("导出本批烧录结果")
+            .set_title("导出本批设备结果")
             .set_file_name(format!(
                 "flashtool-{}.csv",
                 Local::now().format("%Y%m%d-%H%M%S")
@@ -2083,19 +2235,28 @@ impl FlashApp {
             "固件",
             "固件SHA256",
         ];
-        append_csv(&mut output, header.iter().copied());
+        let custom_keys = || settings.extraction_rules.keys().map(String::as_str);
+        append_csv(&mut output, header.into_iter().chain(custom_keys()));
         for (port, row) in &self.jobs {
             let progress = format!("{:.1}%", row.progress * 100.0);
             let duration = row
                 .duration_secs
                 .map(|v| format!("{v:.3}"))
                 .unwrap_or_default();
+            let logs = self
+                .device_logs
+                .current_lines
+                .get(port)
+                .map_or(&[][..], Vec::as_slice);
+            let fields = rules
+                .extract_record(logs, &settings.custom_headers)
+                .custom_fields;
             append_csv(
                 &mut output,
                 [
                     self.batch_started.as_str(),
                     port.as_str(),
-                    self.batch_chip.label(),
+                    if reading { "" } else { self.batch_chip.label() },
                     self.batch_id.as_str(),
                     row.chip_identity
                         .as_ref()
@@ -2113,7 +2274,9 @@ impl FlashApp {
                     row.message.as_str(),
                     self.batch_firmware.as_str(),
                     self.firmware_hash.as_str(),
-                ],
+                ]
+                .into_iter()
+                .chain(custom_keys().map(|key| fields.get(key).map_or("", String::as_str))),
             );
         }
         match fs::write(&path, output) {
@@ -2137,12 +2300,10 @@ impl eframe::App for FlashApp {
                 self.notice = Some("正在准备更新并检查写入权限，请稍候。".into());
             } else if busy {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.error = Some(
-                    "任务正在进行，暂时不能关闭。可先停止排队，等待当前烧录或驱动安装完成。".into(),
-                );
+                self.error = Some("任务正在进行，请等待当前任务完成后关闭。".into());
             } else if self.record_service.pending_local_count() > 0 {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.notice = Some("正在保存本地烧录记录，请稍候再关闭。".into());
+                self.notice = Some("正在保存本地设备记录，请稍候再关闭。".into());
             } else if self.record_service.pending_count() > 0
                 || !self.pending_records.is_empty()
                 || !self.failed_records.is_empty()
@@ -2202,11 +2363,13 @@ impl eframe::App for FlashApp {
         if !busy {
             self.chip_dialog(ctx);
             self.driver_license_dialog(ctx);
+            self.device_read_dialog(ctx);
         }
         if self.update_prompt_pending
             && !self.close_confirm_open
             && self.pending_driver_license.is_none()
             && !self.chip_picker_open
+            && !self.device_read_setup.open
         {
             self.open_update_dialog();
         }
@@ -2258,11 +2421,15 @@ fn header_drag_region(
     })
 }
 
-fn terminal_summary(port: &str, state: &JobState) -> Option<String> {
+fn terminal_summary(port: &str, state: &JobState, operation: RecordOperation) -> Option<String> {
+    let action = match operation {
+        RecordOperation::Flash => "烧录",
+        RecordOperation::ReadOnly => "读取日志",
+    };
     match state {
-        JobState::Success => Some(format!("{port}烧录成功")),
-        JobState::Failed => Some(format!("{port}烧录失败")),
-        JobState::Cancelled => Some(format!("{port}已取消烧录")),
+        JobState::Success => Some(format!("{port}{action}成功")),
+        JobState::Failed => Some(format!("{port}{action}失败")),
+        JobState::Cancelled => Some(format!("{port}已取消{action}")),
         _ => None,
     }
 }
@@ -2758,6 +2925,66 @@ fn text_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(egui::Button::new(RichText::new(text).size(12.0).color(ACCENT)).frame(false))
 }
 
+fn parse_baud_input(input: &str, minimum: u32) -> Result<u32, String> {
+    let minimum = minimum.max(1);
+    let baud = input.trim().parse::<u32>().map_err(|_| {
+        format!(
+            "波特率无效，请输入 {minimum} 至 {} 的十进制整数。",
+            u32::MAX
+        )
+    })?;
+    if baud < minimum {
+        return Err(format!("波特率不能低于 {minimum}。"));
+    }
+    Ok(baud)
+}
+
+fn baud_editor(ui: &mut egui::Ui, input: &mut String, id: &str, minimum: u32) -> egui::Response {
+    let previous = input.clone();
+    let mut response = ui.add_sized(
+        [101.0, 30.0],
+        egui::TextEdit::singleline(input)
+            .id_salt((id, "input"))
+            .font(egui::FontId::monospace(13.0))
+            .margin(egui::vec2(7.0, 6.0))
+            .hint_text("自定义"),
+    );
+    if let Err(error) = parse_baud_input(input, minimum) {
+        ui.painter().rect_stroke(
+            response.rect,
+            4.0,
+            egui::Stroke::new(1.0_f32, DANGER),
+            egui::StrokeKind::Inside,
+        );
+        response = response.on_hover_text(error);
+    } else {
+        response = response.on_hover_text("可直接输入十进制波特率，或从右侧选择常用值。");
+    }
+    let presets = egui::ComboBox::from_id_salt((id, "presets"))
+        .selected_text("常用")
+        .width(62.0)
+        .show_ui(ui, |ui| {
+            for baud in [
+                9_600_u32, 19_200, 57_600, 115_200, 230_400, 460_800, 921_600, 1_000_000,
+                1_500_000, 2_000_000, 3_000_000,
+            ] {
+                if baud >= minimum
+                    && ui
+                        .selectable_label(input.trim() == baud.to_string(), baud.to_string())
+                        .clicked()
+                {
+                    *input = baud.to_string();
+                }
+            }
+        })
+        .response;
+    response = response.union(presets);
+    if *input != previous {
+        response.mark_changed();
+    }
+    response
+}
+
 fn file_picker(ui: &mut egui::Ui, path: &Path, height: f32) -> egui::Response {
     let empty = path.as_os_str().is_empty();
     let (rect, response) = ui.allocate_exact_size(
@@ -2926,6 +3153,7 @@ fn state_label(state: &JobState) -> &'static str {
     match state {
         JobState::Queued => "等待中",
         JobState::Connecting => "连接设备",
+        JobState::Reading => "正在读取",
         JobState::Writing => "正在写入",
         JobState::Verifying => "正在校验",
         JobState::Success => "成功",
@@ -2951,9 +3179,13 @@ fn append_csv<'a>(output: &mut String, values: impl IntoIterator<Item = &'a str>
         output.push('"');
         // Neutralize spreadsheet formulas in file paths, device labels and error text.
         if value
+            .trim_start_matches(|character: char| {
+                character.is_whitespace() || character.is_control() || character == '\u{feff}'
+            })
             .chars()
             .next()
-            .is_some_and(|c| matches!(c, '=' | '+' | '-' | '@' | '\t' | '\r' | '\n'))
+            .is_some_and(|c| matches!(c, '=' | '+' | '-' | '@'))
+            || value.starts_with(['\t', '\r', '\n'])
         {
             output.push('\'');
         }
@@ -3052,11 +3284,28 @@ fn install_fonts(ctx: &egui::Context) {
 mod tests {
     use super::{
         BatchEventKind, DeviceIdentity, DeviceLogBook, DeviceLogKey, JobRow, JobState, Port,
-        PortRow, ScanSchedule, append_csv, header_drag_region, missing_batch_jobs, reconcile_ports,
-        reconcile_scan_result, restart_safety_reason, terminal_summary,
+        PortRow, RecordOperation, ScanSchedule, append_csv, header_drag_region, missing_batch_jobs,
+        parse_baud_input, reconcile_ports, reconcile_scan_result, restart_safety_reason,
+        terminal_summary,
     };
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn custom_baud_accepts_decimal_values_and_respects_operation_minimum() {
+        assert_eq!(parse_baud_input(" 256000 ", 115_200), Ok(256_000));
+        assert_eq!(parse_baud_input("115200", 115_200), Ok(115_200));
+        assert_eq!(parse_baud_input("9600", 1), Ok(9_600));
+        assert_eq!(parse_baud_input("4294967295", 1), Ok(u32::MAX));
+        assert!(parse_baud_input("115199", 115_200).is_err());
+    }
+
+    #[test]
+    fn custom_baud_rejects_invalid_zero_negative_and_overflow_values() {
+        for input in ["", " ", "0", "-1", "4294967296", "1.5", "1e6", "0x70800"] {
+            assert!(parse_baud_input(input, 1).is_err(), "{input:?}");
+        }
+    }
 
     #[test]
     fn update_restart_waits_for_flash_driver_and_every_unsaved_local_record() {
@@ -3131,6 +3380,24 @@ mod tests {
     }
 
     #[test]
+    fn read_only_records_contain_only_raw_serial_lines_for_each_port() {
+        let first = port("COM3", "adapter A");
+        let second = port("COM4", "adapter B");
+        let mut logs = DeviceLogBook::default();
+        logs.begin_read(&[first.clone(), second.clone()], "read-batch");
+        logs.append_history("COM3", "正在读取串口日志".into());
+        logs.append_line("COM4", "UNIQUE DEVICE ID: B".into());
+        logs.append_line("COM3", "UNIQUE DEVICE ID: A".into());
+        assert_eq!(logs.current_lines["COM3"], ["UNIQUE DEVICE ID: A"]);
+        assert_eq!(logs.current_lines["COM4"], ["UNIQUE DEVICE ID: B"]);
+        assert!(
+            logs.history[&DeviceLogKey::from_port(&first, "read-batch")]
+                .iter()
+                .any(|line| line == "正在读取串口日志")
+        );
+    }
+
+    #[test]
     fn same_adapter_new_batch_keeps_old_terminal_bound_to_old_run() {
         let device = port("COM3", "same adapter");
         let mut logs = DeviceLogBook::default();
@@ -3177,14 +3444,14 @@ mod tests {
             JobState::Writing,
             JobState::Verifying,
         ] {
-            assert!(terminal_summary("COM11", &state).is_none());
+            assert!(terminal_summary("COM11", &state, RecordOperation::Flash).is_none());
         }
         assert_eq!(
-            terminal_summary("COM11", &JobState::Success).as_deref(),
+            terminal_summary("COM11", &JobState::Success, RecordOperation::Flash).as_deref(),
             Some("COM11烧录成功")
         );
         assert_eq!(
-            terminal_summary("COM12", &JobState::Failed).as_deref(),
+            terminal_summary("COM12", &JobState::Failed, RecordOperation::Flash).as_deref(),
             Some("COM12烧录失败")
         );
     }

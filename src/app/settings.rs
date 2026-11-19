@@ -12,6 +12,85 @@ pub(super) fn select_page(ctx: &egui::Context, page: SettingsPage) {
     ctx.data_mut(|data| data.insert_temp(egui::Id::new("settings_page"), page));
 }
 
+const EXTRACTION_RULES_EXAMPLE: &str = r#"{
+  "unique_device_id": "UNIQUE DEVICE ID:\\s*([0-9A-Fa-f]{32})\\b"
+}"#;
+
+fn extraction_rules_json(rules: &BTreeMap<String, String>) -> String {
+    serde_json::to_string_pretty(rules).unwrap_or_else(|_| "{}".into())
+}
+
+struct ExtractionRulesValidation {
+    text: String,
+    result: Result<usize, String>,
+}
+
+fn extraction_rules_validation(ctx: &egui::Context, text: &str) -> Result<usize, String> {
+    let id = egui::Id::new("settings_extraction_rules_validation");
+    let cached =
+        ctx.data_mut(|data| data.get_temp::<std::sync::Arc<ExtractionRulesValidation>>(id));
+    if let Some(cached) = cached
+        && cached.text == text
+    {
+        return cached.result.clone();
+    }
+    let result = telemetry::parse_extraction_rules_json(text)
+        .map(|rules| rules.len())
+        .map_err(|error| format!("{error:#}"));
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            id,
+            std::sync::Arc::new(ExtractionRulesValidation {
+                text: text.into(),
+                result: result.clone(),
+            }),
+        );
+    });
+    result
+}
+
+fn extraction_rules_layout(text: &str, wrap_width: f32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+    let mut offset = 0;
+    while offset < text.len() {
+        let start = offset;
+        let color = if text.as_bytes()[offset] == b'"' {
+            offset += 1;
+            let mut escaped = false;
+            while offset < text.len() {
+                let character = text[offset..].chars().next().unwrap();
+                offset += character.len_utf8();
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    break;
+                }
+            }
+            if text[offset..].trim_start().starts_with(':') {
+                ACCENT
+            } else {
+                SUCCESS
+            }
+        } else {
+            offset += text[offset..].find('"').unwrap_or(text.len() - offset);
+            MUTED
+        };
+        job.append(
+            &text[start..offset],
+            0.0,
+            egui::TextFormat {
+                font_id: egui::FontId::monospace(12.0),
+                color,
+                ..Default::default()
+            },
+        );
+    }
+    job
+}
+
 fn headers_match_saved(rows: &[(String, String)], saved: &BTreeMap<String, String>) -> bool {
     let mut headers = BTreeMap::new();
     let mut names = BTreeSet::new();
@@ -53,7 +132,8 @@ impl FlashApp {
             &self.settings_headers,
             self.settings_auto_update,
             self.update_settings.auto_check,
-        )
+        ) || self.settings_extraction_rules_json
+            != extraction_rules_json(&self.telemetry_settings.extraction_rules)
     }
 
     pub(super) fn discard_settings_draft(&mut self) {
@@ -65,6 +145,8 @@ impl FlashApp {
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
         self.settings_auto_update = self.update_settings.auto_check;
+        self.settings_extraction_rules_json =
+            extraction_rules_json(&self.telemetry_settings.extraction_rules);
         self.settings_saved = false;
         self.resume_settings_after_update = false;
     }
@@ -350,11 +432,7 @@ impl FlashApp {
     fn settings_advanced_page(&mut self, ui: &mut egui::Ui) {
         page_heading(ui, "高级配置");
         ui.label(RichText::new("日志上报").heading().size(16.0).strong());
-        green_checkbox(
-            ui,
-            &mut self.telemetry_draft.upload_enabled,
-            "启用烧录日志上报",
-        );
+        green_checkbox(ui, &mut self.telemetry_draft.upload_enabled, "启用日志上报");
         ui.label(RichText::new("POST 接口地址").size(12.0).color(MUTED));
         ui.add(
             egui::TextEdit::singleline(&mut self.telemetry_draft.endpoint)
@@ -404,6 +482,13 @@ impl FlashApp {
                 .font(egui::TextStyle::Monospace)
                 .desired_width(ui.available_width()),
         );
+        ui.label(
+            RichText::new("以上两项继续校验芯片出厂 MAC，自定义字段不会替代它们。")
+                .size(12.0)
+                .color(MUTED),
+        );
+        ui.add_space(10.0);
+        self.settings_extraction_rules_editor(ui);
         ui.add_space(8.0);
         ui.separator();
         ui.label(RichText::new("自定义请求头").heading().size(16.0).strong());
@@ -435,11 +520,112 @@ impl FlashApp {
             self.settings_headers.push((String::new(), String::new()));
         }
     }
+
+    fn settings_extraction_rules_editor(&mut self, ui: &mut egui::Ui) {
+        let validation =
+            extraction_rules_validation(ui.ctx(), &self.settings_extraction_rules_json);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new("自定义字段提取（JSON）")
+                    .heading()
+                    .size(16.0)
+                    .strong(),
+            );
+            if text_button(ui, "复制示例").clicked() {
+                ui.ctx().copy_text(EXTRACTION_RULES_EXAMPLE.into());
+            }
+            if ui
+                .add_enabled_ui(matches!(validation, Ok(0)), |ui| {
+                    text_button(ui, "填入示例")
+                })
+                .inner
+                .on_hover_text("仅在规则为空时填入，保留已有配置。")
+                .clicked()
+            {
+                self.settings_extraction_rules_json = EXTRACTION_RULES_EXAMPLE.into();
+                self.settings_saved = false;
+            }
+        });
+        ui.label(
+            RichText::new("JSON 对象：字段名 → 正则表达式；使用第 1 个捕获组，留空或 {} 表示不提取自定义字段。")
+                .size(12.0)
+                .color(MUTED),
+        );
+        let mut layouter = |ui: &egui::Ui, text: &str, width: f32| {
+            ui.fonts(|fonts| fonts.layout_job(extraction_rules_layout(text, width)))
+        };
+        if ui
+            .add(
+                egui::TextEdit::multiline(&mut self.settings_extraction_rules_json)
+                    .id_salt("custom_extraction_rules_json")
+                    .code_editor()
+                    .desired_rows(6)
+                    .desired_width(ui.available_width())
+                    .char_limit(64 * 1024)
+                    .hint_text("{}")
+                    .layouter(&mut layouter),
+            )
+            .changed()
+        {
+            self.settings_saved = false;
+        }
+        match extraction_rules_validation(ui.ctx(), &self.settings_extraction_rules_json) {
+            Ok(0) => {
+                ui.label(RichText::new("未配置自定义字段").size(12.0).color(MUTED));
+            }
+            Ok(count) => {
+                ui.label(
+                    RichText::new(format!("JSON 与正则校验通过 · {count} 个字段"))
+                        .size(12.0)
+                        .color(SUCCESS),
+                );
+            }
+            Err(error) => {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("尚不能保存：{error}"))
+                            .size(12.0)
+                            .color(DANGER),
+                    )
+                    .wrap(),
+                );
+            }
+        }
+        ui.label(
+            RichText::new("JSON 中的正则反斜杠需写为 \\\\；最多 32 个字段。点击“保存设置”后生效。")
+                .size(12.0)
+                .color(MUTED),
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extraction_editor_example_parses_and_captures_the_requested_device_id() {
+        let rules = telemetry::parse_extraction_rules_json(EXTRACTION_RULES_EXAMPLE).unwrap();
+        let pattern = regex::Regex::new(&rules["unique_device_id"]).unwrap();
+        let captures = pattern
+            .captures("UNIQUE DEVICE ID: 00112233445566778899AABBCCDDEEFF")
+            .unwrap();
+        assert_eq!(&captures[1], "00112233445566778899AABBCCDDEEFF");
+    }
+
+    #[test]
+    fn json_highlighting_preserves_incomplete_and_unicode_editor_input() {
+        for text in [
+            "",
+            "{}",
+            EXTRACTION_RULES_EXAMPLE,
+            r#"{"device_id":"含中文的日志\\\\\"内容"}"#,
+            "{\"device_id\":\"unfinished\\",
+            "not JSON 日志",
+        ] {
+            assert_eq!(extraction_rules_layout(text, 420.0).text, text);
+        }
+    }
 
     #[test]
     fn unsaved_settings_include_telemetry_headers_and_auto_check() {
