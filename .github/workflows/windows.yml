@@ -2,7 +2,7 @@ name: Windows build and release
 
 on:
   push:
-    branches: [main, flashtool]
+    branches: [Flash_tool]
     tags: ['v*']
   workflow_dispatch:
     inputs:

@@ -2,7 +2,7 @@ name: Retry verified release
 
 on:
   push:
-    branches: [flashtool]
+    branches: [Flash_tool]
     paths: [.github/release-retry.json]
   workflow_dispatch:
 
