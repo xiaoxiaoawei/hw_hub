@@ -154,6 +154,7 @@ pub struct FlashApp {
     batch_firmware: String,
     batch_started: String,
     batch_port_identities: BTreeMap<String, String>,
+    batch_port_snapshots: Vec<Port>,
     logs_visible: bool,
     update_dialog_open: bool,
     update_settings: UpdateSettings,
@@ -251,6 +252,7 @@ impl FlashApp {
             batch_firmware: String::new(),
             batch_started: String::new(),
             batch_port_identities: BTreeMap::new(),
+            batch_port_snapshots: Vec::new(),
             logs_visible: true,
             update_dialog_open: false,
             update_settings,
@@ -322,7 +324,7 @@ impl FlashApp {
         });
     }
 
-    fn collect_update_events(&mut self) {
+    fn collect_update_events(&mut self, ctx: &egui::Context) {
         let result = match self.update_result.as_ref().map(mpsc::Receiver::try_recv) {
             Some(Ok(result)) => result,
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
@@ -366,9 +368,13 @@ impl FlashApp {
                 } else {
                     "自动检查暂不可用".into()
                 };
+                self.log(format!("更新检查失败：{error}"));
                 self.update_error = Some(error);
             }
         }
+        // The result can change modal geometry after its cached sizing pass.
+        // Request one settling frame only when a result was consumed.
+        ctx.request_repaint();
     }
 
     fn update_dialog(&mut self, ctx: &egui::Context) {
@@ -404,10 +410,23 @@ impl FlashApp {
                     });
                 });
                 ui.add_space(14.0);
+                if let Some(message) = &self.update_error {
+                    update_error_panel(ui, ctx, &self.update_status, message);
+                    ui.add_space(14.0);
+                }
                 // Keep the title and close action outside scrollable release details.
                 egui::ScrollArea::vertical()
                     .id_salt("update_dialog_content")
-                    .max_height((ctx.screen_rect().height() - 200.0).max(300.0))
+                    .min_scrolled_height(180.0)
+                    .max_height(
+                        (ctx.screen_rect().height()
+                            - if self.update_error.is_some() {
+                                500.0
+                            } else {
+                                200.0
+                            })
+                        .max(180.0),
+                    )
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         egui::Frame::new()
@@ -459,9 +478,16 @@ impl FlashApp {
                                 );
                                 if let Some(version) = &self.update_latest_version {
                                     ui.label(
-                                        RichText::new(format!("最新正式版本：{version}"))
-                                            .size(12.0)
-                                            .color(MUTED),
+                                        RichText::new(format!(
+                                            "{}：{version}",
+                                            if self.update_error.is_some() {
+                                                "上次确认的正式版本"
+                                            } else {
+                                                "最新正式版本"
+                                            }
+                                        ))
+                                        .size(12.0)
+                                        .color(MUTED),
                                     );
                                 }
                             });
@@ -485,10 +511,6 @@ impl FlashApp {
                         }
                         if let Some(message) = &self.update_settings_error {
                             banner(ui, message, true);
-                        }
-                        if let Some(message) = &self.update_error {
-                            ui.add_space(4.0);
-                            banner(ui, &format!("更新服务暂不可用：{message}"), true);
                         }
                         if let Some(release) = &self.update_available {
                             ui.add_space(12.0);
@@ -586,7 +608,6 @@ impl FlashApp {
             let (ports, error) = reconcile_scan_result(
                 std::mem::take(&mut self.ports),
                 result.map_err(|error| format!("串口扫描失败：{error:#}")),
-                &self.batch_port_identities,
             );
             self.ports = ports;
             self.scan_error = error;
@@ -647,6 +668,7 @@ impl FlashApp {
             .collect::<Vec<_>>()
             .join("; ");
         let expected_jobs = ports.len();
+        let batch_port_snapshots = ports.clone();
         let batch_port_identities = self
             .ports
             .iter()
@@ -662,6 +684,7 @@ impl FlashApp {
                 self.batch_firmware = batch_firmware;
                 self.batch_chip = self.selected_chip;
                 self.batch_port_identities = batch_port_identities;
+                self.batch_port_snapshots = batch_port_snapshots;
                 self.batch_started = timestamp();
                 self.batch = Some(batch);
                 self.log(
@@ -1325,7 +1348,7 @@ impl FlashApp {
             .filter(|row| row.selected && row.online)
             .count();
         ui.horizontal(|ui| {
-            panel_title(ui, Icon::Usb, "设备工位", "02");
+            panel_title(ui, Icon::Usb, "在线 COM 设备", "02");
             ui.label(
                 RichText::new(format!("在线 {online}  /  已选 {selected}"))
                     .size(11.0)
@@ -1449,7 +1472,57 @@ impl FlashApp {
                                 } else {
                                     None
                                 };
-                                device_tile(&mut uis[index], row, job, in_batch, locked);
+                                device_tile(&mut uis[index], row, job, in_batch, locked, false);
+                            }
+                        });
+                        ui.add_space(7.0);
+                    }
+                });
+        }
+        let missing_records =
+            missing_batch_jobs(&self.ports, &self.batch_port_snapshots, &self.jobs);
+        if !missing_records.is_empty() {
+            ui.add_space(9.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("本批记录 · 已离线")
+                        .size(12.0)
+                        .strong()
+                        .color(MUTED),
+                );
+                ui.label(
+                    RichText::new(format!("{} 台", missing_records.len()))
+                        .size(10.0)
+                        .color(MUTED),
+                );
+            });
+            ui.label(
+                RichText::new("以下为本批设备的只读任务记录；这些设备已从在线 COM 列表移除。")
+                    .size(10.0)
+                    .color(MUTED),
+            );
+            let columns = if ui.available_width() >= 780.0 { 3 } else { 2 };
+            egui::ScrollArea::vertical()
+                .id_salt("offline_batch_records")
+                .max_height(270.0)
+                .show(ui, |ui| {
+                    for chunk in missing_records.chunks(columns) {
+                        ui.columns(columns, |uis| {
+                            for (index, record) in chunk.iter().enumerate() {
+                                let mut history = PortRow {
+                                    port: record.port.clone(),
+                                    selected: false,
+                                    online: false,
+                                };
+                                device_tile(
+                                    &mut uis[index],
+                                    &mut history,
+                                    record.job,
+                                    true,
+                                    true,
+                                    true,
+                                );
                             }
                         });
                         ui.add_space(7.0);
@@ -1459,7 +1532,7 @@ impl FlashApp {
         ui.add_space(4.0);
         ui.label(
             RichText::new(if self.running() {
-                "本批端口已锁定。新接入设备不会加入当前批次；离线设备保留状态与进度。"
+                "本批端口已锁定。新接入设备不会加入当前批次；离线任务在只读记录中继续显示。"
             } else {
                 "新识别的端口不会自动勾选。勾选在线设备后开始烧录。"
             })
@@ -1792,7 +1865,7 @@ impl FlashApp {
 impl eframe::App for FlashApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.collect_events();
-        self.collect_update_events();
+        self.collect_update_events(ctx);
         self.poll_ports();
         let busy = self.busy();
         if ctx.input(|input| input.viewport().close_requested()) && busy {
@@ -1866,19 +1939,14 @@ impl eframe::App for FlashApp {
 fn reconcile_scan_result(
     previous: Vec<PortRow>,
     observed: Result<Vec<Port>, String>,
-    batch_ports: &BTreeMap<String, String>,
 ) -> (Vec<PortRow>, Option<String>) {
     match observed {
-        Ok(ports) => (reconcile_ports(previous, ports, batch_ports), None),
+        Ok(ports) => (reconcile_ports(previous, ports), None),
         Err(error) => (previous, Some(error)),
     }
 }
 
-fn reconcile_ports(
-    previous: Vec<PortRow>,
-    observed: Vec<Port>,
-    batch_ports: &BTreeMap<String, String>,
-) -> Vec<PortRow> {
+fn reconcile_ports(previous: Vec<PortRow>, observed: Vec<Port>) -> Vec<PortRow> {
     let mut found: HashMap<_, _> = observed
         .into_iter()
         .map(|port| ((port.name.clone(), port.identity.clone()), port))
@@ -1892,9 +1960,6 @@ fn reconcile_ports(
             }
             row.port = port;
             row.online = true;
-            rows.push(row);
-        } else if row.selected || batch_ports.get(&row.port.name) == Some(&row.port.identity) {
-            row.online = false;
             rows.push(row);
         }
     }
@@ -1917,12 +1982,37 @@ fn reconcile_ports(
     rows
 }
 
+struct MissingJob<'a> {
+    port: &'a Port,
+    job: Option<&'a JobRow>,
+}
+
+fn missing_batch_jobs<'a>(
+    online: &[PortRow],
+    snapshots: &'a [Port],
+    jobs: &'a BTreeMap<String, JobRow>,
+) -> Vec<MissingJob<'a>> {
+    snapshots
+        .iter()
+        .filter(|expected| {
+            !online
+                .iter()
+                .any(|row| row.port.name == expected.name && row.port.identity == expected.identity)
+        })
+        .map(|port| MissingJob {
+            port,
+            job: jobs.get(&port.name),
+        })
+        .collect()
+}
+
 fn device_tile(
     ui: &mut egui::Ui,
     row: &mut PortRow,
     job: Option<&JobRow>,
     in_batch: bool,
     locked: bool,
+    history: bool,
 ) {
     let progress = job.map_or(0.0, |job| job.progress);
     let stage = job.map_or_else(
@@ -1963,19 +2053,28 @@ fn device_tile(
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.add_enabled(
-                    !locked && (row.online || row.selected),
-                    egui::Checkbox::new(
-                        &mut row.selected,
+                if history {
+                    ui.label(
                         RichText::new(&row.port.name)
                             .monospace()
                             .size(15.0)
                             .strong(),
-                    ),
-                );
+                    );
+                } else {
+                    ui.add_enabled(
+                        !locked && row.online,
+                        egui::Checkbox::new(
+                            &mut row.selected,
+                            RichText::new(&row.port.name)
+                                .monospace()
+                                .size(15.0)
+                                .strong(),
+                        ),
+                    );
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        RichText::new(if row.online { "在线" } else { "离线" })
+                        RichText::new(if row.online { "在线" } else { "已离线" })
                             .size(10.0)
                             .color(if row.online { ACCENT } else { DANGER }),
                     );
@@ -2020,13 +2119,21 @@ fn device_tile(
                     .color(MUTED),
                 );
                 if in_batch {
-                    ui.label(RichText::new("本批任务").size(10.0).color(ACCENT));
+                    ui.label(
+                        RichText::new(if history {
+                            "本批记录 · 只读"
+                        } else {
+                            "本批任务"
+                        })
+                        .size(10.0)
+                        .color(ACCENT),
+                    );
                 }
             });
             let message = job
                 .map(|job| job.message.as_str())
                 .unwrap_or(if !row.online {
-                    "离线设备保留上次选择与结果"
+                    "本批设备已离线，等待任务状态更新"
                 } else if row.selected {
                     "等待开始本批烧录"
                 } else {
@@ -2360,6 +2467,46 @@ fn banner(ui: &mut egui::Ui, message: &str, error: bool) {
         });
 }
 
+fn update_error_panel(ui: &mut egui::Ui, ctx: &egui::Context, status: &str, message: &str) {
+    egui::Frame::new()
+        .fill(Color32::from_rgb(255, 239, 241))
+        .corner_radius(9.0)
+        .inner_margin(12.0)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                RichText::new("更新服务暂不可用")
+                    .size(13.0)
+                    .strong()
+                    .color(DANGER),
+            );
+            egui::ScrollArea::vertical()
+                .id_salt("update_error_details")
+                .max_height(92.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(message).size(12.0).color(DANGER)).wrap(),
+                    );
+                });
+        });
+    ui.add_space(7.0);
+    // Keep these actions outside every error/release ScrollArea.
+    ui.horizontal_wrapped(|ui| {
+        if secondary_button(ui, "复制错误详情", [124.0, 34.0]).clicked() {
+            ctx.copy_text(format!(
+                "FlashTool {}\n{}\n{}",
+                env!("CARGO_PKG_VERSION"),
+                status,
+                message
+            ));
+        }
+        if secondary_button(ui, "打开官方发布页", [140.0, 34.0]).clicked() {
+            ctx.open_url(egui::OpenUrl::new_tab(updater::RELEASES_URL));
+        }
+    });
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2451,7 +2598,10 @@ fn install_fonts(ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Port, PortRow, ScanSchedule, append_csv, reconcile_ports, reconcile_scan_result};
+    use super::{
+        JobRow, JobState, Port, PortRow, ScanSchedule, append_csv, missing_batch_jobs,
+        reconcile_ports, reconcile_scan_result,
+    };
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
 
@@ -2563,73 +2713,92 @@ mod tests {
     #[test]
     fn failed_scan_preserves_known_devices_and_selection() {
         let previous = vec![selected("COM3", "CP210x A")];
-        let (rows, error) =
-            reconcile_scan_result(previous, Err("enumeration failed".into()), &BTreeMap::new());
+        let (rows, error) = reconcile_scan_result(previous, Err("enumeration failed".into()));
         assert_eq!(error.as_deref(), Some("enumeration failed"));
         assert_eq!(rows.len(), 1);
         assert!(rows[0].online && rows[0].selected);
     }
 
     #[test]
-    fn new_or_reused_com_identity_is_not_automatically_selected() {
+    fn selected_device_is_removed_from_live_list_as_soon_as_scan_confirms_unplug() {
         let previous = vec![selected("COM3", "CP210x A")];
-        let rows = reconcile_ports(
-            previous,
-            vec![port("COM3", "CP210x B"), port("COM4", "CH343")],
-            &BTreeMap::new(),
-        );
-        let old = rows
-            .iter()
-            .find(|row| row.port.description == "CP210x A")
-            .unwrap();
-        assert!(old.selected && !old.online);
-        assert!(
-            rows.iter()
-                .filter(|row| row.online)
-                .all(|row| !row.selected)
-        );
+        let (rows, error) = reconcile_scan_result(previous, Ok(vec![]));
+        assert!(rows.is_empty());
+        assert!(error.is_none());
+    }
+
+    fn job(state: JobState, progress: f32) -> JobRow {
+        JobRow {
+            state,
+            progress,
+            message: "original task status".into(),
+            started: "started".into(),
+            finished: String::new(),
+            elapsed: None,
+            duration_secs: Some(1.25),
+        }
     }
 
     #[test]
-    fn offline_batch_device_is_retained_but_reconnection_requires_selection() {
-        let batch = BTreeMap::from([("COM7".into(), port("COM7", "ESP native USB").identity)]);
-        let previous = vec![
-            PortRow {
-                port: port("COM7", "ESP native USB"),
-                selected: false,
-                online: true,
-            },
-            selected("COM3", "CP210x A"),
-            PortRow {
-                port: port("COM9", "unused"),
-                selected: false,
-                online: true,
-            },
-        ];
-        let offline = reconcile_ports(previous, vec![], &batch);
-        assert_eq!(offline.len(), 2);
-        assert!(offline.iter().all(|row| !row.online));
-        let reconnected = reconcile_ports(offline, vec![port("COM3", "CP210x A")], &batch);
-        let restored = reconnected
-            .iter()
-            .find(|row| row.port.name == "COM3")
-            .unwrap();
-        assert!(restored.online && !restored.selected);
-        assert!(
-            reconnected
-                .iter()
-                .any(|row| row.port.name == "COM7" && !row.online)
-        );
+    fn completed_batch_unplug_disappears_from_live_com_list_but_retains_read_only_record() {
+        let snapshots = vec![port("COM3", "CP210x A")];
+        let jobs = BTreeMap::from([("COM3".into(), job(JobState::Success, 1.0))]);
+        let rows = reconcile_ports(vec![selected("COM3", "CP210x A")], vec![]);
+        assert!(rows.is_empty());
+        let records = missing_batch_jobs(&rows, &snapshots, &jobs);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].port.name, "COM3");
+        let record = records[0].job.unwrap();
+        assert_eq!(record.state, JobState::Success);
+        assert_eq!(record.progress, 1.0);
+        assert_eq!(record.duration_secs, Some(1.25));
     }
 
     #[test]
-    fn repeated_scan_deduplicates_observations_without_losing_selection() {
-        let observed = vec![port("COM3", "CP210x A"), port("COM3", "CP210x A")];
+    fn missing_active_task_keeps_its_progress_independently_of_live_device_rows() {
+        let snapshots = vec![port("COM7", "ESP native USB")];
+        let jobs = BTreeMap::from([("COM7".into(), job(JobState::Writing, 0.42))]);
+        let rows = reconcile_ports(vec![selected("COM7", "ESP native USB")], vec![]);
+        assert!(rows.is_empty());
+        let records = missing_batch_jobs(&rows, &snapshots, &jobs);
+        let record = records[0].job.unwrap();
+        assert_eq!(record.state, JobState::Writing);
+        assert_eq!(record.progress, 0.42);
+        assert_eq!(record.message, "original task status");
+        assert_eq!(jobs.len(), 1);
+    }
+
+    #[test]
+    fn reused_com_contains_only_new_device_and_does_not_inherit_selection_or_old_task() {
+        let snapshots = vec![port("COM3", "CP210x A")];
+        let jobs = BTreeMap::from([("COM3".into(), job(JobState::Failed, 0.42))]);
         let rows = reconcile_ports(
             vec![selected("COM3", "CP210x A")],
-            observed,
-            &BTreeMap::new(),
+            vec![port("COM3", "CP210x B")],
         );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].port.description, "CP210x B");
+        assert!(rows[0].online && !rows[0].selected);
+        let records = missing_batch_jobs(&rows, &snapshots, &jobs);
+        assert_eq!(records.len(), 1);
+        assert_ne!(records[0].port.identity, rows[0].port.identity);
+        assert_eq!(records[0].job.unwrap().state, JobState::Failed);
+        assert_eq!(records[0].job.unwrap().progress, 0.42);
+    }
+
+    #[test]
+    fn disconnect_then_same_identity_reconnect_requires_new_selection() {
+        let disconnected = reconcile_ports(vec![selected("COM3", "CP210x A")], vec![]);
+        assert!(disconnected.is_empty());
+        let reconnected = reconcile_ports(disconnected, vec![port("COM3", "CP210x A")]);
+        assert_eq!(reconnected.len(), 1);
+        assert!(reconnected[0].online && !reconnected[0].selected);
+    }
+
+    #[test]
+    fn repeated_scan_deduplicates_observations_without_losing_continuous_selection() {
+        let observed = vec![port("COM3", "CP210x A"), port("COM3", "CP210x A")];
+        let rows = reconcile_ports(vec![selected("COM3", "CP210x A")], observed);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].selected && rows[0].online);
     }

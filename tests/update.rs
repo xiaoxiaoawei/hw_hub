@@ -1,9 +1,9 @@
 use esp32c3_flashtool::updater::{
-    CheckResult, UpdateSettings, check_latest_from_json, load_settings_from, save_settings_at,
-    should_auto_check,
+    CheckResult, UpdateEndpoint, UpdateHttpResponse, UpdateSettings, check_latest_from_json,
+    check_latest_with_transport, load_settings_from, save_settings_at, should_auto_check,
 };
 use serde_json::{Value, json};
-use std::fs;
+use std::{collections::VecDeque, fs};
 
 fn release(version: &str, with_asset: bool) -> Value {
     let name = format!("FlashTool-v{version}-windows-x64.zip");
@@ -196,4 +196,423 @@ fn corrupt_settings_and_write_failures_are_visible_without_erasing_old_data() {
     fs::create_dir(&occupied).unwrap();
     assert!(save_settings_at(&occupied, &UpdateSettings::default()).is_err());
     assert!(occupied.is_dir());
+}
+
+// Public v0.4.2 API fields observed on 2026-11-19; unrelated API fields omitted.
+const PUBLISHED_042: &str = r##"{
+  "tag_name": "v0.4.2",
+  "html_url": "https://github.com/xiaoxiaoawei/hw_hub/releases/tag/v0.4.2",
+  "draft": false,
+  "prerelease": false,
+  "body": "- Windows 改用原生 USB 与串口接口插拔事件检测，移除固定每两秒自动扫描；空闲时不枚举串口。\n- 插拔后合并事件并执行有限次数的延迟识别，兼容串口驱动稍后就绪；保留手动刷新、批次设备身份保护和逐 COM 进度。\n- 自动检测不可用时明确提示使用手动刷新，不隐藏错误或恢复定时轮询。\n- 修复发布草稿的查询与续传，增加复用成功 Windows 构建产物的发布重试工作流。\n\nWindows x64 构建平台和验证范围见 ZIP 内 BUILD-METADATA.json；USB Hub 多设备烧录及驱动安装仍需实机验收。\n\n驱动包状态：{\"ch343\": \"embedded\", \"cp210x\": \"embedded\"}",
+  "assets": [
+    {
+      "name": "FlashTool-v0.4.2-source.zip",
+      "browser_download_url": "https://github.com/xiaoxiaoawei/hw_hub/releases/download/v0.4.2/FlashTool-v0.4.2-source.zip"
+    },
+    {
+      "name": "FlashTool-v0.4.2-windows-x64.zip",
+      "browser_download_url": "https://github.com/xiaoxiaoawei/hw_hub/releases/download/v0.4.2/FlashTool-v0.4.2-windows-x64.zip"
+    },
+    {
+      "name": "SHA256SUMS",
+      "browser_download_url": "https://github.com/xiaoxiaoawei/hw_hub/releases/download/v0.4.2/SHA256SUMS"
+    }
+  ]
+}"##;
+
+fn response(status: u16, body: impl Into<Vec<u8>>, location: Option<&str>) -> UpdateHttpResponse {
+    UpdateHttpResponse {
+        status,
+        body: body.into(),
+        location: location.map(str::to_owned),
+    }
+}
+
+fn latest_redirect() -> UpdateHttpResponse {
+    response(
+        302,
+        Vec::new(),
+        Some("https://github.com/xiaoxiaoawei/hw_hub/releases/tag/v0.4.2"),
+    )
+}
+
+// Real expanded_assets/v0.4.2 markup shape, limited to its Windows asset anchor.
+const WINDOWS_042_HTML: &str = r#"
+<div data-view-component="true" class="Box Box--condensed tmp-mt-3">
+  <ul data-view-component="true"><li class="Box-row">
+    <a href="/xiaoxiaoawei/hw_hub/releases/download/v0.4.2/FlashTool-v0.4.2-windows-x64.zip" rel="nofollow" data-turbo="false" class="wb-break-all">
+      FlashTool-v0.4.2-windows-x64.zip
+    </a>
+  </li></ul>
+</div>
+"#;
+
+fn replay(
+    current: &str,
+    replies: Vec<(UpdateEndpoint, anyhow::Result<UpdateHttpResponse>)>,
+) -> anyhow::Result<CheckResult> {
+    let mut replies = VecDeque::from(replies);
+    let result = check_latest_with_transport(current, |endpoint| {
+        let (expected, response) = replies.pop_front().expect("unexpected network request");
+        assert_eq!(
+            endpoint, expected,
+            "request must use only the expected official endpoint"
+        );
+        response
+    });
+    assert!(replies.is_empty(), "expected requests were not exercised");
+    result
+}
+
+fn fallback_replies(
+    api: anyhow::Result<UpdateHttpResponse>,
+    latest: UpdateHttpResponse,
+    assets: UpdateHttpResponse,
+) -> Vec<(UpdateEndpoint, anyhow::Result<UpdateHttpResponse>)> {
+    vec![
+        (UpdateEndpoint::ApiLatest, api),
+        (UpdateEndpoint::WebsiteLatest, Ok(latest)),
+        (
+            UpdateEndpoint::ExpandedAssets {
+                tag: "v0.4.2".into(),
+            },
+            Ok(assets),
+        ),
+    ]
+}
+
+#[test]
+fn real_published_042_sample_is_up_to_date_without_any_fallback_or_downgrade() {
+    for current in ["0.4.2", "0.4.3"] {
+        assert_eq!(
+            replay(
+                current,
+                vec![(
+                    UpdateEndpoint::ApiLatest,
+                    Ok(response(200, PUBLISHED_042, None))
+                )]
+            )
+            .unwrap(),
+            CheckResult::UpToDate {
+                latest_version: "0.4.2".into()
+            }
+        );
+    }
+}
+
+#[test]
+fn transient_api_failures_use_only_verified_official_latest_and_asset_proof() {
+    for status in [403, 429, 500, 502, 503, 504] {
+        assert_eq!(
+            replay(
+                "0.4.2",
+                fallback_replies(
+                    Ok(response(status, Vec::new(), None)),
+                    latest_redirect(),
+                    response(200, WINDOWS_042_HTML, None),
+                )
+            )
+            .unwrap(),
+            CheckResult::UpToDate {
+                latest_version: "0.4.2".into()
+            }
+        );
+    }
+    let CheckResult::Available(update) = replay(
+        "0.4.1",
+        fallback_replies(
+            Err(anyhow::anyhow!("WinHTTP 12029: cannot connect")),
+            latest_redirect(),
+            response(200, WINDOWS_042_HTML, None),
+        ),
+    )
+    .unwrap() else {
+        panic!("verified newer release should be available");
+    };
+    assert_eq!(update.version, "0.4.2");
+    assert_eq!(
+        update.release_url,
+        "https://github.com/xiaoxiaoawei/hw_hub/releases/tag/v0.4.2"
+    );
+    assert_eq!(
+        update.download_url.as_deref(),
+        Some(
+            "https://github.com/xiaoxiaoawei/hw_hub/releases/download/v0.4.2/FlashTool-v0.4.2-windows-x64.zip"
+        )
+    );
+    assert!(update.notes.is_empty());
+}
+
+#[test]
+fn an_api_recovery_on_the_next_manual_check_needs_no_preference_or_state_change() {
+    let mut replies = VecDeque::from(fallback_replies(
+        Err(anyhow::anyhow!("temporary DNS failure")),
+        latest_redirect(),
+        response(200, WINDOWS_042_HTML, None),
+    ));
+    replies.push_back((
+        UpdateEndpoint::ApiLatest,
+        Ok(response(200, PUBLISHED_042, None)),
+    ));
+    let mut transport = |endpoint| {
+        let (expected, response) = replies.pop_front().expect("unexpected request");
+        assert_eq!(endpoint, expected);
+        response
+    };
+    for _ in 0..2 {
+        assert_eq!(
+            check_latest_with_transport("0.4.2", &mut transport).unwrap(),
+            CheckResult::UpToDate {
+                latest_version: "0.4.2".into()
+            }
+        );
+    }
+    assert!(replies.is_empty());
+}
+
+#[test]
+fn api_not_found_requires_website_confirmation_and_network_errors_stay_errors() {
+    assert_eq!(
+        replay(
+            "0.4.2",
+            vec![
+                (
+                    UpdateEndpoint::ApiLatest,
+                    Ok(response(404, Vec::new(), None))
+                ),
+                (
+                    UpdateEndpoint::WebsiteLatest,
+                    Ok(response(404, Vec::new(), None))
+                ),
+            ]
+        )
+        .unwrap(),
+        CheckResult::NoPublishedRelease
+    );
+    for api in [
+        Ok(response(404, Vec::new(), None)),
+        Err(anyhow::anyhow!("API DNS failure")),
+    ] {
+        let error = replay(
+            "0.4.2",
+            vec![
+                (UpdateEndpoint::ApiLatest, api),
+                (
+                    UpdateEndpoint::WebsiteLatest,
+                    Err(anyhow::anyhow!("website WinHTTP 12002 timeout")),
+                ),
+            ],
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("GitHub API")
+                && message.contains("GitHub 官网")
+                && message.contains("12002")
+        );
+        assert!(message.contains("HTTP 404") || message.contains("API DNS failure"));
+    }
+    assert!(
+        replay(
+            "0.4.2",
+            vec![
+                (
+                    UpdateEndpoint::ApiLatest,
+                    Err(anyhow::anyhow!("API connection failure"))
+                ),
+                (
+                    UpdateEndpoint::WebsiteLatest,
+                    Ok(response(404, Vec::new(), None))
+                ),
+            ]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn invalid_or_unsafe_successful_api_data_never_triggers_website_fallback() {
+    let mut inputs = vec!["not JSON".to_owned(), "{}".to_owned()];
+    for flag in ["draft", "prerelease"] {
+        let mut input = release("0.4.2", true);
+        input[flag] = true.into();
+        inputs.push(input.to_string());
+    }
+    let mut input = release("0.4.2", true);
+    input["html_url"] = "https://github.com/someone/other/releases/tag/v0.4.2".into();
+    inputs.push(input.to_string());
+    for input in inputs {
+        assert!(
+            replay(
+                "0.4.2",
+                vec![(UpdateEndpoint::ApiLatest, Ok(response(200, input, None)))]
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        replay(
+            "0.4.2",
+            vec![(
+                UpdateEndpoint::ApiLatest,
+                Ok(response(302, Vec::new(), Some("https://evil.example/")))
+            )]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn fallback_rejects_unsafe_nonstable_or_missing_latest_redirects_before_fetching_assets() {
+    for location in [
+        None,
+        Some("http://github.com/xiaoxiaoawei/hw_hub/releases/tag/v0.4.2"),
+        Some("https://github.com.evil.example/xiaoxiaoawei/hw_hub/releases/tag/v0.4.2"),
+        Some("https://github.com@evil.example/xiaoxiaoawei/hw_hub/releases/tag/v0.4.2"),
+        Some("//evil.example/xiaoxiaoawei/hw_hub/releases/tag/v0.4.2"),
+        Some("https://github.com/someone/other/releases/tag/v0.4.2"),
+        Some("https://github.com/xiaoxiaoawei/hw_hub/releases/edit/v0.4.2"),
+        Some("https://github.com/xiaoxiaoawei/hw_hub/releases/tag/v0.4.2-rc.1"),
+        Some("https://github.com/xiaoxiaoawei/hw_hub/releases/tag/v0.4.2+build"),
+        Some("https://github.com/xiaoxiaoawei/hw_hub/releases/tag/v00.4.2"),
+        Some("https://github.com/xiaoxiaoawei/hw_hub/releases/tag/v0.4.2?redirect=evil"),
+        Some("https://github.com/xiaoxiaoawei/hw_hub/releases/tag/v0.4.2/../v0.5.0"),
+    ] {
+        assert!(
+            replay(
+                "0.4.2",
+                vec![
+                    (
+                        UpdateEndpoint::ApiLatest,
+                        Ok(response(429, Vec::new(), None))
+                    ),
+                    (
+                        UpdateEndpoint::WebsiteLatest,
+                        Ok(response(302, Vec::new(), location))
+                    ),
+                ]
+            )
+            .is_err(),
+            "must reject {location:?}"
+        );
+    }
+    for status in [200, 403, 404, 429, 500] {
+        // HTML labelled Draft is never accepted as a latest-release proof.
+        assert!(
+            replay(
+                "0.4.2",
+                vec![
+                    (
+                        UpdateEndpoint::ApiLatest,
+                        Ok(response(503, Vec::new(), None))
+                    ),
+                    (
+                        UpdateEndpoint::WebsiteLatest,
+                        Ok(response(status, "<span>Draft</span>", None))
+                    ),
+                ]
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn fallback_asset_proof_is_canonical_unique_and_never_redirected_or_extracted_from_text() {
+    let relative = "/xiaoxiaoawei/hw_hub/releases/download/v0.4.2/FlashTool-v0.4.2-windows-x64.zip";
+    for html in [
+        "<div>Draft</div>".to_owned(),
+        format!("<!-- <a href=\"{relative}\">fake</a> -->"),
+        format!("<script>const s = '<a href=\"{relative}\">fake</a>';</script>"),
+        format!("<template><a href=\"{relative}\">fake</a></template>"),
+        format!("<a data-href=\"{relative}\">fake</a>"),
+        format!("<a href={relative}>unquoted</a>"),
+        format!("<a href=\"https://evil.example{relative}\">wrong host</a>"),
+        format!("<a href=\"{relative}?redirect=evil\">query</a>"),
+        WINDOWS_042_HTML.replace("xiaoxiaoawei/hw_hub", "someone/other"),
+        WINDOWS_042_HTML.repeat(2),
+        format!("<a href=\"{relative}\" href=\"https://evil.example\">ambiguous</a>"),
+        format!("<a href=\"{relative}"),
+    ] {
+        assert!(
+            replay(
+                "0.4.1",
+                fallback_replies(
+                    Ok(response(403, Vec::new(), None)),
+                    latest_redirect(),
+                    response(200, html.as_bytes(), None),
+                )
+            )
+            .is_err(),
+            "must reject {html}"
+        );
+    }
+    for status in [302, 404, 503] {
+        assert!(
+            replay(
+                "0.4.1",
+                fallback_replies(
+                    Ok(response(403, Vec::new(), None)),
+                    latest_redirect(),
+                    response(status, WINDOWS_042_HTML, Some("https://evil.example/")),
+                )
+            )
+            .is_err()
+        );
+    }
+    let reordered = format!("<a rel='nofollow' HREF = '{relative}' class='asset'>Windows</a>");
+    assert!(matches!(
+        replay(
+            "0.4.1",
+            fallback_replies(
+                Ok(response(429, Vec::new(), None)),
+                response(
+                    302,
+                    Vec::new(),
+                    Some("/xiaoxiaoawei/hw_hub/releases/tag/v0.4.2")
+                ),
+                response(200, reordered, None),
+            )
+        )
+        .unwrap(),
+        CheckResult::Available(_)
+    ));
+}
+
+#[test]
+fn fallback_responses_remain_bounded_and_require_utf8() {
+    for assets in [
+        response(200, vec![b'x'; 1024 * 1024 + 1], None),
+        response(200, vec![0xff], None),
+    ] {
+        assert!(
+            replay(
+                "0.4.2",
+                fallback_replies(
+                    Err(anyhow::anyhow!("API network failure")),
+                    latest_redirect(),
+                    assets,
+                )
+            )
+            .is_err()
+        );
+    }
+    let oversized_location = "x".repeat(8193);
+    assert!(
+        replay(
+            "0.4.2",
+            vec![
+                (
+                    UpdateEndpoint::ApiLatest,
+                    Ok(response(503, Vec::new(), None))
+                ),
+                (
+                    UpdateEndpoint::WebsiteLatest,
+                    Ok(response(302, Vec::new(), Some(&oversized_location)))
+                ),
+            ]
+        )
+        .is_err()
+    );
 }

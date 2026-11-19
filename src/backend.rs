@@ -29,8 +29,7 @@ pub struct Port {
 
 /// A recognized adapter is suggested in the UI; selection remains explicit.
 pub fn list_ports() -> Result<Vec<Port>> {
-    let mut ports: Vec<_> = serialport::available_ports()
-        .context("无法枚举串口，请检查操作系统设备管理器")?
+    let mut ports: Vec<_> = available_port_infos()?
         .into_iter()
         .map(describe_port)
         .collect();
@@ -40,6 +39,175 @@ pub fn list_ports() -> Result<Vec<Port>> {
             .then_with(|| a.name.cmp(&b.name))
     });
     Ok(ports)
+}
+
+fn available_port_infos() -> Result<Vec<SerialPortInfo>> {
+    let ports = serialport::available_ports().context("无法枚举串口，请检查操作系统设备管理器")?;
+    #[cfg(windows)]
+    let ports = retain_present_ports(ports, present_ports::names())?;
+    Ok(ports)
+}
+
+#[cfg(any(windows, test))]
+fn retain_present_ports(
+    ports: Vec<SerialPortInfo>,
+    present_names: Result<std::collections::HashSet<String>>,
+) -> Result<Vec<SerialPortInfo>> {
+    let present: std::collections::HashSet<_> = present_names
+        .context("无法确认 Windows 当前在线串口；保留上次设备状态")?
+        .into_iter()
+        .map(|name| port_name_key(&name))
+        .collect();
+    // serialport 4.10.1 supplements its DIGCF_PRESENT enumeration with raw
+    // SERIALCOMM registry entries. Those can outlive a removal notification.
+    // Intersect every entry with actual present device nodes, without probing
+    // or opening COM ports. A genuinely present Unknown port stays available.
+    Ok(ports
+        .into_iter()
+        .filter(|port| present.contains(&port_name_key(&port.port_name)))
+        .collect())
+}
+
+#[cfg(windows)]
+mod present_ports {
+    use anyhow::{Context, Result, bail, ensure};
+    use std::{
+        collections::HashSet,
+        mem,
+        ptr::{null, null_mut},
+    };
+    use windows_sys::Win32::{
+        Devices::DeviceAndDriverInstallation::{
+            CM_Get_DevNode_Status, CR_SUCCESS, DICS_FLAG_GLOBAL, DIGCF_PRESENT, DIREG_DEV,
+            GUID_DEVCLASS_MODEM, GUID_DEVCLASS_PORTS, HDEVINFO, SP_DEVINFO_DATA,
+            SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
+            SetupDiOpenDevRegKey,
+        },
+        Foundation::{
+            ERROR_FILE_NOT_FOUND, ERROR_KEY_DOES_NOT_EXIST, ERROR_NO_MORE_ITEMS,
+            ERROR_PATH_NOT_FOUND, INVALID_HANDLE_VALUE,
+        },
+        System::Registry::{HKEY, KEY_QUERY_VALUE, REG_SZ, RegCloseKey, RegQueryValueExW},
+    };
+
+    struct DeviceSet(HDEVINFO);
+    impl Drop for DeviceSet {
+        fn drop(&mut self) {
+            unsafe {
+                SetupDiDestroyDeviceInfoList(self.0);
+            }
+        }
+    }
+
+    struct DeviceKey(HKEY);
+    impl Drop for DeviceKey {
+        fn drop(&mut self) {
+            unsafe {
+                RegCloseKey(self.0);
+            }
+        }
+    }
+
+    pub(super) fn names() -> Result<HashSet<String>> {
+        let mut names = HashSet::new();
+        for class in [GUID_DEVCLASS_PORTS, GUID_DEVCLASS_MODEM] {
+            let raw = unsafe { SetupDiGetClassDevsW(&class, null(), null_mut(), DIGCF_PRESENT) };
+            if raw == INVALID_HANDLE_VALUE as HDEVINFO {
+                return Err(std::io::Error::last_os_error())
+                    .context("无法读取当前在线的 Ports/Modem 设备集合");
+            }
+            let devices = DeviceSet(raw);
+            let mut index = 0u32;
+            loop {
+                let mut device: SP_DEVINFO_DATA = unsafe { mem::zeroed() };
+                device.cbSize = mem::size_of::<SP_DEVINFO_DATA>() as u32;
+                if unsafe { SetupDiEnumDeviceInfo(devices.0, index, &mut device) } == 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(ERROR_NO_MORE_ITEMS as i32) {
+                        break;
+                    }
+                    return Err(error).context("枚举当前在线串口设备失败");
+                }
+                let (mut status, mut problem) = (0u32, 0u32);
+                let result =
+                    unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, device.DevInst, 0) };
+                ensure!(
+                    result == CR_SUCCESS,
+                    "读取当前串口设备状态失败（CM 错误 0x{result:X}）"
+                );
+                // Match serialport's healthy-device policy, including Unknown
+                // entries obtained from SERIALCOMM after the primary scan.
+                if problem == 0
+                    && let Some(name) = port_name(&devices, &device)?
+                {
+                    names.insert(name);
+                }
+                index = index.checked_add(1).context("在线设备数量超出支持范围")?;
+            }
+        }
+        Ok(names)
+    }
+
+    fn port_name(devices: &DeviceSet, device: &SP_DEVINFO_DATA) -> Result<Option<String>> {
+        let raw = unsafe {
+            SetupDiOpenDevRegKey(
+                devices.0,
+                device,
+                DICS_FLAG_GLOBAL,
+                0,
+                DIREG_DEV,
+                KEY_QUERY_VALUE,
+            )
+        };
+        if raw == INVALID_HANDLE_VALUE {
+            let error = std::io::Error::last_os_error();
+            // Some present Ports/Modem nodes are controllers or have not been
+            // assigned a port. A missing key/value is not a failed full scan.
+            if matches!(error.raw_os_error(), Some(code) if code == ERROR_FILE_NOT_FOUND as i32 || code == ERROR_PATH_NOT_FOUND as i32 || code == ERROR_KEY_DOES_NOT_EXIST as i32)
+            {
+                return Ok(None);
+            }
+            return Err(error).context("无法读取在线设备的 PortName 注册表项");
+        }
+        let key = DeviceKey(raw);
+        let value_name: Vec<_> = "PortName".encode_utf16().chain(Some(0)).collect();
+        let mut buffer = [0u16; 256];
+        let mut byte_len = mem::size_of_val(&buffer) as u32;
+        let mut value_type = 0;
+        let result = unsafe {
+            RegQueryValueExW(
+                key.0,
+                value_name.as_ptr(),
+                null(),
+                &mut value_type,
+                buffer.as_mut_ptr().cast(),
+                &mut byte_len,
+            )
+        };
+        if matches!(result, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) {
+            return Ok(None);
+        }
+        if result != 0 {
+            return Err(std::io::Error::from_raw_os_error(result as i32))
+                .context("读取在线设备的 PortName 失败");
+        }
+        ensure!(
+            value_type == REG_SZ
+                && byte_len.is_multiple_of(2)
+                && byte_len as usize <= mem::size_of_val(&buffer),
+            "在线设备的 PortName 类型或长度无效"
+        );
+        let name = String::from_utf16(&buffer[..byte_len as usize / 2])
+            .context("在线设备的 PortName 不是有效 UTF-16")?;
+        let name = name.trim_end_matches('\0');
+        if name.is_empty() {
+            return Ok(None);
+        }
+        if name.contains('\0') {
+            bail!("在线设备的 PortName 含有无效的空字符");
+        }
+        Ok(Some(name.to_owned()))
+    }
 }
 
 fn port_number(name: &str) -> Option<u32> {
@@ -175,8 +343,8 @@ fn flash_impl(
 
     // Preserve USB PID metadata: espflash uses it to choose native USB reset
     // sequences for USB Serial/JTAG, versus DTR/RTS for USB-UART adapters.
-    let info = serialport::available_ports()
-        .context("连接前无法重新枚举串口")?
+    let info = available_port_infos()
+        .context("连接前无法重新枚举在线串口")?
         .into_iter()
         .find(|info| port_name_key(&info.port_name) == port_name_key(port))
         .with_context(|| format!("串口 {port} 已断开或不存在，请刷新设备列表"))?;
@@ -428,6 +596,72 @@ mod tests {
                 product: Some("CP210x".into()),
             }),
         }
+    }
+
+    fn present(names: &[&str]) -> Result<std::collections::HashSet<String>> {
+        Ok(names.iter().map(|name| (*name).to_owned()).collect())
+    }
+
+    #[test]
+    fn excludes_registry_only_ghost_com_without_dropping_present_usb() {
+        let ghost = SerialPortInfo {
+            port_name: "COM99".into(),
+            port_type: SerialPortType::Unknown,
+        };
+        let ports =
+            retain_present_ports(vec![usb_info("COM3", Some("A")), ghost], present(&["COM3"]))
+                .unwrap();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].port_name, "COM3");
+        assert!(matches!(ports[0].port_type, SerialPortType::UsbPort(_)));
+    }
+
+    #[test]
+    fn preserves_an_unknown_port_confirmed_by_present_device_metadata() {
+        let unknown = SerialPortInfo {
+            port_name: "COM7".into(),
+            port_type: SerialPortType::Unknown,
+        };
+        let ports = retain_present_ports(
+            vec![unknown, usb_info("COM3", Some("A"))],
+            present(&["COM7"]),
+        )
+        .unwrap();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].port_name, "COM7");
+        assert!(matches!(ports[0].port_type, SerialPortType::Unknown));
+    }
+
+    #[test]
+    fn unplugged_usb_does_not_reappear_as_registry_unknown_before_reinsertion() {
+        let connected =
+            retain_present_ports(vec![usb_info("COM3", Some("original"))], present(&["COM3"]))
+                .unwrap();
+        let original = describe_port(connected[0].clone());
+        let stale_registry = SerialPortInfo {
+            port_name: "COM3".into(),
+            port_type: SerialPortType::Unknown,
+        };
+        let removed = retain_present_ports(vec![stale_registry], present(&[])).unwrap();
+        assert!(removed.is_empty());
+        let reinserted = retain_present_ports(
+            vec![usb_info("COM3", Some("replacement"))],
+            present(&["COM3"]),
+        )
+        .unwrap();
+        let replacement = describe_port(reinserted[0].clone());
+        assert_eq!(original.name, replacement.name);
+        assert_ne!(original.identity, replacement.identity);
+    }
+
+    #[test]
+    fn failed_present_device_query_is_not_reported_as_a_successful_empty_scan() {
+        let result = retain_present_ports(
+            vec![usb_info("COM3", Some("A"))],
+            Err(anyhow::anyhow!("mock registry access denied")),
+        );
+        let error = result.unwrap_err();
+        assert!(format!("{error:#}").contains("mock registry access denied"));
     }
 
     #[test]
