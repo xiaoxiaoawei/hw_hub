@@ -2,6 +2,7 @@ mod device_read;
 mod firmware_drop;
 mod settings;
 mod software_update;
+mod startup_log;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -31,6 +32,7 @@ use esp32c3_flashtool::{
     updater::{self, CheckResult, ReleaseUpdate, UpdateSettings},
 };
 use firmware_drop::FirmwareFileDrop;
+use startup_log::StartupLogTask;
 
 const ACCENT: Color32 = Color32::from_rgb(22, 139, 245);
 const ACCENT_LIGHT: Color32 = Color32::from_rgb(29, 52, 74);
@@ -116,6 +118,14 @@ struct DeviceLogBook {
 }
 
 impl DeviceLogBook {
+    fn key_for_port(&self, port: &Port) -> DeviceLogKey {
+        self.current_keys
+            .get(&port.name)
+            .filter(|key| key.identity == port.identity)
+            .cloned()
+            .unwrap_or_else(|| DeviceLogKey::from_port(port, ""))
+    }
+
     fn begin_batch(&mut self, ports: &[Port], batch: &str, chip: &str, firmware: &str) {
         self.begin_run(ports, batch, &format!("{chip} · SHA256 {firmware}"), true);
     }
@@ -150,9 +160,13 @@ impl DeviceLogBook {
     }
 
     fn append_history(&mut self, port: &str, line: String) {
-        let Some(key) = self.current_keys.get(port) else {
+        let Some(key) = self.current_keys.get(port).cloned() else {
             return;
         };
+        self.append_history_for(&key, line);
+    }
+
+    fn append_history_for(&mut self, key: &DeviceLogKey, line: String) {
         let history = self.history.entry(key.clone()).or_default();
         history.push_back(line);
         while history.len() > 10_000 {
@@ -297,6 +311,8 @@ pub struct FlashApp {
     logs: VecDeque<String>,
     device_logs: DeviceLogBook,
     log_windows: BTreeSet<DeviceLogKey>,
+    startup_log: Option<StartupLogTask>,
+    startup_log_baud: String,
     batch_summary_logged: bool,
     batch_id: String,
     batch_started_at: String,
@@ -442,6 +458,8 @@ impl FlashApp {
             logs: VecDeque::new(),
             device_logs: DeviceLogBook::default(),
             log_windows: BTreeSet::new(),
+            startup_log: None,
+            startup_log_baud: "115200".into(),
             batch_summary_logged: true,
             batch_id: String::new(),
             batch_started_at: String::new(),
@@ -519,7 +537,7 @@ impl FlashApp {
     }
 
     fn busy(&self) -> bool {
-        self.running() || self.driver_busy || self.installer_preparing
+        self.running() || self.startup_log.is_some() || self.driver_busy || self.installer_preparing
     }
 
     fn scan_ports(&mut self) {
@@ -1037,6 +1055,46 @@ impl FlashApp {
                         });
                     });
                     ui.separator();
+                    let reading_startup = self.startup_log_running(&key);
+                    if reading_startup || self.startup_log_available(&key) {
+                        ui.push_id(("startup_log_toolbar", &key), |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if reading_startup {
+                                    ui.spinner();
+                                    ui.label(
+                                        RichText::new("正在读取启动日志").size(12.0).color(MUTED),
+                                    );
+                                    if secondary_button(ui, "停止读取", [88.0, 30.0]).clicked()
+                                    {
+                                        self.cancel_startup_log(&key);
+                                    }
+                                } else {
+                                    let locked = self.busy();
+                                    ui.label(RichText::new("波特率").size(12.0).color(MUTED));
+                                    ui.add_enabled_ui(!locked, |ui| {
+                                        baud_editor(
+                                            ui,
+                                            &mut self.startup_log_baud,
+                                            "startup_log_baud",
+                                            1,
+                                        );
+                                    });
+                                    let baud = parse_baud_input(&self.startup_log_baud, 1).ok();
+                                    if ui
+                                        .add_enabled_ui(!locked && baud.is_some(), |ui| {
+                                            primary_button(ui, "复位并读取启动日志", [184.0, 32.0])
+                                        })
+                                        .inner
+                                        .clicked()
+                                        && let Some(baud) = baud
+                                    {
+                                        self.start_startup_log(&key, baud);
+                                    }
+                                }
+                            });
+                        });
+                        ui.separator();
+                    }
                     let body_size = ui.available_size().max(egui::Vec2::splat(1.0));
                     egui::ScrollArea::both()
                         .id_salt(("detailed_log", &key))
@@ -1067,6 +1125,7 @@ impl FlashApp {
                         });
                 });
             if close || !open {
+                self.cancel_startup_log(&key);
                 self.log_windows.remove(&key);
             }
         }
@@ -1916,7 +1975,7 @@ impl FlashApp {
             let columns = if ui.available_width() >= 780.0 { 3 } else { 2 };
             let jobs = &self.jobs;
             let batch_ports = &self.batch_port_identities;
-            let log_keys = &self.device_logs.current_keys;
+            let device_logs = &self.device_logs;
             egui::ScrollArea::vertical()
                 .id_salt("device_workstations")
                 .max_height(360.0)
@@ -1932,12 +1991,7 @@ impl FlashApp {
                                     None
                                 };
                                 if device_tile(&mut uis[index], row, job, in_batch, locked, false) {
-                                    let key = log_keys
-                                        .get(&row.port.name)
-                                        .filter(|key| key.identity == row.port.identity)
-                                        .cloned()
-                                        .unwrap_or_else(|| DeviceLogKey::from_port(&row.port, ""));
-                                    requested_logs.push(key);
+                                    requested_logs.push(device_logs.key_for_port(&row.port));
                                 }
                             }
                         });
@@ -2063,6 +2117,8 @@ impl FlashApp {
                     "正在读取日志…"
                 } else if running {
                     "批次正在运行…"
+                } else if self.startup_log.is_some() {
+                    "正在读取启动日志…"
                 } else if self.driver_busy {
                     "等待驱动安装…"
                 } else {
@@ -2325,6 +2381,7 @@ impl FlashApp {
 impl eframe::App for FlashApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.collect_events();
+        self.poll_startup_log();
         self.poll_records();
         self.collect_update_events(ctx);
         self.poll_self_update(ctx);

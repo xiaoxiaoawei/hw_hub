@@ -16,6 +16,8 @@
 4. **开始批量烧录**：每台独立连接、检查 Flash 容量、压缩写入、MD5 校验并复位。ESP32-C3 连接后还会自动只读获取可选的 128 位设备 ID。仅全部烧录步骤成功后标记成功；单台失败不影响其他设备。
 5. **查看日志与保存结果**。每个 COM 口独立显示进度、状态和耗时。点击设备卡片的终端按钮打开日志窗口，可复制日志或拖动窗口边缘调整宽高。底部“烧录汇总”显示设备结果和批次汇总。“清空汇总”保留设备日志及任务结果。每台任务结束后自动保存独立 CSV。批次结束后可导出汇总。
 
+在在线 COM 的日志窗口点击「复位并读取启动日志」。波特率默认 115200，可选择或输入。原始输出会追加到该窗口，最多读取 10 秒，也可点击「停止读取」。一次可操作一个串口，采集时暂停烧录、批量读取和驱动安装。USB-UART 需要支持 DTR/RTS 与板卡 BOOT/EN 的自动复位电路。原生 USB 复位可能触发端口重新枚举。
+
 支持 1–16 台同时烧录，更多设备排队处理。默认并发 4 台，烧录波特率为 460800，可从常用速率中选择或填写不低于 115200 的整数。“停止排队”取消尚未开始的设备，正在写入的设备会继续完成校验。
 
 ESP32-C3 烧录会从 `ESP_EFUSE_OPTIONAL_UNIQUE_ID` 读取 16 字节，按固件读取顺序编码为 32 个大写十六进制字符。值自动进入本台 COM 日志、独立 CSV、整批导出和可选 POST 的 `custom_fields.unique_device_id`。字段为全零或读取失败时，烧录日志会记录原因。
@@ -110,11 +112,11 @@ cargo run --locked
 python3 scripts/bump-version.py --help
 python3 scripts/bump-version.py --check
 # 先为下一版本写好 CHANGELOG，再预演并更新版本：
-python3 scripts/bump-version.py 0.5.6 --dry-run
-python3 scripts/bump-version.py 0.5.6
+python3 scripts/bump-version.py 0.5.7 --dry-run
+python3 scripts/bump-version.py 0.5.7
 ```
 
-提交并验证新版本后创建对应 Git 标签，例如 `git tag -a v0.5.6 -m "FlashTool v0.5.6"`，再推送分支和标签以触发发布。标签必须与 Cargo 版本相同。每次修复使用新版本和标签。
+提交并验证新版本后创建对应 Git 标签，例如 `git tag -a v0.5.7 -m "FlashTool v0.5.7"`，再推送分支和标签以触发发布。标签必须与 Cargo 版本相同。每次修复使用新版本和标签。
 
 GitHub Actions 验证 `vX.Y.Z` 标签与 Cargo 版本一致，通过格式、静态检查和测试后在 Windows 构建。正式 Release 统一使用 `FlashTool vX.Y.Z` 标题，上传版本 ZIP、源码 ZIP 和 SHA256 校验文件，验证成功后才发布并标记 Latest。已发布标签及附件保持不变；可手动选择只构建或发布一个已存在的版本标签。Latest 保持指向较高的正式版本，补发旧版本时保留更新版本的 Latest 标记。
 

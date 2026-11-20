@@ -98,6 +98,36 @@ pub fn capture(
     cancel: &AtomicBool,
     callback: &mut dyn FnMut(CaptureEvent) -> bool,
 ) -> Result<CaptureSummary> {
+    capture_impl(expected, options, cancel, callback, false)
+}
+
+/// Reset this frozen device into normal firmware boot, then listen for up to
+/// ten seconds. The native handle is open before the pulse and RX is never
+/// purged. A compatible UART reset circuit maps deasserted DTR to released
+/// GPIO9 and RTS to EN. Arbitrary/custom wiring cannot be inferred from VID/PID.
+/// Native Espressif USB keeps its dedicated reset sequence; if it disappears,
+/// this operation reports the error rather than rebinding a different device.
+pub fn capture_startup_log(
+    expected: &Port,
+    baud: u32,
+    cancel: &AtomicBool,
+    callback: &mut dyn FnMut(CaptureEvent) -> bool,
+) -> Result<CaptureSummary> {
+    let options = CaptureOptions {
+        baud,
+        reset: true,
+        ..CaptureOptions::default()
+    };
+    capture_impl(expected, &options, cancel, callback, true)
+}
+
+fn capture_impl(
+    expected: &Port,
+    options: &CaptureOptions,
+    cancel: &AtomicBool,
+    callback: &mut dyn FnMut(CaptureEvent) -> bool,
+    startup_reset: bool,
+) -> Result<CaptureSummary> {
     validate_options(options)?;
     if cancel.load(Ordering::Acquire) {
         return Ok(empty_summary(CaptureEnd::Cancelled));
@@ -121,6 +151,13 @@ pub fn capture(
                 actual.name
             )
         })?;
+    if startup_reset {
+        // Opening can race a hotplug/reassignment after the first snapshot.
+        // Revalidate the full frozen identity before any explicit modem pulse.
+        // Keep the handle; do not retry or bind a newly enumerated replacement.
+        let after_open = backend::list_ports().context("打开后无法再次确认启动复位设备身份")?;
+        expected_port(expected, &after_open)?;
+    }
     if !callback(CaptureEvent::Opened) {
         return Ok(empty_summary(CaptureEnd::Stopped));
     }
@@ -131,21 +168,143 @@ pub fn capture(
         if !callback(CaptureEvent::Resetting) {
             return Ok(empty_summary(CaptureEnd::Stopped));
         }
-        // In fixed espflash 4.7.0, Connection::new only stores settings and
-        // reset() calls reset_after_flash(): modem controls + short sleeps.
-        // Do not call begin/reset_to_flash/sync/command on this connection.
-        let mut connection = Connection::new(
-            serial,
-            reset_usb_info(actual),
-            ResetAfterOperation::HardReset,
-            ResetBeforeOperation::NoResetNoSync,
-            options.baud,
-        );
-        connection.reset().with_context(|| format!("{} 显式复位失败；该端口可能不支持 DTR/RTS 或已重新枚举。请关闭自动复位，手动按复位键后重试", actual.name))?;
-        serial = connection.into_serial();
+        if startup_reset {
+            let native_usb = reset_usb_info(actual).pid == 0x1001;
+            let outcome = startup_reset_lines(&mut serial, native_usb, cancel, thread::sleep)
+                .with_context(|| {
+                    format!(
+                        "{} 启动复位失败。请检查自动复位接线。原生 USB 端口可能已重新枚举",
+                        actual.name
+                    )
+                })?;
+            if outcome == ResetOutcome::Cancelled {
+                return Ok(empty_summary(CaptureEnd::Cancelled));
+            }
+        } else {
+            // Preserve the existing batch-read reset behavior. In pinned
+            // espflash 4.7.0 this only changes modem controls and sleeps.
+            // Do not call begin/reset_to_flash/sync/command on the connection.
+            let mut connection = Connection::new(
+                serial,
+                reset_usb_info(actual),
+                ResetAfterOperation::HardReset,
+                ResetBeforeOperation::NoResetNoSync,
+                options.baud,
+            );
+            connection.reset().with_context(|| format!("{} 显式复位失败；该端口可能不支持 DTR/RTS 或已重新枚举。请关闭自动复位，手动按复位键后重试", actual.name))?;
+            serial = connection.into_serial();
+        }
     }
     capture_reader(&mut serial, options, cancel, callback)
         .with_context(|| format!("{} 串口日志采集失败", actual.name))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResetOutcome {
+    Complete,
+    Cancelled,
+}
+
+trait ResetLines {
+    fn dtr(&mut self, asserted: bool) -> Result<()>;
+    fn rts(&mut self, asserted: bool) -> Result<()>;
+}
+impl<T: SerialPort> ResetLines for T {
+    fn dtr(&mut self, asserted: bool) -> Result<()> {
+        Ok(self.write_data_terminal_ready(asserted)?)
+    }
+    fn rts(&mut self, asserted: bool) -> Result<()> {
+        Ok(self.write_request_to_send(asserted)?)
+    }
+}
+
+struct ReleaseEn<'a, T: ResetLines> {
+    lines: &'a mut T,
+    armed: bool,
+}
+impl<T: ResetLines> ReleaseEn<'_, T> {
+    fn release(&mut self) -> Result<()> {
+        self.lines
+            .rts(false)
+            .context("释放 RTS/EN 失败，请检查连接并手动复位设备")?;
+        self.armed = false;
+        Ok(())
+    }
+}
+impl<T: ResetLines> Drop for ReleaseEn<'_, T> {
+    fn drop(&mut self) {
+        if self.armed {
+            // Also release on panic/unwind or a failed first release attempt.
+            // A disconnected driver can reject this; never report that as a
+            // successful reset/cancellation through the normal Result path.
+            let _ = self.lines.rts(false);
+        }
+    }
+}
+
+fn startup_reset_lines(
+    lines: &mut impl ResetLines,
+    native_usb: bool,
+    cancel: &AtomicBool,
+    mut wait: impl FnMut(Duration),
+) -> Result<ResetOutcome> {
+    if cancel.load(Ordering::Acquire) {
+        return Ok(ResetOutcome::Cancelled);
+    }
+    let mut guard = ReleaseEn { lines, armed: true };
+    let mut settle = || {
+        for _ in 0..10 {
+            if cancel.load(Ordering::Acquire) {
+                return false;
+            }
+            wait(Duration::from_millis(10));
+        }
+        !cancel.load(Ordering::Acquire)
+    };
+    let result = (|| -> Result<ResetOutcome> {
+        if native_usb {
+            // Exact order from pinned espflash 4.7.0 reset_after_flash() for
+            // Espressif VID303A/PID1001, with cancellable waits and cleanup.
+            if !settle() {
+                return Ok(ResetOutcome::Cancelled);
+            }
+            guard.lines.dtr(false).context("原生 USB 释放 DTR 失败")?;
+            if !settle() {
+                return Ok(ResetOutcome::Cancelled);
+            }
+            guard.lines.rts(true).context("原生 USB 复位 RTS 失败")?;
+            guard
+                .lines
+                .dtr(false)
+                .context("原生 USB 复位期间释放 DTR 失败")?;
+            guard
+                .lines
+                .rts(true)
+                .context("原生 USB 复位 RTS 确认失败")?;
+        } else {
+            // Unlike a download-mode reset, GPIO9 must remain released while
+            // EN rises. DTR polarity assumes the standard ESP auto-reset circuit.
+            guard
+                .lines
+                .dtr(false)
+                .context("释放 DTR/BOOT(GPIO9) 失败")?;
+            if !settle() {
+                return Ok(ResetOutcome::Cancelled);
+            }
+            guard.lines.rts(true).context("拉低 RTS/EN 复位失败")?;
+        }
+        if !settle() {
+            return Ok(ResetOutcome::Cancelled);
+        }
+        Ok(ResetOutcome::Complete)
+    })();
+    let released = guard.release();
+    match (result, released) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(release_error)) => Err(error.context(format!("{release_error:#}"))),
+    }
 }
 
 fn validate_options(options: &CaptureOptions) -> Result<()> {
@@ -379,7 +538,136 @@ fn emit_line(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use std::{cell::Cell, collections::VecDeque, rc::Rc};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum ControlEvent {
+        Dtr(bool),
+        Rts(bool),
+    }
+    #[derive(Default)]
+    struct FakeLines {
+        events: Vec<ControlEvent>,
+        en_asserted: Rc<Cell<bool>>,
+        fail_on: Vec<usize>,
+    }
+    impl FakeLines {
+        fn control(&mut self, event: ControlEvent) -> Result<()> {
+            if let ControlEvent::Rts(asserted) = event {
+                self.en_asserted.set(asserted);
+            }
+            self.events.push(event);
+            // A driver may report failure after applying the level. Exercise
+            // cleanup against that case, rather than assuming errors do nothing.
+            ensure!(
+                !self.fail_on.contains(&self.events.len()),
+                "synthetic modem control failure"
+            );
+            Ok(())
+        }
+    }
+    impl ResetLines for FakeLines {
+        fn dtr(&mut self, asserted: bool) -> Result<()> {
+            self.control(ControlEvent::Dtr(asserted))
+        }
+        fn rts(&mut self, asserted: bool) -> Result<()> {
+            self.control(ControlEvent::Rts(asserted))
+        }
+    }
+
+    #[test]
+    fn startup_bridge_releases_gpio9_before_en_pulse_and_native_keeps_its_dedicated_order() {
+        for native in [false, true] {
+            let mut lines = FakeLines::default();
+            let mut waited = Duration::ZERO;
+            assert_eq!(
+                startup_reset_lines(&mut lines, native, &AtomicBool::new(false), |delay| {
+                    waited += delay
+                })
+                .unwrap(),
+                ResetOutcome::Complete
+            );
+            let expected = if native {
+                vec![
+                    ControlEvent::Dtr(false),
+                    ControlEvent::Rts(true),
+                    ControlEvent::Dtr(false),
+                    ControlEvent::Rts(true),
+                    ControlEvent::Rts(false),
+                ]
+            } else {
+                vec![
+                    ControlEvent::Dtr(false),
+                    ControlEvent::Rts(true),
+                    ControlEvent::Rts(false),
+                ]
+            };
+            assert_eq!(lines.events, expected);
+            assert_eq!(
+                waited,
+                Duration::from_millis(if native { 300 } else { 200 })
+            );
+            assert!(!lines.en_asserted.get());
+        }
+    }
+
+    #[test]
+    fn startup_cancel_before_pulse_does_nothing_and_cancelling_during_hold_releases_en() {
+        let mut untouched = FakeLines::default();
+        assert_eq!(
+            startup_reset_lines(&mut untouched, false, &AtomicBool::new(true), |_| panic!(
+                "cancelled operation must not wait"
+            ))
+            .unwrap(),
+            ResetOutcome::Cancelled
+        );
+        assert!(untouched.events.is_empty());
+        for native in [false, true] {
+            let mut lines = FakeLines::default();
+            let asserted = lines.en_asserted.clone();
+            let cancel = AtomicBool::new(false);
+            let result = startup_reset_lines(&mut lines, native, &cancel, |_| {
+                if asserted.get() {
+                    cancel.store(true, Ordering::Release);
+                }
+            })
+            .unwrap();
+            assert_eq!(result, ResetOutcome::Cancelled);
+            assert_eq!(lines.events.last(), Some(&ControlEvent::Rts(false)));
+            assert!(!lines.en_asserted.get());
+        }
+    }
+
+    #[test]
+    fn modem_failures_and_unwind_attempt_en_release_and_failed_release_is_not_success() {
+        for (native, fail_on) in [
+            (false, vec![1]),
+            (false, vec![2]),
+            (true, vec![3]),
+            (false, vec![3]),
+            (false, vec![2, 3]),
+        ] {
+            let mut lines = FakeLines {
+                fail_on,
+                ..FakeLines::default()
+            };
+            let error = startup_reset_lines(&mut lines, native, &AtomicBool::new(false), |_| {})
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("synthetic modem control failure"));
+            assert_eq!(lines.events.last(), Some(&ControlEvent::Rts(false)));
+            assert!(!lines.en_asserted.get());
+        }
+        let mut lines = FakeLines::default();
+        let asserted = lines.en_asserted.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = startup_reset_lines(&mut lines, false, &AtomicBool::new(false), |_| {
+                assert!(!asserted.get(), "synthetic panic during EN hold");
+            });
+        }));
+        assert!(result.is_err());
+        assert_eq!(lines.events.last(), Some(&ControlEvent::Rts(false)));
+        assert!(!lines.en_asserted.get());
+    }
 
     struct ScriptedRead {
         chunks: VecDeque<io::Result<Vec<u8>>>,

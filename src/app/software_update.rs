@@ -174,7 +174,7 @@ impl FlashApp {
 
     fn update_wait_reason(&self) -> Option<&'static str> {
         restart_safety_reason(
-            self.running(),
+            self.running() || self.startup_log.is_some(),
             self.driver_busy,
             self.record_service.pending_local_count(),
             self.pending_records.len(),

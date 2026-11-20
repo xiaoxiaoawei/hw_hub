@@ -2,6 +2,11 @@
 
 应用版本以 `Cargo.toml` 的 `[package].version` 为唯一来源。发布前先补充本文件，再使用 `python scripts/bump-version.py <版本>` 同步包和锁文件；`--check` 检查一致性，`--dry-run` 预览更新。正式版本格式为 `MAJOR.MINOR.PATCH`，Git 标签格式为 `vMAJOR.MINOR.PATCH`。
 
+## [0.5.6] - 2026-11-20
+
+- 在线 COM 的日志窗口新增「复位并读取启动日志」。可设置读取波特率，在同一窗口查看、复制原始启动输出，也可提前停止。
+- 独立采集先打开串口再复位设备，并按设备身份绑定本次读取。
+
 ## [0.5.5] - 2026-11-20
 
 - 自动保存的单台 CSV 和手动导出的整批 CSV 都提供 `unique_device_id` 独立列。
