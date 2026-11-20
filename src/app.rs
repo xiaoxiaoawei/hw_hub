@@ -2145,8 +2145,13 @@ impl FlashApp {
                     self.logs_visible = !self.logs_visible;
                 }
                 if !self.jobs.is_empty()
-                    && (self.batch_operation == RecordOperation::Flash || !self.running())
-                    && text_button(ui, "导出本批 CSV").clicked()
+                    && ui
+                        .add_enabled_ui(!self.running(), |ui| {
+                            text_button(ui, "导出本批 CSV")
+                                .on_disabled_hover_text("批次结束后可导出完整结果")
+                        })
+                        .inner
+                        .clicked()
                 {
                     self.export_csv();
                 }
@@ -2209,6 +2214,9 @@ impl FlashApp {
     }
 
     fn export_csv(&mut self) {
+        if self.jobs.is_empty() || self.running() {
+            return;
+        }
         let settings = &self.batch_telemetry_settings;
         let rules = match telemetry::CompiledExtractionRules::new(&settings.extraction_rules) {
             Ok(rules) => rules,
@@ -2251,9 +2259,7 @@ impl FlashApp {
             .keys()
             .map(String::as_str)
             .collect();
-        if !reading && self.batch_chip == ChipModel::Esp32c3 {
-            custom_keys.insert(telemetry::UNIQUE_DEVICE_ID_KEY);
-        }
+        custom_keys.insert(telemetry::UNIQUE_DEVICE_ID_KEY);
         append_csv(
             &mut output,
             header.into_iter().chain(custom_keys.iter().copied()),

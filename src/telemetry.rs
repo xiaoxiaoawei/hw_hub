@@ -1045,7 +1045,13 @@ fn csv_cell(value: &str) -> String {
 }
 
 fn csv_bytes(record: &DeviceRecord) -> Vec<u8> {
-    let header = [
+    csv_bytes_for_format(record, true)
+}
+
+// The previous format is rendered only to compare an existing immutable file
+// during a retry. Existing records are never rewritten to add a new column.
+fn csv_bytes_for_format(record: &DeviceRecord, include_unique_device_id: bool) -> Vec<u8> {
+    let mut header = vec![
         "schema_version",
         "record_id",
         "batch_id",
@@ -1066,7 +1072,7 @@ fn csv_bytes(record: &DeviceRecord) -> Vec<u8> {
         "custom_fields",
         "custom_field_errors",
     ];
-    let values = vec![
+    let mut values = vec![
         record.schema_version.to_string(),
         record.record_id.clone(),
         record.batch_id.clone(),
@@ -1087,6 +1093,16 @@ fn csv_bytes(record: &DeviceRecord) -> Vec<u8> {
         serde_json::to_string(&record.custom_fields).expect("string maps are valid JSON"),
         serde_json::to_string(&record.custom_field_errors).expect("string maps are valid JSON"),
     ];
+    if include_unique_device_id {
+        header.push(UNIQUE_DEVICE_ID_KEY);
+        values.push(
+            record
+                .custom_fields
+                .get(UNIQUE_DEVICE_ID_KEY)
+                .cloned()
+                .unwrap_or_default(),
+        );
+    }
     let mut output = vec![0xef, 0xbb, 0xbf];
     output.extend_from_slice(
         header
@@ -1135,7 +1151,7 @@ fn persist_csv(directory: &Path, record: &DeviceRecord) -> Result<PathBuf> {
                 .read_to_end(&mut old)
                 .context("无法读取已有本地 CSV")?;
             ensure!(
-                old == bytes,
+                old == bytes || old == csv_bytes_for_format(record, false),
                 "同一批次和串口已存在内容不同的 CSV，已拒绝覆盖和上传"
             );
         }

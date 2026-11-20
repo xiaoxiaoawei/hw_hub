@@ -2,6 +2,11 @@
 
 应用版本以 `Cargo.toml` 的 `[package].version` 为唯一来源。发布前先补充本文件，再使用 `python scripts/bump-version.py <版本>` 同步包和锁文件；`--check` 检查一致性，`--dry-run` 预览更新。正式版本格式为 `MAJOR.MINOR.PATCH`，Git 标签格式为 `vMAJOR.MINOR.PATCH`。
 
+## [0.5.5] - 2026-11-20
+
+- 自动保存的单台 CSV 和手动导出的整批 CSV 都提供 `unique_device_id` 独立列。
+- 整批 CSV 在任务全部结束后可导出，避免导出时设备 ID 尚未读取。
+
 ## [0.5.4] - 2026-11-20
 
 - ESP32-C3 烧录连接时直接读取 128 位 `OPTIONAL_UNIQUE_ID`。每个串口的日志显示 `UNIQUE DEVICE ID`。

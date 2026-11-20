@@ -136,6 +136,7 @@ fn flash_custom_fields_are_saved_in_stable_json_columns_and_posted_with_factory_
     assert_eq!(result.custom_fields["unique_device_id"], CUSTOM_ID);
     let fields = csv_fields(result.csv_path.as_ref().unwrap());
     assert_eq!(fields["operation"], "flash");
+    assert_eq!(fields[UNIQUE_DEVICE_ID_KEY], CUSTOM_ID);
     assert_eq!(
         serde_json::from_str::<Value>(&fields["custom_fields"]).unwrap()["unique_device_id"],
         CUSTOM_ID
@@ -144,12 +145,21 @@ fn flash_custom_fields_are_saved_in_stable_json_columns_and_posted_with_factory_
     assert_eq!(header[15], "logs");
     assert_eq!(
         &header[16..],
-        &["operation", "custom_fields", "custom_field_errors"]
+        &[
+            "operation",
+            "custom_fields",
+            "custom_field_errors",
+            UNIQUE_DEVICE_ID_KEY
+        ]
     );
     let posted: Value = serde_json::from_slice(&server.request().body).unwrap();
     assert_eq!(posted["efuse_id"], EFUSE);
     assert_eq!(posted["custom_fields"]["unique_device_id"], CUSTOM_ID);
     assert_eq!(posted["operation"], "flash");
+    assert!(
+        posted.get(UNIQUE_DEVICE_ID_KEY).is_none(),
+        "CSV column does not change the HTTP schema"
+    );
     server.assert_no_request();
 }
 
@@ -176,6 +186,7 @@ fn readonly_custom_identity_can_upload_without_claiming_a_flash_or_factory_mac()
     assert!(result.custom_field_errors.contains_key("optional_board"));
     let fields = csv_fields(result.csv_path.as_ref().unwrap());
     assert_eq!(fields["operation"], "read_only");
+    assert_eq!(fields[UNIQUE_DEVICE_ID_KEY], CUSTOM_ID);
     assert!(fields["firmware_sha256"].is_empty());
     let posted: Value = serde_json::from_slice(&server.request().body).unwrap();
     assert_eq!(posted["operation"], "read_only");
@@ -285,6 +296,7 @@ fn hardware_unique_id_is_automatically_saved_and_posted_without_a_log_regex() {
     assert_eq!(result.custom_fields[UNIQUE_DEVICE_ID_KEY], CUSTOM_ID);
     assert!(result.custom_field_errors.is_empty());
     let csv = csv_fields(result.csv_path.as_ref().unwrap());
+    assert_eq!(csv[UNIQUE_DEVICE_ID_KEY], CUSTOM_ID);
     assert_eq!(
         serde_json::from_str::<Value>(&csv["custom_fields"]).unwrap()[UNIQUE_DEVICE_ID_KEY],
         CUSTOM_ID
@@ -416,6 +428,7 @@ fn posted_hardware_id_wins_over_configured_uart_conflict_and_retry_stays_immutab
     let path = failed.csv_path.clone().unwrap();
     let old_csv = fs::read(&path).unwrap();
     assert_eq!(failed.custom_fields[UNIQUE_DEVICE_ID_KEY], CUSTOM_ID);
+    assert_eq!(csv_fields(&path)[UNIQUE_DEVICE_ID_KEY], CUSTOM_ID);
     assert!(failed.custom_field_errors[UNIQUE_DEVICE_ID_KEY].contains("已采用硬件"));
     let first = server.request();
     let posted: Value = serde_json::from_slice(&first.body).unwrap();
@@ -447,6 +460,78 @@ fn posted_hardware_id_wins_over_configured_uart_conflict_and_retry_stays_immutab
 }
 
 #[test]
+fn previous_csv_format_is_reused_without_rewriting_or_accepting_a_changed_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = LocalServer::new(vec![Reply::status(201)], Some(directory.path().to_owned()));
+    let mut configuration = settings(directory.path());
+    let mut old_session = RecordService::new(|| {});
+    old_session
+        .submit_with_identity(
+            &configuration,
+            draft(),
+            RecordOperation::Flash,
+            Some(CUSTOM_ID),
+        )
+        .unwrap();
+    let saved = receive_record(&mut old_session);
+    let path = saved.csv_path.unwrap();
+    let mut rows = csv_rows(&path);
+    assert_eq!(rows[0].pop().as_deref(), Some(UNIQUE_DEVICE_ID_KEY));
+    assert_eq!(rows[1].pop().as_deref(), Some(CUSTOM_ID));
+    // Model the exact pre-column release format independently of the writer.
+    let mut previous = vec![0xef, 0xbb, 0xbf];
+    for row in rows {
+        let line = row
+            .iter()
+            .map(|cell| format!("\"{}\"", cell.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(",");
+        previous.extend_from_slice(line.as_bytes());
+        previous.extend_from_slice(b"\r\n");
+    }
+    fs::write(&path, &previous).unwrap();
+    configuration.upload_enabled = true;
+    configuration.endpoint = server.endpoint.clone();
+    let mut retry_session = RecordService::new(|| {});
+    assert_eq!(
+        retry_session
+            .submit_with_identity(
+                &configuration,
+                draft(),
+                RecordOperation::Flash,
+                Some(CUSTOM_ID)
+            )
+            .unwrap(),
+        saved.record_id
+    );
+    let retry = receive_record(&mut retry_session);
+    assert_eq!(retry.upload_state, UploadState::Uploaded);
+    assert_eq!(retry.csv_path.as_ref(), Some(&path));
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        previous,
+        "historical files stay immutable"
+    );
+    assert!(!csv_fields(&path).contains_key(UNIQUE_DEVICE_ID_KEY));
+    let posted: Value = serde_json::from_slice(&server.request().body).unwrap();
+    assert_eq!(posted["custom_fields"][UNIQUE_DEVICE_ID_KEY], CUSTOM_ID);
+    let mut changed_session = RecordService::new(|| {});
+    changed_session
+        .submit_with_identity(
+            &configuration,
+            draft(),
+            RecordOperation::Flash,
+            Some("FFEEDDCCBBAA99887766554433221100"),
+        )
+        .unwrap();
+    let rejected = receive_record(&mut changed_session);
+    assert!(rejected.csv_path.is_none());
+    assert!(rejected.error.unwrap().contains("已拒绝覆盖和上传"));
+    assert_eq!(fs::read(&path).unwrap(), previous);
+    server.assert_no_request();
+}
+
+#[test]
 fn absent_hardware_identity_preserves_user_uart_rules_without_fabricating_factory_data() {
     let directory = tempfile::tempdir().unwrap();
     let mut configuration = settings(directory.path());
@@ -461,6 +546,7 @@ fn absent_hardware_identity_preserves_user_uart_rules_without_fabricating_factor
     assert_eq!(result.custom_fields[UNIQUE_DEVICE_ID_KEY], "0".repeat(32));
     let fields = csv_fields(result.csv_path.as_ref().unwrap());
     assert!(fields["efuse_id"].is_empty() && fields["mac"].is_empty());
+    assert_eq!(fields[UNIQUE_DEVICE_ID_KEY], "0".repeat(32));
     let input = draft();
     configuration.extraction_rules.clear();
     service
@@ -468,6 +554,10 @@ fn absent_hardware_identity_preserves_user_uart_rules_without_fabricating_factor
         .unwrap();
     let result = receive_record(&mut service);
     assert!(!result.custom_fields.contains_key(UNIQUE_DEVICE_ID_KEY));
+    assert_eq!(
+        csv_fields(result.csv_path.as_ref().unwrap())[UNIQUE_DEVICE_ID_KEY],
+        ""
+    );
 }
 
 fn readonly_draft() -> RecordDraft {
