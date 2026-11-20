@@ -7,12 +7,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use sha2::{Digest, Sha256};
 
-use crate::verification::VerificationChecks;
+use crate::{production::ProductionBatch, verification::VerificationChecks};
 
 const NAME: &str = "validation-results.csv";
 const BOM: &[u8] = b"\xef\xbb\xbf";
-const MAX_ROW_BYTES: usize = 1024 * 1024;
+const MAX_ROW_BYTES: usize = 2 * 1024 * 1024;
 const HEADER: [&str; 10] = [
     "batch",
     "COM",
@@ -25,6 +26,9 @@ const HEADER: [&str; 10] = [
     "result",
     "failures",
 ];
+const PRODUCTION_COLUMNS: [&str; 4] =
+    ["生产批次/工单号", "主板年周", "主板生产日期", "startup_log"];
+const MAX_COLUMNS: usize = HEADER.len() + PRODUCTION_COLUMNS.len();
 
 #[derive(Clone, Debug)]
 pub struct VerificationRecord {
@@ -32,23 +36,70 @@ pub struct VerificationRecord {
     pub port: String,
     pub finished_at: String,
     pub checks: VerificationChecks,
+    pub startup_log: String,
+}
+
+/// Preserve the legacy ten-column history format. Production metadata and
+/// startup logs belong in the separate per-work-order format below.
+pub fn append_batch(directory: &Path, records: &[VerificationRecord]) -> Result<PathBuf> {
+    append_records(directory, records, NAME, None)
+}
+
+/// Append full frozen captures to a deterministic CSV for this work order.
+/// The supplied directory is already routed by the caller. The timestamp is
+/// preserved as supplied, including the caller's Beijing +08:00 offset.
+pub fn append_batch_with_production(
+    directory: &Path,
+    records: &[VerificationRecord],
+    production: &ProductionBatch,
+) -> Result<PathBuf> {
+    ensure!(
+        !production.work_order.trim().is_empty(),
+        "生产工单号不能为空"
+    );
+    let name = format!(
+        "validation-{:x}.csv",
+        Sha256::digest(production.work_order.as_bytes())
+    );
+    append_records(directory, records, &name, Some(production))
 }
 
 /// Save a complete batch snapshot. Repeating identical rows is a no-op;
 /// changing a previously stored batch/COM row is rejected without overwriting.
 /// All cooperating writers must use this persistent sidecar lock.
-pub fn append_batch(directory: &Path, records: &[VerificationRecord]) -> Result<PathBuf> {
+fn append_records(
+    directory: &Path,
+    records: &[VerificationRecord],
+    name: &str,
+    production: Option<&ProductionBatch>,
+) -> Result<PathBuf> {
     ensure!(directory.is_absolute(), "验证记录目录必须为绝对路径");
     ensure!(!records.is_empty(), "没有待保存的验证结果");
     let batch = &records[0].batch_id;
     ensure!(!batch.is_empty(), "验证批次标识不能为空");
     let stored_batch = formula_safe(batch.clone());
+    let mut header = HEADER.to_vec();
+    if production.is_some() {
+        header.extend(PRODUCTION_COLUMNS);
+    }
     let mut expected = BTreeMap::new();
     let mut incoming = Vec::with_capacity(records.len());
     for record in records {
         ensure!(&record.batch_id == batch, "一次只能保存同一验证批次");
         ensure!(!record.port.is_empty(), "验证端口不能为空");
-        let cells = record_cells(record);
+        let mut cells = record_cells(record);
+        if let Some(production) = production {
+            cells.extend(
+                [
+                    production.work_order.clone(),
+                    production.board_week.clone(),
+                    production.board_date.to_string(),
+                    record.startup_log.clone(),
+                ]
+                .into_iter()
+                .map(formula_safe),
+            );
+        }
         let bytes = encode_row(&cells)?;
         let port = cells[1].clone();
         ensure!(
@@ -58,8 +109,8 @@ pub fn append_batch(directory: &Path, records: &[VerificationRecord]) -> Result<
         incoming.push((port, bytes));
     }
     fs::create_dir_all(directory).context("无法创建验证记录目录")?;
-    let path = directory.join(NAME);
-    let lock_path = directory.join("validation-results.csv.lock");
+    let path = directory.join(name);
+    let lock_path = directory.join(format!("{name}.lock"));
     regular_or_absent(&lock_path)?;
     let lock = OpenOptions::new()
         .read(true)
@@ -89,15 +140,18 @@ pub fn append_batch(directory: &Path, records: &[VerificationRecord]) -> Result<
                 .read_exact(&mut bom)
                 .context("验证记录缺少UTF-8 BOM")?;
             ensure!(bom.as_slice() == BOM, "已有验证记录不是带BOM的UTF-8 CSV");
-            let header = read_row(&mut reader)?.context("验证记录缺少表头")?;
+            let stored_header = read_row(&mut reader)?.context("验证记录缺少表头")?;
             ensure!(
-                header.iter().map(String::as_str).eq(HEADER),
+                stored_header
+                    .iter()
+                    .map(String::as_str)
+                    .eq(header.iter().copied()),
                 "已有验证记录表头不匹配"
             );
             while let Some(row) = read_row(&mut reader)? {
-                ensure!(row.len() == HEADER.len(), "已有验证记录列数不匹配");
+                ensure!(row.len() == header.len(), "已有验证记录列数不匹配");
                 ensure!(
-                    !row.iter().map(String::as_str).eq(HEADER),
+                    !row.iter().map(String::as_str).eq(header.iter().copied()),
                     "已有验证记录包含重复表头"
                 );
                 if row[0] == stored_batch {
@@ -141,7 +195,7 @@ pub fn append_batch(directory: &Path, records: &[VerificationRecord]) -> Result<
     } else {
         temporary.write_all(BOM)?;
         temporary.write_all(&encode_row(
-            &HEADER.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+            &header.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
         )?)?;
     }
     for (_, bytes) in missing {
@@ -226,12 +280,12 @@ fn encode_row(cells: &[String]) -> Result<Vec<u8>> {
             if byte == b'"' {
                 bytes.push(byte);
             }
-            ensure!(bytes.len() <= MAX_ROW_BYTES - 3, "验证记录单行超过1MiB");
+            ensure!(bytes.len() <= MAX_ROW_BYTES - 3, "验证记录单行超过2MiB");
         }
         bytes.push(b'"');
     }
     bytes.extend_from_slice(b"\r\n");
-    ensure!(bytes.len() <= MAX_ROW_BYTES, "验证记录单行超过1MiB");
+    ensure!(bytes.len() <= MAX_ROW_BYTES, "验证记录单行超过2MiB");
     Ok(bytes)
 }
 
@@ -245,7 +299,7 @@ fn read_row(reader: &mut impl BufRead) -> Result<Option<Vec<String>>> {
             .take((MAX_ROW_BYTES + 1 - start) as u64)
             .read_until(b'\n', &mut raw)
             .context("无法读取验证CSV")?;
-        ensure!(raw.len() <= MAX_ROW_BYTES, "已有验证CSV单行超过1MiB");
+        ensure!(raw.len() <= MAX_ROW_BYTES, "已有验证CSV单行超过2MiB");
         for byte in &raw[start..] {
             if *byte == b'"' {
                 quoted = !quoted;
@@ -288,7 +342,7 @@ fn read_row(reader: &mut impl BufRead) -> Result<Option<Vec<String>>> {
                     String::from_utf8(std::mem::take(&mut field))
                         .context("验证CSV包含无效UTF-8")?,
                 );
-                ensure!(cells.len() < HEADER.len(), "已有验证CSV列数过多");
+                ensure!(cells.len() < MAX_COLUMNS, "已有验证CSV列数过多");
                 state = Start;
             }
             (Quoted, _) => field.push(byte),
@@ -323,6 +377,7 @@ mod tests {
             batch_id: batch.into(),
             port: port.into(),
             finished_at: "2026-01-01T00:00:00Z".into(),
+            startup_log: String::new(),
             checks: VerificationChecks {
                 max30105_ok: true,
                 bmi270_ok: true,
@@ -342,6 +397,109 @@ mod tests {
             rows.push(row);
         }
         rows
+    }
+
+    fn production(order: &str) -> ProductionBatch {
+        ProductionBatch {
+            work_order: order.into(),
+            board_week: "2026W01".into(),
+            board_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+        }
+    }
+
+    #[test]
+    fn production_orders_have_safe_distinct_files_and_keep_full_frozen_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let order = production("../synthetic/order:*?工单");
+        let mut first = sample("synthetic-prod-a", "COM1", 2922);
+        first.finished_at = "2026-01-01T08:00:00+08:00".into();
+        first.startup_log = "Synthetic boot\r\nquotes: \"ready\", 逗号\nlast line".into();
+        let path =
+            append_batch_with_production(dir.path(), std::slice::from_ref(&first), &order).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert_eq!(path.parent(), Some(dir.path()));
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            format!(
+                "validation-{:x}.csv",
+                Sha256::digest(order.work_order.as_bytes())
+            )
+        );
+        let rows = parsed(&before);
+        assert_eq!(&rows[0][..HEADER.len()], HEADER);
+        assert_eq!(&rows[0][HEADER.len()..], PRODUCTION_COLUMNS);
+        assert_eq!(rows[1][2], first.finished_at);
+        assert_eq!(
+            &rows[1][10..13],
+            [order.work_order.as_str(), "2026W01", "2026-01-01"]
+        );
+        assert_eq!(rows[1][13], first.startup_log);
+        append_batch_with_production(dir.path(), std::slice::from_ref(&first), &order).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let second = sample("synthetic-prod-b", "COM2", 2923);
+        assert_eq!(
+            append_batch_with_production(dir.path(), &[second], &order).unwrap(),
+            path
+        );
+        assert!(fs::read(&path).unwrap().starts_with(&before));
+        let other = append_batch_with_production(
+            dir.path(),
+            &[sample("synthetic-other", "COM3", 2922)],
+            &production("synthetic-other-order"),
+        )
+        .unwrap();
+        assert_ne!(other, path);
+        assert_eq!(parsed(&fs::read(other).unwrap()).len(), 2);
+        let mut changed = first;
+        changed.startup_log.push_str(" changed capture");
+        let saved = fs::read(&path).unwrap();
+        assert!(append_batch_with_production(dir.path(), &[changed], &order).is_err());
+        assert_eq!(fs::read(path).unwrap(), saved);
+    }
+
+    #[test]
+    fn full_512_kib_quoted_startup_log_survives_csv_expansion_and_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = sample("synthetic-large", "COM1", 2922);
+        first.startup_log = "\"".repeat(512 * 1024);
+        let order = production("synthetic-large-order");
+        let path =
+            append_batch_with_production(dir.path(), std::slice::from_ref(&first), &order).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(before.len() > 1024 * 1024);
+        assert_eq!(parsed(&before)[1][13], first.startup_log);
+        append_batch_with_production(dir.path(), &[first], &order).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let mut oversized = sample("synthetic-oversized", "COM2", 2922);
+        oversized.startup_log = "x".repeat(MAX_ROW_BYTES + 1);
+        assert!(append_batch_with_production(dir.path(), &[oversized], &order).is_err());
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn production_format_does_not_upgrade_or_mix_with_legacy_ten_column_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = sample("synthetic-legacy", "COM1", 2922);
+        let legacy = append_batch(dir.path(), std::slice::from_ref(&row)).unwrap();
+        let before = fs::read(&legacy).unwrap();
+        let order = production("synthetic-legacy-order");
+        let path =
+            append_batch_with_production(dir.path(), std::slice::from_ref(&row), &order).unwrap();
+        assert_ne!(legacy, path);
+        assert_eq!(fs::read(&legacy).unwrap(), before);
+        assert_eq!(parsed(&before)[0].len(), 10);
+        assert_eq!(parsed(&fs::read(&path).unwrap())[0].len(), 14);
+        fs::write(&path, &before).unwrap();
+        assert!(append_batch_with_production(dir.path(), &[row], &order).is_err());
+        assert_eq!(fs::read(path).unwrap(), before);
+        assert!(
+            append_batch_with_production(
+                dir.path(),
+                &[sample("synthetic-empty", "COM1", 2922)],
+                &production("  ")
+            )
+            .is_err()
+        );
     }
 
     #[test]

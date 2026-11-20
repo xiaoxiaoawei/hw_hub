@@ -1,5 +1,6 @@
 use esp32c3_flashtool::{
     backend::DeviceIdentity,
+    production::ProductionBatch,
     telemetry::{
         CompiledExtractionRules, ExtractionOutcome, RecordDraft, RecordOperation, RecordResult,
         RecordService, RecordStatus, TelemetrySettings, UNIQUE_DEVICE_ID_KEY, UploadState,
@@ -144,13 +145,17 @@ fn flash_custom_fields_are_saved_in_stable_json_columns_and_posted_with_factory_
     let header = &csv_rows(result.csv_path.as_ref().unwrap())[0];
     assert_eq!(header[15], "logs");
     assert_eq!(
-        &header[16..],
+        &header[16..20],
         &[
             "operation",
             "custom_fields",
             "custom_field_errors",
             UNIQUE_DEVICE_ID_KEY
         ]
+    );
+    assert_eq!(
+        &header[20..],
+        &["生产批次/工单号", "主板年周", "主板生产日期"]
     );
     let posted: Value = serde_json::from_slice(&server.request().body).unwrap();
     assert_eq!(posted["efuse_id"], EFUSE);
@@ -476,6 +481,9 @@ fn previous_csv_format_is_reused_without_rewriting_or_accepting_a_changed_identi
     let saved = receive_record(&mut old_session);
     let path = saved.csv_path.unwrap();
     let mut rows = csv_rows(&path);
+    assert_eq!(rows[0].len(), 23);
+    rows[0].truncate(20);
+    rows[1].truncate(20);
     assert_eq!(rows[0].pop().as_deref(), Some(UNIQUE_DEVICE_ID_KEY));
     assert_eq!(rows[1].pop().as_deref(), Some(CUSTOM_ID));
     // Model the exact pre-column release format independently of the writer.
@@ -558,6 +566,195 @@ fn absent_hardware_identity_preserves_user_uart_rules_without_fabricating_factor
         csv_fields(result.csv_path.as_ref().unwrap())[UNIQUE_DEVICE_ID_KEY],
         ""
     );
+}
+
+#[test]
+fn production_snapshot_uses_the_frozen_destination_and_keeps_http_schema_unchanged() {
+    let root = tempfile::tempdir().unwrap();
+    let mut production = ProductionBatch::parse("synthetic-order", "2647", "2026-11-20").unwrap();
+    let destination = production.record_directory(root.path(), RecordOperation::Flash);
+    let server = LocalServer::new(vec![Reply::status(201)], Some(destination.clone()));
+    let mut configuration = settings(&destination);
+    configuration.upload_enabled = true;
+    configuration.endpoint = server.endpoint.clone();
+    let mut input = draft();
+    input.started_at = "2026-11-20T15:01:02+08:00".into();
+    input.finished_at = "2026-11-20T15:01:03+08:00".into();
+    let mut service = RecordService::new(|| {});
+    service
+        .submit_with_production(
+            &configuration,
+            input,
+            RecordOperation::Flash,
+            Some(CUSTOM_ID),
+            Some(&production),
+        )
+        .unwrap();
+    production.work_order = "later-order".into();
+    production.board_week = "2648".into();
+    configuration.csv_directory = Some(root.path().join("later-path"));
+    let result = receive_record(&mut service);
+    assert_eq!(result.upload_state, UploadState::Uploaded);
+    let path = result.csv_path.as_ref().unwrap();
+    assert_eq!(path.parent(), Some(destination.as_path()));
+    let fields = csv_fields(path);
+    assert_eq!(fields["生产批次/工单号"], "synthetic-order");
+    assert_eq!(fields["主板年周"], "2647");
+    assert_eq!(fields["主板生产日期"], "2026-11-20");
+    assert_eq!(fields[UNIQUE_DEVICE_ID_KEY], CUSTOM_ID);
+    assert_eq!(fields["started_at"], "2026-11-20T15:01:02+08:00");
+    assert!(!root.path().join("later-path").exists());
+    let posted: Value = serde_json::from_slice(&server.request().body).unwrap();
+    assert_eq!(posted["started_at"], fields["started_at"]);
+    assert_eq!(posted["finished_at"], fields["finished_at"]);
+    for key in [
+        "production",
+        "work_order",
+        "board_week",
+        "board_date",
+        "生产批次/工单号",
+        "主板年周",
+        "主板生产日期",
+    ] {
+        assert!(
+            posted.get(key).is_none(),
+            "production metadata must remain CSV-only"
+        );
+    }
+    server.assert_no_request();
+}
+
+#[test]
+fn readonly_records_append_the_same_production_columns_in_the_resolved_verification_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let production = ProductionBatch::parse("read-order", "2647", "2026-11-20").unwrap();
+    let destination = production.record_directory(root.path(), RecordOperation::ReadOnly);
+    let mut configuration = settings(&destination);
+    configuration.extraction_rules = custom_rules();
+    let mut service = RecordService::new(|| {});
+    service
+        .submit_with_production(
+            &configuration,
+            readonly_draft(),
+            RecordOperation::ReadOnly,
+            None,
+            Some(&production),
+        )
+        .unwrap();
+    let saved = receive_record(&mut service);
+    assert_eq!(
+        saved.csv_path.as_ref().unwrap().parent(),
+        Some(destination.as_path())
+    );
+    let fields = csv_fields(saved.csv_path.as_ref().unwrap());
+    assert_eq!(fields["operation"], "read_only");
+    assert_eq!(fields["生产批次/工单号"], "read-order");
+    assert_eq!(fields["主板年周"], "2647");
+    assert_eq!(fields["主板生产日期"], "2026-11-20");
+    let header = &csv_rows(saved.csv_path.as_ref().unwrap())[0];
+    assert_eq!(header.len(), 23);
+    assert_eq!(header[19], UNIQUE_DEVICE_ID_KEY);
+    assert_eq!(
+        &header[20..],
+        &["生产批次/工单号", "主板年周", "主板生产日期"]
+    );
+}
+
+#[test]
+fn production_retry_preserves_files_and_distinguishes_formula_safe_work_order_values() {
+    let root = tempfile::tempdir().unwrap();
+    let production = ProductionBatch::parse("=ORDER", "2647", "2026-11-20").unwrap();
+    let configuration = settings(root.path());
+    let mut initial = RecordService::new(|| {});
+    let id = initial
+        .submit_with_production(
+            &configuration,
+            draft(),
+            RecordOperation::Flash,
+            None,
+            Some(&production),
+        )
+        .unwrap();
+    let saved = receive_record(&mut initial);
+    let path = saved.csv_path.unwrap();
+    let original = fs::read(&path).unwrap();
+    assert_eq!(csv_fields(&path)["生产批次/工单号"], "'=ORDER");
+    let mut retry = RecordService::new(|| {});
+    assert_eq!(
+        retry
+            .submit_with_production(
+                &configuration,
+                draft(),
+                RecordOperation::Flash,
+                None,
+                Some(&production)
+            )
+            .unwrap(),
+        id
+    );
+    assert_eq!(receive_record(&mut retry).csv_path.as_ref(), Some(&path));
+    assert_eq!(fs::read(&path).unwrap(), original);
+    let changed = ProductionBatch::parse("'=ORDER", "2647", "2026-11-20").unwrap();
+    let mut changed_session = RecordService::new(|| {});
+    changed_session
+        .submit_with_production(
+            &configuration,
+            draft(),
+            RecordOperation::Flash,
+            None,
+            Some(&changed),
+        )
+        .unwrap();
+    let rejected = receive_record(&mut changed_session);
+    assert!(rejected.csv_path.is_none());
+    assert!(rejected.error.unwrap().contains("已拒绝覆盖和上传"));
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn legacy_twenty_column_records_are_reused_only_without_production_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let configuration = settings(root.path());
+    let mut initial = RecordService::new(|| {});
+    initial.submit(&configuration, draft()).unwrap();
+    let path = receive_record(&mut initial).csv_path.unwrap();
+    let mut previous = vec![0xef, 0xbb, 0xbf];
+    for row in csv_rows(&path) {
+        let line = row
+            .iter()
+            .take(20)
+            .map(|cell| format!("\"{}\"", cell.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(",");
+        previous.extend_from_slice(line.as_bytes());
+        previous.extend_from_slice(b"\r\n");
+    }
+    fs::write(&path, &previous).unwrap();
+    let mut legacy_retry = RecordService::new(|| {});
+    legacy_retry.submit(&configuration, draft()).unwrap();
+    assert_eq!(
+        receive_record(&mut legacy_retry).csv_path.as_ref(),
+        Some(&path)
+    );
+    assert_eq!(fs::read(&path).unwrap(), previous);
+    let production = ProductionBatch::parse("new-order", "2647", "2026-11-20").unwrap();
+    let mut enriched_retry = RecordService::new(|| {});
+    enriched_retry
+        .submit_with_production(
+            &configuration,
+            draft(),
+            RecordOperation::Flash,
+            None,
+            Some(&production),
+        )
+        .unwrap();
+    let rejected = receive_record(&mut enriched_retry);
+    assert!(
+        rejected.csv_path.is_none(),
+        "an old file cannot silently omit a new production snapshot"
+    );
+    assert!(rejected.error.unwrap().contains("已拒绝覆盖和上传"));
+    assert_eq!(fs::read(&path).unwrap(), previous);
 }
 
 fn readonly_draft() -> RecordDraft {

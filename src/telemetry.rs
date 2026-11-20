@@ -1,6 +1,10 @@
 //! Durable per-device production records. Local persistence and optional network
 //! delivery run on separate bounded workers; no GUI operation performs I/O.
-use crate::{backend::DeviceIdentity, telemetry_http};
+use crate::{
+    backend::DeviceIdentity,
+    production::{PRODUCTION_HEADERS, ProductionBatch},
+    telemetry_http,
+};
 use anyhow::{Context, Result, anyhow, ensure};
 use regex::{Regex, RegexBuilder};
 use serde::{
@@ -507,6 +511,27 @@ struct DeviceRecord {
     operation: RecordOperation,
     custom_fields: BTreeMap<String, String>,
     custom_field_errors: BTreeMap<String, String>,
+    // Production metadata belongs to local CSV only; the HTTP contract stays
+    // unchanged and does not require ProductionBatch to implement Serialize.
+    #[serde(skip)]
+    production: Option<ProductionMetadata>,
+}
+
+#[derive(Clone, Debug)]
+struct ProductionMetadata {
+    work_order: String,
+    board_week: String,
+    board_date: String,
+}
+
+impl From<&ProductionBatch> for ProductionMetadata {
+    fn from(production: &ProductionBatch) -> Self {
+        Self {
+            work_order: production.work_order.clone(),
+            board_week: production.board_week.clone(),
+            board_date: production.board_date.to_string(),
+        }
+    }
 }
 
 static NEXT_BATCH: AtomicU64 = AtomicU64::new(0);
@@ -543,6 +568,7 @@ struct LocalTask {
     record_id: String,
     operation: RecordOperation,
     hardware_unique_device_id: Option<String>,
+    production: Option<ProductionMetadata>,
 }
 struct UploadTask {
     settings: TelemetrySettings,
@@ -680,6 +706,20 @@ impl RecordService {
         operation: RecordOperation,
         unique_device_id: Option<&str>,
     ) -> Result<String> {
+        self.submit_with_production(settings, draft, operation, unique_device_id, None)
+    }
+
+    /// The caller freezes both the resolved CSV directory and production
+    /// metadata for the job. Retries must retain the same directory/metadata;
+    /// this layer never appends the production directory a second time.
+    pub fn submit_with_production(
+        &mut self,
+        settings: &TelemetrySettings,
+        draft: RecordDraft,
+        operation: RecordOperation,
+        unique_device_id: Option<&str>,
+        production: Option<&ProductionBatch>,
+    ) -> Result<String> {
         let hardware_unique_device_id = unique_device_id
             .map(normalize_hardware_unique_id)
             .transpose()?;
@@ -726,6 +766,7 @@ impl RecordService {
             record_id: id.clone(),
             operation,
             hardware_unique_device_id,
+            production: production.map(ProductionMetadata::from),
         };
         if self.sender.try_send(task).is_err() {
             self.local_pending.fetch_sub(1, Ordering::AcqRel);
@@ -796,6 +837,7 @@ fn persist_task(task: LocalTask) -> Result<LocalOutcome> {
         &task.settings,
         task.operation,
         task.hardware_unique_device_id.as_deref(),
+        task.production,
     );
     let directory = match &task.settings.csv_directory {
         Some(path) => path.clone(),
@@ -847,6 +889,7 @@ fn prepare_record(
     settings: &TelemetrySettings,
     operation: RecordOperation,
     hardware_unique_device_id: Option<&str>,
+    production: Option<ProductionMetadata>,
 ) -> DeviceRecord {
     let logs = redact_header_credentials(draft.logs.clone(), &settings.custom_headers);
     let mut extracted = match CompiledExtractionRules::new(&settings.extraction_rules) {
@@ -915,6 +958,7 @@ fn prepare_record(
         operation,
         custom_fields: extracted.custom_fields,
         custom_field_errors: extracted.errors,
+        production,
     }
 }
 
@@ -1029,14 +1073,19 @@ fn redact_header_credentials(
 }
 
 fn csv_cell(value: &str) -> String {
+    encode_csv_cell(value, false)
+}
+
+fn encode_csv_cell(value: &str, protect_apostrophe: bool) -> String {
     let first = value
         .trim_start_matches(|character: char| {
             character.is_whitespace() || character.is_control() || character == '\u{feff}'
         })
         .chars()
         .next();
-    let formula = first.is_some_and(|character| matches!(character, '=' | '+' | '-' | '@'))
-        || value.starts_with(['\t', '\r', '\n']);
+    let formula = first.is_some_and(|character| {
+        matches!(character, '=' | '+' | '-' | '@') || (protect_apostrophe && character == '\'')
+    }) || value.starts_with(['\t', '\r', '\n']);
     format!(
         "\"{}{}\"",
         if formula { "'" } else { "" },
@@ -1045,12 +1094,16 @@ fn csv_cell(value: &str) -> String {
 }
 
 fn csv_bytes(record: &DeviceRecord) -> Vec<u8> {
-    csv_bytes_for_format(record, true)
+    csv_bytes_for_format(record, true, true)
 }
 
 // The previous format is rendered only to compare an existing immutable file
 // during a retry. Existing records are never rewritten to add a new column.
-fn csv_bytes_for_format(record: &DeviceRecord, include_unique_device_id: bool) -> Vec<u8> {
+fn csv_bytes_for_format(
+    record: &DeviceRecord,
+    include_unique_device_id: bool,
+    include_production: bool,
+) -> Vec<u8> {
     let mut header = vec![
         "schema_version",
         "record_id",
@@ -1103,6 +1156,26 @@ fn csv_bytes_for_format(record: &DeviceRecord, include_unique_device_id: bool) -
                 .unwrap_or_default(),
         );
     }
+    if include_production {
+        header.extend(PRODUCTION_HEADERS);
+        values.extend([
+            record
+                .production
+                .as_ref()
+                .map_or("", |production| production.work_order.as_str())
+                .to_owned(),
+            record
+                .production
+                .as_ref()
+                .map_or("", |production| production.board_week.as_str())
+                .to_owned(),
+            record
+                .production
+                .as_ref()
+                .map_or("", |production| production.board_date.as_str())
+                .to_owned(),
+        ]);
+    }
     let mut output = vec![0xef, 0xbb, 0xbf];
     output.extend_from_slice(
         header
@@ -1116,7 +1189,10 @@ fn csv_bytes_for_format(record: &DeviceRecord, include_unique_device_id: bool) -
     output.extend_from_slice(
         values
             .iter()
-            .map(|value| csv_cell(value))
+            .enumerate()
+            .map(|(index, value)| {
+                encode_csv_cell(value, include_production && index >= values.len() - 3)
+            })
             .collect::<Vec<_>>()
             .join(",")
             .as_bytes(),
@@ -1151,7 +1227,10 @@ fn persist_csv(directory: &Path, record: &DeviceRecord) -> Result<PathBuf> {
                 .read_to_end(&mut old)
                 .context("无法读取已有本地 CSV")?;
             ensure!(
-                old == bytes || old == csv_bytes_for_format(record, false),
+                old == bytes
+                    || (record.production.is_none()
+                        && (old == csv_bytes_for_format(record, true, false)
+                            || old == csv_bytes_for_format(record, false, false))),
                 "同一批次和串口已存在内容不同的 CSV，已拒绝覆盖和上传"
             );
         }

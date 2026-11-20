@@ -91,21 +91,19 @@ impl FlashApp {
     fn start_read(&mut self, ports: Vec<Port>, baud: u32) {
         self.error = None;
         self.notice = None;
+        let Some(setup) = self.prepare_record_setup(RecordOperation::ReadOnly, false) else {
+            return;
+        };
         let options = CaptureOptions {
             baud,
             reset: self.device_read_setup.reset,
             ..CaptureOptions::default()
         };
-        match Batch::start_reading(
-            ports.clone(),
-            self.concurrency,
-            options,
-            &self.telemetry_settings,
-        ) {
+        match Batch::start_reading(ports.clone(), self.concurrency, options, &setup.settings) {
             Ok(batch) => {
                 self.firmware_hash.clear();
                 self.batch_firmware.clear();
-                self.attach_batch(batch, ports, RecordOperation::ReadOnly);
+                self.attach_batch(batch, ports, RecordOperation::ReadOnly, setup);
             }
             Err(error) => self.error = Some(format!("无法开始读取日志：{error:#}")),
         }

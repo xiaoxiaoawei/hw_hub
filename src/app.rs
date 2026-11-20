@@ -1,5 +1,7 @@
+mod clipboard;
 mod device_read;
 mod firmware_drop;
+mod production_setup;
 mod settings;
 mod software_update;
 mod startup_log;
@@ -15,7 +17,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use chrono::Local;
 use device_read::DeviceReadSetup;
 use eframe::egui::{self, Color32, RichText};
 use esp32c3_flashtool::{
@@ -26,6 +27,7 @@ use esp32c3_flashtool::{
     device_watch::DeviceWatcher,
     drivers::{self, DriverKind},
     firmware::{FirmwareInput, prepare_firmware},
+    production::{PRODUCTION_HEADERS, ProductionBatch, beijing_datetime, beijing_now},
     self_update::{self, PreparedUpdate, SelfUpdateEvent, SelfUpdateService},
     telemetry::{
         self, RecordDraft, RecordOperation, RecordService, RecordStatus, TelemetrySettings,
@@ -34,6 +36,7 @@ use esp32c3_flashtool::{
     updater::{self, CheckResult, ReleaseUpdate, UpdateSettings},
 };
 use firmware_drop::FirmwareFileDrop;
+use production_setup::{ProductionInputs, RecordSetup, effective_record_directory};
 use startup_log::StartupLogTask;
 use validation::ValidationWorkspace;
 
@@ -224,6 +227,7 @@ struct PendingRecord {
     device: DeviceLogKey,
     operation: RecordOperation,
     unique_device_id: Option<String>,
+    production: Option<ProductionBatch>,
 }
 
 impl PendingRecord {
@@ -297,6 +301,7 @@ impl ScanSchedule {
 pub struct FlashApp {
     workspace: Workspace,
     validation: ValidationWorkspace,
+    production_inputs: ProductionInputs,
     selected_chip: ChipModel,
     pending_chip: ChipModel,
     batch_chip: ChipModel,
@@ -331,6 +336,7 @@ pub struct FlashApp {
     telemetry_settings: TelemetrySettings,
     telemetry_draft: TelemetrySettings,
     batch_telemetry_settings: TelemetrySettings,
+    batch_production: Option<ProductionBatch>,
     telemetry_settings_error: Option<String>,
     settings_headers: Vec<(String, String)>,
     settings_extraction_rules_json: String,
@@ -446,6 +452,7 @@ impl FlashApp {
         let mut app = Self {
             workspace: Workspace::Flash,
             validation: ValidationWorkspace::default(),
+            production_inputs: ProductionInputs::default(),
             selected_chip: ChipModel::default(),
             pending_chip: ChipModel::default(),
             batch_chip: ChipModel::default(),
@@ -479,6 +486,7 @@ impl FlashApp {
             settings_open: false,
             telemetry_draft: telemetry_settings.clone(),
             batch_telemetry_settings: telemetry_settings.clone(),
+            batch_production: None,
             settings_headers: telemetry_settings
                 .custom_headers
                 .iter()
@@ -613,7 +621,7 @@ impl FlashApp {
             self.ports = ports;
             self.scan_error = error;
             if success {
-                self.last_scan = Local::now().format("%H:%M:%S").to_string();
+                self.last_scan = beijing_now().format("%H:%M:%S").to_string();
             }
         }
         self.start_scheduled_scan();
@@ -634,6 +642,9 @@ impl FlashApp {
             self.error = Some("请先勾选在线的待烧录串口。".into());
             return;
         }
+        let Some(setup) = self.prepare_record_setup(RecordOperation::Flash, true) else {
+            return;
+        };
         let mut inputs = Vec::new();
         for (index, row) in self.firmware.iter().enumerate().filter(|(_, r)| r.enabled) {
             if row.path.as_os_str().is_empty() {
@@ -680,7 +691,7 @@ impl FlashApp {
                 self.firmware_hash = firmware_hash;
                 self.batch_firmware = batch_firmware;
                 self.batch_chip = self.selected_chip;
-                self.attach_batch(batch, ports, RecordOperation::Flash);
+                self.attach_batch(batch, ports, RecordOperation::Flash, setup);
             }
             Err(err) => self.error = Some(format!("无法启动批次：{err:#}")),
         }
@@ -694,7 +705,13 @@ impl FlashApp {
             .collect()
     }
 
-    fn attach_batch(&mut self, batch: Batch, ports: Vec<Port>, operation: RecordOperation) {
+    fn attach_batch(
+        &mut self,
+        batch: Batch,
+        ports: Vec<Port>,
+        operation: RecordOperation,
+        setup: RecordSetup,
+    ) {
         self.jobs.clear();
         self.expected_jobs = ports.len();
         self.logs.clear();
@@ -705,9 +722,10 @@ impl FlashApp {
             .collect();
         self.batch_port_snapshots = ports;
         self.batch_started = timestamp();
-        self.batch_started_at = chrono::Utc::now().to_rfc3339();
+        self.batch_started_at = beijing_now().to_rfc3339();
         self.batch_id = telemetry::new_batch_id();
-        self.batch_telemetry_settings = self.telemetry_settings.clone();
+        self.batch_telemetry_settings = setup.settings;
+        self.batch_production = setup.production;
         self.batch_summary_logged = false;
         match operation {
             RecordOperation::Flash => self.device_logs.begin_batch(
@@ -732,7 +750,7 @@ impl FlashApp {
 
     fn log(&mut self, message: String) {
         self.logs
-            .push_back(format!("{}  {message}", Local::now().format("%H:%M:%S")));
+            .push_back(format!("{}  {message}", beijing_now().format("%H:%M:%S")));
         while self.logs.len() > 1_000 {
             self.logs.pop_front();
         }
@@ -781,12 +799,12 @@ impl FlashApp {
                 kind == BatchEventKind::State && is_terminal(&state) && row.finished_at.is_empty();
             if state == JobState::Connecting && row.started.is_empty() {
                 row.started = now.clone();
-                row.started_at = chrono::Utc::now().to_rfc3339();
+                row.started_at = beijing_now().to_rfc3339();
                 row.elapsed = Some(Instant::now());
             }
             if first_terminal {
                 row.finished = now;
-                row.finished_at = chrono::Utc::now().to_rfc3339();
+                row.finished_at = beijing_now().to_rfc3339();
                 row.duration_secs = row.elapsed.map(|start| start.elapsed().as_secs_f64());
             }
             if let Some(reported) = &identity {
@@ -921,17 +939,19 @@ impl FlashApp {
             device,
             operation: self.batch_operation,
             unique_device_id: row.unique_device_id.clone(),
+            production: self.batch_production.clone(),
         });
         self.retry_record_submissions();
     }
 
     fn retry_record_submissions(&mut self) {
         while let Some(pending) = self.pending_records.front() {
-            match self.record_service.submit_with_identity(
+            match self.record_service.submit_with_production(
                 &pending.settings,
                 pending.draft.clone(),
                 pending.operation,
                 pending.unique_device_id.as_deref(),
+                pending.production.as_ref(),
             ) {
                 Ok(id) => {
                     let pending = self
@@ -1061,17 +1081,16 @@ impl FlashApp {
                             if secondary_button(ui, "关闭", [64.0, 29.0]).clicked() {
                                 close = true;
                             }
-                            if secondary_button(ui, "复制", [64.0, 29.0]).clicked() {
-                                let text = self
-                                    .device_logs
+                            let copy = secondary_button(ui, "复制", [64.0, 29.0]);
+                            clipboard::copy_with_feedback(ui, copy, || {
+                                self.device_logs
                                     .history
                                     .get(&key)
                                     .map(|lines| {
                                         lines.iter().cloned().collect::<Vec<_>>().join("\n")
                                     })
-                                    .unwrap_or_default();
-                                ctx.copy_text(text);
-                            }
+                                    .unwrap_or_default()
+                            });
                         });
                     });
                     ui.separator();
@@ -1201,7 +1220,13 @@ impl FlashApp {
 
     fn retry_failed_local_records(&mut self) {
         while let Some(mut pending) = self.failed_records.pop_front() {
-            pending.settings.csv_directory = self.telemetry_settings.csv_directory.clone();
+            if let Ok(directory) = effective_record_directory(
+                &self.telemetry_settings,
+                pending.operation,
+                pending.production.as_ref(),
+            ) {
+                pending.settings.csv_directory = Some(directory);
+            }
             pending.refresh_upload_settings(&self.telemetry_settings);
             self.pending_records.push_back(pending);
         }
@@ -2339,15 +2364,17 @@ impl FlashApp {
             }
         };
         let reading = self.batch_operation == RecordOperation::ReadOnly;
-        let Some(path) = rfd::FileDialog::new()
+        let mut dialog = rfd::FileDialog::new()
             .set_title("导出本批设备结果")
             .set_file_name(format!(
                 "flashtool-{}.csv",
-                Local::now().format("%Y%m%d-%H%M%S")
+                beijing_now().format("%Y%m%d-%H%M%S")
             ))
-            .add_filter("CSV 表格", &["csv"])
-            .save_file()
-        else {
+            .add_filter("CSV 表格", &["csv"]);
+        if let Some(directory) = &settings.csv_directory {
+            dialog = dialog.set_directory(directory);
+        }
+        let Some(path) = dialog.save_file() else {
             return;
         };
         let mut output = String::from("\u{feff}");
@@ -2373,9 +2400,22 @@ impl FlashApp {
             .map(String::as_str)
             .collect();
         custom_keys.insert(telemetry::UNIQUE_DEVICE_ID_KEY);
+        let production_values = self.batch_production.as_ref().map(|production| {
+            [
+                production.work_order.clone(),
+                production.board_week.clone(),
+                production.board_date.to_string(),
+            ]
+        });
         append_csv(
             &mut output,
-            header.into_iter().chain(custom_keys.iter().copied()),
+            header.into_iter().chain(custom_keys.iter().copied()).chain(
+                production_values
+                    .as_ref()
+                    .map(|_| PRODUCTION_HEADERS)
+                    .into_iter()
+                    .flatten(),
+            ),
         );
         for (port, row) in &self.jobs {
             let progress = format!("{:.1}%", row.progress * 100.0);
@@ -2425,7 +2465,8 @@ impl FlashApp {
                     custom_keys
                         .iter()
                         .map(|key| fields.custom_fields.get(*key).map_or("", String::as_str)),
-                ),
+                )
+                .chain(production_values.iter().flatten().map(String::as_str)),
             );
         }
         match fs::write(&path, output) {
@@ -2508,6 +2549,8 @@ impl eframe::App for FlashApp {
                             banner(ui, message, false);
                             ui.add_space(12.0);
                         }
+                        self.production_input_panel(ui, !busy);
+                        ui.add_space(12.0);
                         match self.workspace {
                             Workspace::Flash => {
                                 card(ui, |ui| {
@@ -3280,14 +3323,15 @@ fn update_error_panel(ui: &mut egui::Ui, ctx: &egui::Context, status: &str, mess
     ui.add_space(7.0);
     // Keep these actions outside every error/release ScrollArea.
     ui.horizontal_wrapped(|ui| {
-        if secondary_button(ui, "复制错误详情", [124.0, 34.0]).clicked() {
-            ctx.copy_text(format!(
+        let copy = secondary_button(ui, "复制错误详情", [124.0, 34.0]);
+        clipboard::copy_with_feedback(ui, copy, || {
+            format!(
                 "FlashTool {}\n{}\n{}",
                 env!("CARGO_PKG_VERSION"),
                 status,
                 message
-            ));
-        }
+            )
+        });
         if secondary_button(ui, "打开官方发布页", [140.0, 34.0]).clicked() {
             ctx.open_url(egui::OpenUrl::new_tab(updater::RELEASES_URL));
         }
@@ -3304,16 +3348,12 @@ fn format_update_time(timestamp: u64) -> String {
     i64::try_from(timestamp)
         .ok()
         .and_then(|seconds| chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0))
-        .map(|time| {
-            time.with_timezone(&Local)
-                .format("%Y-%m-%d %H:%M")
-                .to_string()
-        })
+        .map(|time| beijing_datetime(time).format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| "时间无效".into())
 }
 
 fn timestamp() -> String {
-    Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+    beijing_now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 fn state_label(state: &JobState) -> &'static str {

@@ -28,6 +28,36 @@ fn verification_metric(ui: &mut egui::Ui, label: &str, value: &str, color: Color
     });
 }
 
+fn validation_identity_value(
+    ui: &mut egui::Ui,
+    key: &DeviceLogKey,
+    label: &str,
+    value: Option<&str>,
+) {
+    ui.push_id(("validation_identity", key, label), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(label).size(11.0).color(MUTED));
+            ui.label(
+                RichText::new(value.unwrap_or("未读取"))
+                    .monospace()
+                    .size(12.0)
+                    .color(INK),
+            );
+            if let Some(value) = value {
+                ui.scope(|ui| {
+                    ui.spacing_mut().button_padding = egui::vec2(5.0, 2.0);
+                    ui.spacing_mut().interact_size.y = 22.0;
+                    let response = ui.add(
+                        egui::Button::new(RichText::new("复制").size(11.0).color(ACCENT))
+                            .frame(false),
+                    );
+                    clipboard::copy_with_feedback(ui, response, || value.to_owned());
+                });
+            }
+        });
+    });
+}
+
 impl FlashApp {
     pub(super) fn validation_panel(&mut self, ui: &mut egui::Ui) {
         let locked = self.busy();
@@ -289,15 +319,32 @@ impl FlashApp {
                             {
                                 requested_logs.push(row.key.clone());
                             }
-                            ui.label(
-                                RichText::new(status)
-                                    .monospace()
-                                    .size(18.0)
-                                    .strong()
-                                    .color(color),
-                            );
+                            if status != "PASS" {
+                                ui.label(
+                                    RichText::new(status)
+                                        .monospace()
+                                        .size(18.0)
+                                        .strong()
+                                        .color(color),
+                                );
+                            }
                         });
                     });
+                    if status == "PASS" {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 58.0),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    RichText::new("PASS！")
+                                        .heading()
+                                        .size(42.0)
+                                        .strong()
+                                        .color(SUCCESS),
+                                );
+                            },
+                        );
+                    }
                     if let Some(checks) = &row.checks {
                         ui.horizontal_wrapped(|ui| {
                             verification_metric(
@@ -329,29 +376,12 @@ impl FlashApp {
                                 },
                             );
                         });
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(format!(
-                                    "MAC  {}",
-                                    checks.mac.as_deref().unwrap_or("未读取")
-                                ))
-                                .monospace()
-                                .size(12.0)
-                                .color(INK),
-                            )
-                            .wrap(),
-                        );
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(format!(
-                                    "UNIQUE DEVICE ID  {}",
-                                    checks.unique_device_id.as_deref().unwrap_or("未读取")
-                                ))
-                                .monospace()
-                                .size(12.0)
-                                .color(INK),
-                            )
-                            .wrap(),
+                        validation_identity_value(ui, &row.key, "MAC", checks.mac.as_deref());
+                        validation_identity_value(
+                            ui,
+                            &row.key,
+                            "UNIQUE DEVICE ID",
+                            checks.unique_device_id.as_deref(),
                         );
                         for failure in &checks.failures {
                             ui.add(
@@ -397,9 +427,8 @@ impl FlashApp {
                 if secondary_button(ui, "打开 CSV", [94.0, 31.0]).clicked() {
                     self.open_validation_report();
                 }
-                if text_button(ui, "复制路径").clicked() {
-                    ui.ctx().copy_text(path.display().to_string());
-                }
+                let response = text_button(ui, "复制路径");
+                clipboard::copy_with_feedback(ui, response, || path.display().to_string());
             });
             ui.add(
                 egui::Label::new(
@@ -436,6 +465,16 @@ impl FlashApp {
             .show(ctx, |ui| {
                 ui.set_width((ctx.screen_rect().width() - 64.0).clamp(260.0, 760.0));
                 ui.label(RichText::new("本批验证结果").heading().size(20.0).strong());
+                if let Some(production) = &self.validation.production {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} · 年周 {}",
+                            production.work_order, production.board_week
+                        ))
+                        .size(12.0)
+                        .color(MUTED),
+                    );
+                }
                 if self.validation.report.is_none() {
                     ui.label(RichText::new("报告尚未保存").size(12.0).color(DANGER));
                 }
@@ -481,9 +520,8 @@ impl FlashApp {
                         if primary_button(ui, "打开 CSV", [104.0, 33.0]).clicked() {
                             self.open_validation_report();
                         }
-                        if text_button(ui, "复制路径").clicked() {
-                            ctx.copy_text(path.display().to_string());
-                        }
+                        let response = text_button(ui, "复制路径");
+                        clipboard::copy_with_feedback(ui, response, || path.display().to_string());
                     }
                 });
             });

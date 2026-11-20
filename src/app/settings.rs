@@ -288,7 +288,7 @@ impl FlashApp {
         ui.horizontal_wrapped(|ui| {
             if secondary_button(ui, "选择目录", [90.0, 31.0]).clicked()
                 && let Some(path) = rfd::FileDialog::new()
-                    .set_title("选择烧录记录 CSV 目录")
+                    .set_title("选择本地 CSV 记录根目录")
                     .pick_folder()
             {
                 self.telemetry_draft.csv_directory = Some(path);
@@ -531,9 +531,8 @@ impl FlashApp {
                     .size(16.0)
                     .strong(),
             );
-            if text_button(ui, "复制示例").clicked() {
-                ui.ctx().copy_text(EXTRACTION_RULES_EXAMPLE.into());
-            }
+            let copy = text_button(ui, "复制示例");
+            clipboard::copy_with_feedback(ui, copy, || EXTRACTION_RULES_EXAMPLE.into());
             if ui
                 .add_enabled_ui(matches!(validation, Ok(0)), |ui| {
                     text_button(ui, "填入示例")

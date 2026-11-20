@@ -24,6 +24,7 @@ pub const MAX_CAPTURE_DECODED_BYTES: usize = MAX_CAPTURE_BYTES - 128;
 pub const MAX_CAPTURE_LINES: usize = 8_192;
 pub const MAX_LINE_BYTES: usize = 16 * 1024;
 const READ_SLICE: Duration = Duration::from_millis(100);
+const VALIDATION_QUIET: Duration = Duration::from_millis(700);
 
 #[derive(Clone, Debug)]
 pub struct CaptureOptions {
@@ -87,6 +88,27 @@ pub struct CaptureSummary {
     pub limit: Option<CaptureLimit>,
 }
 
+pub(crate) struct ValidationCaptureResult {
+    pub summary: CaptureSummary,
+    /// Only the dedicated validation path sets this after a fresh C3 boot
+    /// marker, complete passing lines and 700 ms with no received bytes.
+    pub early_verified: bool,
+}
+impl ValidationCaptureResult {
+    fn normal(summary: CaptureSummary) -> Self {
+        Self {
+            summary,
+            early_verified: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompletionMode {
+    FullInterval,
+    Validation,
+}
+
 /// Capture one frozen device identity. Call from a worker, never the UI thread.
 /// Callback `true` continues; `false` stops immediately (e.g. required fields
 /// were captured). No UART bytes are written, no buffers are purged and no ROM,
@@ -98,7 +120,15 @@ pub fn capture(
     cancel: &AtomicBool,
     callback: &mut dyn FnMut(CaptureEvent) -> bool,
 ) -> Result<CaptureSummary> {
-    capture_impl(expected, options, cancel, callback, false)
+    capture_impl(
+        expected,
+        options,
+        cancel,
+        callback,
+        false,
+        CompletionMode::FullInterval,
+    )
+    .map(|result| result.summary)
 }
 
 /// Reset this frozen device into normal firmware boot, then listen for up to
@@ -118,7 +148,38 @@ pub fn capture_startup_log(
         reset: true,
         ..CaptureOptions::default()
     };
-    capture_impl(expected, &options, cancel, callback, true)
+    capture_impl(
+        expected,
+        &options,
+        cancel,
+        callback,
+        true,
+        CompletionMode::FullInterval,
+    )
+    .map(|result| result.summary)
+}
+
+/// Batch verification alone may finish after complete fresh-boot evidence and
+/// quiet. The standalone startup-log API deliberately keeps its full interval.
+pub(crate) fn capture_validation_startup_log(
+    expected: &Port,
+    baud: u32,
+    cancel: &AtomicBool,
+    callback: &mut dyn FnMut(CaptureEvent) -> bool,
+) -> Result<ValidationCaptureResult> {
+    let options = CaptureOptions {
+        baud,
+        reset: true,
+        ..CaptureOptions::default()
+    };
+    capture_impl(
+        expected,
+        &options,
+        cancel,
+        callback,
+        true,
+        CompletionMode::Validation,
+    )
 }
 
 fn capture_impl(
@@ -127,15 +188,20 @@ fn capture_impl(
     cancel: &AtomicBool,
     callback: &mut dyn FnMut(CaptureEvent) -> bool,
     startup_reset: bool,
-) -> Result<CaptureSummary> {
+    completion: CompletionMode,
+) -> Result<ValidationCaptureResult> {
     validate_options(options)?;
     if cancel.load(Ordering::Acquire) {
-        return Ok(empty_summary(CaptureEnd::Cancelled));
+        return Ok(ValidationCaptureResult::normal(empty_summary(
+            CaptureEnd::Cancelled,
+        )));
     }
     let current = backend::list_ports().context("监听前无法确认当前在线串口")?;
     let actual = expected_port(expected, &current)?;
     if cancel.load(Ordering::Acquire) {
-        return Ok(empty_summary(CaptureEnd::Cancelled));
+        return Ok(ValidationCaptureResult::normal(empty_summary(
+            CaptureEnd::Cancelled,
+        )));
     }
     let mut serial = serialport::new(&actual.name, options.baud)
         .data_bits(DataBits::Eight)
@@ -159,14 +225,20 @@ fn capture_impl(
         expected_port(expected, &after_open)?;
     }
     if !callback(CaptureEvent::Opened) {
-        return Ok(empty_summary(CaptureEnd::Stopped));
+        return Ok(ValidationCaptureResult::normal(empty_summary(
+            CaptureEnd::Stopped,
+        )));
     }
     if options.reset {
         if cancel.load(Ordering::Acquire) {
-            return Ok(empty_summary(CaptureEnd::Cancelled));
+            return Ok(ValidationCaptureResult::normal(empty_summary(
+                CaptureEnd::Cancelled,
+            )));
         }
         if !callback(CaptureEvent::Resetting) {
-            return Ok(empty_summary(CaptureEnd::Stopped));
+            return Ok(ValidationCaptureResult::normal(empty_summary(
+                CaptureEnd::Stopped,
+            )));
         }
         if startup_reset {
             let native_usb = reset_usb_info(actual).pid == 0x1001;
@@ -178,7 +250,9 @@ fn capture_impl(
                     )
                 })?;
             if outcome == ResetOutcome::Cancelled {
-                return Ok(empty_summary(CaptureEnd::Cancelled));
+                return Ok(ValidationCaptureResult::normal(empty_summary(
+                    CaptureEnd::Cancelled,
+                )));
             }
         } else {
             // Preserve the existing batch-read reset behavior. In pinned
@@ -195,8 +269,16 @@ fn capture_impl(
             serial = connection.into_serial();
         }
     }
-    capture_reader(&mut serial, options, cancel, callback)
-        .with_context(|| format!("{} 串口日志采集失败", actual.name))
+    capture_reader_with_completion(
+        &mut serial,
+        options,
+        cancel,
+        callback,
+        completion,
+        Instant::now,
+        thread::sleep,
+    )
+    .with_context(|| format!("{} 串口日志采集失败", actual.name))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -388,32 +470,118 @@ impl<T: SerialPort> CaptureRead for T {
     }
 }
 
+#[cfg(test)]
 fn capture_reader(
     serial: &mut impl CaptureRead,
     options: &CaptureOptions,
     cancel: &AtomicBool,
     callback: &mut dyn FnMut(CaptureEvent) -> bool,
 ) -> Result<CaptureSummary> {
-    let start = Instant::now();
+    capture_reader_with_completion(
+        serial,
+        options,
+        cancel,
+        callback,
+        CompletionMode::FullInterval,
+        Instant::now,
+        thread::sleep,
+    )
+    .map(|result| result.summary)
+}
+
+#[derive(Default)]
+struct QuietVerification {
+    lines: Vec<String>,
+    marker_seen: bool,
+    last_rx: Option<Instant>,
+    evaluated_bytes: Option<usize>,
+    evaluated_pass: bool,
+    #[cfg(test)]
+    evaluations: usize,
+}
+impl QuietVerification {
+    fn line(&mut self, line: &str) {
+        if c3_boot_marker(line) {
+            self.marker_seen = true;
+            self.lines.clear();
+            self.evaluated_bytes = None;
+        } else if self.marker_seen {
+            self.lines.push(line.to_owned());
+        }
+    }
+
+    fn passes_after_quiet(&mut self, now: Instant, pending: bool, received_bytes: usize) -> bool {
+        if !self.marker_seen
+            || pending
+            || !self
+                .last_rx
+                .is_some_and(|last| now.saturating_duration_since(last) >= VALIDATION_QUIET)
+        {
+            return false;
+        }
+        if self.evaluated_bytes != Some(received_bytes) {
+            // At most one evaluation per changed quiet burst, never per byte
+            // or line. The 10-second/700-ms window also bounds evaluations.
+            self.evaluated_pass = crate::verification::evaluate(&self.lines).passes();
+            self.evaluated_bytes = Some(received_bytes);
+            #[cfg(test)]
+            {
+                self.evaluations += 1;
+            }
+        }
+        self.evaluated_pass
+    }
+}
+
+fn c3_boot_marker(line: &str) -> bool {
+    let line = line.trim();
+    if let Some(suffix) = line.strip_prefix("ESP-ROM:esp32c3") {
+        return suffix.is_empty() || suffix.starts_with('-');
+    }
+    let hex_value = |value: &str| value.as_bytes().first().is_some_and(u8::is_ascii_hexdigit);
+    line.strip_prefix("rst:0x").is_some_and(hex_value)
+        && line
+            .split_once("boot:0x")
+            .is_some_and(|(_, value)| hex_value(value))
+}
+
+fn capture_reader_with_completion(
+    serial: &mut impl CaptureRead,
+    options: &CaptureOptions,
+    cancel: &AtomicBool,
+    callback: &mut dyn FnMut(CaptureEvent) -> bool,
+    completion: CompletionMode,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+) -> Result<ValidationCaptureResult> {
+    let start = now();
     let deadline = start
         .checked_add(options.timeout)
         .context("日志监听超时时间过大")?;
     let mut summary = empty_summary(CaptureEnd::TimedOut);
     let mut lines = LineDecoder::default();
+    let mut verification = QuietVerification::default();
+    let mut quiet_candidate = false;
+    let mut early_verified = false;
     let mut buffer = [0_u8; 4_096];
     loop {
         if cancel.load(Ordering::Acquire) {
             summary.end = CaptureEnd::Cancelled;
             break;
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.saturating_duration_since(now());
         if remaining.is_zero() {
             break;
         }
         // Windows serialport rounds to milliseconds. Never let a final
         // sub-millisecond slice turn into the special zero-timeout setting.
+        let read_slice = if quiet_candidate {
+            Duration::from_millis(1)
+        } else {
+            READ_SLICE
+        };
         serial
-            .read_timeout(remaining.min(READ_SLICE).max(Duration::from_millis(1)))
+            .read_timeout(remaining.min(read_slice).max(Duration::from_millis(1)))
             .context("设置串口读取超时失败")?;
         let capacity = buffer.len().min(MAX_CAPTURE_BYTES - summary.bytes_read);
         if capacity == 0 {
@@ -431,8 +599,32 @@ fn capture_reader(
                         | io::ErrorKind::Interrupted
                 ) =>
             {
+                if cancel.load(Ordering::Acquire) {
+                    summary.end = CaptureEnd::Cancelled;
+                    break;
+                }
+                if completion == CompletionMode::Validation
+                    && error.kind() != io::ErrorKind::Interrupted
+                {
+                    if verification.passes_after_quiet(
+                        now(),
+                        !lines.bytes.is_empty(),
+                        summary.bytes_read,
+                    ) {
+                        if quiet_candidate {
+                            early_verified = true;
+                            summary.end = CaptureEnd::Stopped;
+                            break;
+                        }
+                        // Drain once more with a short read after parsing, so
+                        // bytes that arrived during evaluation are not cut off.
+                        quiet_candidate = true;
+                    } else {
+                        quiet_candidate = false;
+                    }
+                }
                 if error.kind() != io::ErrorKind::Interrupted {
-                    thread::sleep(Duration::from_millis(1).min(remaining));
+                    sleep(Duration::from_millis(1).min(remaining));
                 }
                 continue;
             }
@@ -444,12 +636,42 @@ fn capture_reader(
             }
         };
         if length == 0 {
+            if cancel.load(Ordering::Acquire) {
+                summary.end = CaptureEnd::Cancelled;
+                break;
+            }
+            if completion == CompletionMode::Validation {
+                if verification.passes_after_quiet(
+                    now(),
+                    !lines.bytes.is_empty(),
+                    summary.bytes_read,
+                ) {
+                    if quiet_candidate {
+                        early_verified = true;
+                        summary.end = CaptureEnd::Stopped;
+                        break;
+                    }
+                    quiet_candidate = true;
+                } else {
+                    quiet_candidate = false;
+                }
+            }
             // Avoid a busy loop with drivers that return immediately on no data.
-            thread::sleep(Duration::from_millis(1).min(remaining));
+            sleep(Duration::from_millis(1).min(remaining));
             continue;
         }
         summary.bytes_read += length;
-        if let Some(end) = lines.feed(&buffer[..length], &mut summary, callback) {
+        quiet_candidate = false;
+        verification.last_rx = Some(now());
+        let mut forward = |event| {
+            if completion == CompletionMode::Validation
+                && let CaptureEvent::Line(line) = &event
+            {
+                verification.line(line);
+            }
+            callback(event)
+        };
+        if let Some(end) = lines.feed(&buffer[..length], &mut summary, &mut forward) {
             summary.end = end;
             break;
         }
@@ -471,8 +693,11 @@ fn capture_reader(
             summary.end = CaptureEnd::Stopped;
         }
     }
-    summary.elapsed = start.elapsed();
-    Ok(summary)
+    summary.elapsed = now().saturating_duration_since(start);
+    Ok(ValidationCaptureResult {
+        summary,
+        early_verified,
+    })
 }
 
 #[derive(Default)]
@@ -539,6 +764,275 @@ fn emit_line(
 mod tests {
     use super::*;
     use std::{cell::Cell, collections::VecDeque, rc::Rc};
+
+    struct ScheduledRead {
+        time: Rc<Cell<Duration>>,
+        incoming: VecDeque<(Duration, Vec<u8>)>,
+        timeout: Duration,
+    }
+    impl Read for ScheduledRead {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let deadline = self.time.get() + self.timeout;
+            if self.incoming.front().is_some_and(|(at, _)| *at <= deadline) {
+                let (at, bytes) = self.incoming.pop_front().unwrap();
+                self.time.set(at.max(self.time.get()));
+                let length = bytes.len().min(output.len());
+                output[..length].copy_from_slice(&bytes[..length]);
+                if length < bytes.len() {
+                    self.incoming
+                        .push_front((self.time.get(), bytes[length..].to_vec()));
+                }
+                return Ok(length);
+            }
+            self.time.set(deadline);
+            Err(io::ErrorKind::TimedOut.into())
+        }
+    }
+    impl CaptureRead for ScheduledRead {
+        fn read_timeout(&mut self, timeout: Duration) -> Result<()> {
+            self.timeout = timeout;
+            Ok(())
+        }
+    }
+
+    fn passing_startup() -> Vec<u8> {
+        concat!(
+            "ESP-ROM:esp32c3-api1-20210207\n",
+            "MAX30105 detected & working!\n",
+            "BMI270 detected & working!\n",
+            "MAC ADDRESS: 00:11:22:AA:BB:CC\n",
+            "UNIQUE DEVICE ID: 00112233445566778899AABBCCDDEEFF\n",
+            "Analog Read in millivolts at battery pin: 2922\n",
+        )
+        .as_bytes()
+        .to_vec()
+    }
+
+    fn scheduled_capture(
+        mode: CompletionMode,
+        incoming: Vec<(u64, Vec<u8>)>,
+    ) -> (ValidationCaptureResult, Vec<String>) {
+        let time = Rc::new(Cell::new(Duration::ZERO));
+        let mut serial = ScheduledRead {
+            time: time.clone(),
+            incoming: incoming
+                .into_iter()
+                .map(|(at, data)| (Duration::from_millis(at), data))
+                .collect(),
+            timeout: READ_SLICE,
+        };
+        let now_time = time.clone();
+        let base = Instant::now();
+        let mut raw = Vec::new();
+        let result = capture_reader_with_completion(
+            &mut serial,
+            &CaptureOptions::default(),
+            &AtomicBool::new(false),
+            &mut |event| {
+                if let CaptureEvent::Line(line) = event {
+                    raw.push(line);
+                }
+                true
+            },
+            mode,
+            move || base + now_time.get(),
+            move |delay| time.set(time.get() + delay),
+        )
+        .unwrap();
+        (result, raw)
+    }
+
+    #[test]
+    fn verification_quiet_finishes_early_but_standalone_startup_still_collects_ten_seconds() {
+        let data = passing_startup();
+        let (result, raw) = scheduled_capture(CompletionMode::Validation, vec![(0, data.clone())]);
+        assert!(result.early_verified);
+        assert_eq!(result.summary.end, CaptureEnd::Stopped);
+        assert!(
+            result.summary.elapsed >= VALIDATION_QUIET
+                && result.summary.elapsed < Duration::from_secs(1)
+        );
+        assert_eq!(
+            raw,
+            String::from_utf8(data.clone())
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>()
+        );
+        let (result, _) = scheduled_capture(CompletionMode::FullInterval, vec![(0, data)]);
+        assert!(!result.early_verified);
+        assert_eq!(result.summary.end, CaptureEnd::TimedOut);
+        assert!(result.summary.elapsed >= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn partial_battery_and_utf8_tail_delay_quiet_without_losing_any_raw_lines() {
+        let mut partial = passing_startup();
+        partial.truncate(partial.len() - 2); // Battery "292", no newline yet.
+        let (result, raw) = scheduled_capture(
+            CompletionMode::Validation,
+            vec![(0, partial.clone()), (1_000, b"2\n".to_vec())],
+        );
+        assert!(result.early_verified && result.summary.elapsed >= Duration::from_millis(1_700));
+        assert_eq!(
+            raw.last().unwrap(),
+            "Analog Read in millivolts at battery pin: 2922"
+        );
+        let (result, raw) = scheduled_capture(
+            CompletionMode::Validation,
+            vec![(0, partial), (1_000, b"3\n".to_vec())],
+        );
+        assert!(!result.early_verified);
+        assert!(result.summary.elapsed >= Duration::from_secs(10));
+        assert!(raw.last().unwrap().ends_with("2923"));
+        let (result, raw) = scheduled_capture(
+            CompletionMode::Validation,
+            vec![
+                (0, passing_startup()),
+                (600, b"debug \xe4".to_vec()),
+                (900, b"\xbd\xa0\n".to_vec()),
+            ],
+        );
+        assert!(result.early_verified && result.summary.elapsed >= Duration::from_millis(1_600));
+        assert_eq!(raw.last().unwrap(), "debug 你");
+    }
+
+    #[test]
+    fn final_short_drain_keeps_a_latest_burst_and_late_failure_prevents_early_pass() {
+        // With this fake clock, the first eligible idle occurs at 706 ms.
+        // Bytes arriving while/after evidence was parsed must still be read.
+        let (result, raw) = scheduled_capture(
+            CompletionMode::Validation,
+            vec![(0, passing_startup()), (707, b"last diagnostic\n".to_vec())],
+        );
+        assert!(result.early_verified && result.summary.elapsed >= Duration::from_millis(1_407));
+        assert_eq!(raw.last().unwrap(), "last diagnostic");
+        let failure = b"Error: BMI270 not connected, check wiring and I2C address!\n";
+        let (result, raw) = scheduled_capture(
+            CompletionMode::Validation,
+            vec![(0, passing_startup()), (600, failure.to_vec())],
+        );
+        assert!(!result.early_verified && result.summary.elapsed >= Duration::from_secs(10));
+        assert_eq!(
+            raw.last().unwrap(),
+            String::from_utf8_lossy(failure).trim_end()
+        );
+    }
+
+    #[test]
+    fn cancellation_during_final_short_drain_cannot_report_early_success() {
+        struct CancelDuringDrain<'a> {
+            inner: ScheduledRead,
+            cancel: &'a AtomicBool,
+        }
+        impl Read for CancelDuringDrain<'_> {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                let result = self.inner.read(output);
+                if self.inner.timeout == Duration::from_millis(1) {
+                    self.cancel.store(true, Ordering::Release);
+                }
+                result
+            }
+        }
+        impl CaptureRead for CancelDuringDrain<'_> {
+            fn read_timeout(&mut self, timeout: Duration) -> Result<()> {
+                self.inner.read_timeout(timeout)
+            }
+        }
+        let time = Rc::new(Cell::new(Duration::ZERO));
+        let now_time = time.clone();
+        let cancel = AtomicBool::new(false);
+        let mut serial = CancelDuringDrain {
+            inner: ScheduledRead {
+                time: time.clone(),
+                incoming: [(Duration::ZERO, passing_startup())].into(),
+                timeout: READ_SLICE,
+            },
+            cancel: &cancel,
+        };
+        let base = Instant::now();
+        let mut lines = 0;
+        let result = capture_reader_with_completion(
+            &mut serial,
+            &CaptureOptions::default(),
+            &cancel,
+            &mut |event| {
+                if matches!(event, CaptureEvent::Line(_)) {
+                    lines += 1;
+                }
+                true
+            },
+            CompletionMode::Validation,
+            move || base + now_time.get(),
+            move |delay| time.set(time.get() + delay),
+        )
+        .unwrap();
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(!result.early_verified);
+        assert_eq!(result.summary.end, CaptureEnd::Cancelled);
+        assert_eq!(lines, 6);
+    }
+
+    #[test]
+    fn verification_requires_latest_fresh_marker_and_complete_lines_or_falls_back() {
+        let data = passing_startup();
+        let no_marker = data
+            .splitn(2, |byte| *byte == b'\n')
+            .nth(1)
+            .unwrap()
+            .to_vec();
+        for incoming in [
+            vec![(0, no_marker)],
+            vec![
+                (0, data.clone()),
+                (
+                    600,
+                    b"rst:0x1 (POWERON),boot:0xc (SPI_FAST_FLASH_BOOT)\n".to_vec(),
+                ),
+            ],
+            vec![(0, data), (600, b"unterminated tail".to_vec())],
+        ] {
+            let (result, raw) = scheduled_capture(CompletionMode::Validation, incoming);
+            assert!(!result.early_verified);
+            assert_eq!(result.summary.end, CaptureEnd::TimedOut);
+            assert!(result.summary.elapsed >= Duration::from_secs(10));
+            assert!(!raw.is_empty());
+        }
+        assert!(c3_boot_marker("ESP-ROM:esp32c3-api1-20210207"));
+        assert!(c3_boot_marker(
+            "rst:0x1 (POWERON),boot:0xc (SPI_FAST_FLASH_BOOT)"
+        ));
+        for invalid in [
+            "prefix ESP-ROM:esp32c3",
+            "ESP-ROM:esp32c3x",
+            "ESP-ROM:esp32s3",
+            "rst:garbage boot:0x1",
+            "rst:0x1 boot:bad",
+        ] {
+            assert!(!c3_boot_marker(invalid));
+        }
+    }
+
+    #[test]
+    fn verification_parser_runs_once_per_changed_eligible_quiet_burst() {
+        let base = Instant::now();
+        let mut state = QuietVerification::default();
+        for line in String::from_utf8(passing_startup()).unwrap().lines() {
+            state.line(line);
+        }
+        state.last_rx = Some(base);
+        assert!(!state.passes_after_quiet(base + Duration::from_millis(699), false, 200));
+        assert_eq!(state.evaluations, 0);
+        assert!(state.passes_after_quiet(base + VALIDATION_QUIET, false, 200));
+        for _ in 0..100 {
+            assert!(state.passes_after_quiet(base + Duration::from_secs(1), false, 200));
+        }
+        assert_eq!(state.evaluations, 1);
+        state.last_rx = Some(base + Duration::from_secs(1));
+        assert!(!state.passes_after_quiet(base + Duration::from_secs(2), true, 201));
+        assert!(state.passes_after_quiet(base + Duration::from_secs(2), false, 201));
+        assert_eq!(state.evaluations, 2);
+    }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum ControlEvent {

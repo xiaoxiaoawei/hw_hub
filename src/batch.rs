@@ -2,7 +2,7 @@
 use crate::{
     backend::{self, DeviceIdentity, FlashProgress, Port},
     firmware::PreparedFirmware,
-    serial_capture::{self, CaptureEnd, CaptureEvent, CaptureOptions, CaptureSummary},
+    serial_capture::{self, CaptureEnd, CaptureEvent, CaptureOptions, ValidationCaptureResult},
     telemetry::{CompiledExtractionRules, TelemetrySettings},
 };
 use anyhow::{Context, Result, ensure};
@@ -300,7 +300,8 @@ impl Batch {
     }
 
     /// Reset each frozen device into normal firmware boot and collect its raw
-    /// console for ten seconds. Success here means complete console transport;
+    /// console for at most ten seconds. Complete passing fresh-boot data plus
+    /// 700 ms of quiet may finish earlier. Success means console transport;
     /// the application evaluates its verification criteria independently.
     /// No firmware, extraction regex, eFuse probe or flash operation is used.
     pub fn start_validation(ports: Vec<Port>, baud: u32, concurrency: usize) -> Result<Self> {
@@ -308,7 +309,7 @@ impl Batch {
             ports,
             baud,
             concurrency,
-            serial_capture::capture_startup_log,
+            serial_capture::capture_validation_startup_log,
         )
     }
 
@@ -351,7 +352,7 @@ fn start_validation_with_capture(
         u32,
         &AtomicBool,
         &mut dyn FnMut(CaptureEvent) -> bool,
-    ) -> Result<CaptureSummary>
+    ) -> Result<ValidationCaptureResult>
     + Send
     + Sync
     + 'static,
@@ -376,7 +377,10 @@ fn start_validation_with_capture(
                 .get(&backend::port_name_key(port))
                 .context("本批启动验证设备身份快照丢失")?;
             let mut lines_received = 0usize;
-            let result = capture(snapshot, baud, &AtomicBool::new(false), &mut |event| {
+            let ValidationCaptureResult {
+                summary: result,
+                early_verified,
+            } = capture(snapshot, baud, &AtomicBool::new(false), &mut |event| {
                 match event {
                     CaptureEvent::Opened => {
                         events.state = JobState::Reading;
@@ -392,10 +396,17 @@ fn start_validation_with_capture(
                 }
                 true
             })?;
-            // An early stop, limit or cancellation cannot certify a complete
-            // observation interval. Already forwarded lines stay with this COM.
+            // Only the low-level fresh-marker + complete passing data + quiet
+            // path can certify an early stop. Arbitrary callback stops remain
+            // incomplete. Already forwarded lines stay with this COM.
             match result.end {
                 CaptureEnd::TimedOut => {}
+                CaptureEnd::Stopped if early_verified => {
+                    events.send(
+                        BatchEventKind::Log,
+                        "完整启动数据已收齐并静默 700ms，提前结束采集".into(),
+                    );
+                }
                 CaptureEnd::LimitReached => {
                     anyhow::bail!("启动日志超过本次读取上限，采集结果不完整")
                 }
@@ -578,15 +589,18 @@ mod tests {
         }
     }
 
-    fn capture_summary(end: CaptureEnd, bytes: usize, lines: usize) -> CaptureSummary {
-        CaptureSummary {
-            bytes_read: bytes,
-            decoded_bytes: bytes,
-            lines,
-            elapsed: Duration::from_secs(10),
-            end,
-            limit: (end == CaptureEnd::LimitReached)
-                .then_some(serial_capture::CaptureLimit::TotalBytes),
+    fn capture_summary(end: CaptureEnd, bytes: usize, lines: usize) -> ValidationCaptureResult {
+        ValidationCaptureResult {
+            summary: serial_capture::CaptureSummary {
+                bytes_read: bytes,
+                decoded_bytes: bytes,
+                lines,
+                elapsed: Duration::from_secs(10),
+                end,
+                limit: (end == CaptureEnd::LimitReached)
+                    .then_some(serial_capture::CaptureLimit::TotalBytes),
+            },
+            early_verified: false,
         }
     }
 
@@ -610,6 +624,82 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn validation_accepts_only_certified_quiet_completion_and_preserves_all_raw_lines() {
+        let batch = start_validation_with_capture(
+            ["COM1", "COM2", "COM3"]
+                .into_iter()
+                .map(validation_port)
+                .collect(),
+            115_200,
+            2,
+            |snapshot, _, _, callback| {
+                callback(CaptureEvent::Opened);
+                callback(CaptureEvent::Resetting);
+                let lines = [
+                    "ESP-ROM:esp32c3-api1-20210207",
+                    "MAX30105 detected & working!",
+                    "BMI270 detected & working!",
+                    "MAC ADDRESS: 00:11:22:AA:BB:CC",
+                    "UNIQUE DEVICE ID: 00112233445566778899AABBCCDDEEFF",
+                    "Analog Read in millivolts at battery pin: 2922",
+                    "last diagnostic",
+                ];
+                for line in lines {
+                    assert!(callback(CaptureEvent::Line(line.into())));
+                }
+                let end = if snapshot.name == "COM3" {
+                    CaptureEnd::LimitReached
+                } else {
+                    CaptureEnd::Stopped
+                };
+                let mut result = capture_summary(
+                    end,
+                    lines.iter().map(|line| line.len() + 1).sum(),
+                    lines.len(),
+                );
+                result.summary.elapsed = Duration::from_millis(701);
+                result.early_verified = snapshot.name != "COM2";
+                Ok(result)
+            },
+        )
+        .unwrap();
+        let mut finals = HashMap::new();
+        let mut raw: HashMap<String, Vec<String>> = HashMap::new();
+        let mut quiet_logs = Vec::new();
+        while finals.len() < 3 {
+            let event = batch.receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+            if event.kind == BatchEventKind::DeviceLog {
+                raw.entry(event.port.clone())
+                    .or_default()
+                    .push(event.message.clone());
+            }
+            if event.kind == BatchEventKind::Log && event.message.contains("700ms") {
+                quiet_logs.push(event.port.clone());
+            }
+            if terminal(&event.state) {
+                finals.insert(event.port.clone(), event);
+            }
+        }
+        assert_eq!(finals["COM1"].state, JobState::Success);
+        assert_eq!(
+            finals["COM2"].state,
+            JobState::Failed,
+            "uncertified early stops remain incomplete"
+        );
+        assert_eq!(
+            finals["COM3"].state,
+            JobState::Failed,
+            "a completion flag never waives limits"
+        );
+        assert_eq!(quiet_logs, ["COM1"]);
+        for lines in raw.values() {
+            assert_eq!(lines.len(), 7);
+            assert_eq!(lines.last().unwrap(), "last diagnostic");
+        }
+        assert_eq!(raw.len(), 3);
     }
 
     #[test]

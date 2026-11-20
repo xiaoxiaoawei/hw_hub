@@ -10,8 +10,10 @@ pub(super) struct ValidationWorkspace {
     pub(super) report: Option<PathBuf>,
     pub(super) save_error: Option<String>,
     pub(super) result_open: bool,
+    pub(super) production: Option<ProductionBatch>,
     batch: Option<Batch>,
     batch_id: String,
+    report_directory: Option<PathBuf>,
     save_result: Option<mpsc::Receiver<Result<PathBuf, String>>>,
 }
 
@@ -23,8 +25,10 @@ impl Default for ValidationWorkspace {
             report: None,
             save_error: None,
             result_open: false,
+            production: None,
             batch: None,
             batch_id: String::new(),
+            report_directory: None,
             save_result: None,
         }
     }
@@ -37,6 +41,7 @@ pub(super) struct ValidationRow {
     pub(super) message: String,
     pub(super) key: DeviceLogKey,
     lines: Vec<String>,
+    startup_log: String,
     finished_at: String,
 }
 
@@ -49,16 +54,19 @@ impl ValidationRow {
             checks: None,
             message: "等待验证".into(),
             lines: Vec::new(),
+            startup_log: String::new(),
             finished_at: String::new(),
         }
     }
 
     fn finish(&mut self) {
-        let mut checks = verification::evaluate(&std::mem::take(&mut self.lines));
+        let lines = std::mem::take(&mut self.lines);
+        let mut checks = verification::evaluate(&lines);
         if self.state != JobState::Success {
             checks.failures.insert(0, self.message.clone());
         }
-        self.finished_at = chrono::Utc::now().to_rfc3339();
+        self.startup_log = lines.join("\n");
+        self.finished_at = beijing_now().to_rfc3339();
         self.checks = Some(checks);
     }
 }
@@ -79,6 +87,9 @@ impl FlashApp {
                 return;
             }
         };
+        let Some(setup) = self.prepare_record_setup(RecordOperation::ReadOnly, true) else {
+            return;
+        };
         let ports = self.selected_online_ports();
         let batch = match Batch::start_validation(ports.clone(), baud, self.concurrency) {
             Ok(batch) => batch,
@@ -91,6 +102,8 @@ impl FlashApp {
         self.error = None;
         self.notice = None;
         self.validation.batch_id = telemetry::new_batch_id();
+        self.validation.production = setup.production;
+        self.validation.report_directory = setup.settings.csv_directory;
         self.validation.rows = ports
             .into_iter()
             .map(|port| ValidationRow::new(port, &self.validation.batch_id))
@@ -204,11 +217,14 @@ impl FlashApp {
     }
 
     fn save_validation_report(&mut self) {
-        let directory = self
-            .telemetry_settings
-            .csv_directory
-            .clone()
-            .map_or_else(telemetry::default_records_directory, Ok);
+        let (Some(directory), Some(production)) = (
+            self.validation.report_directory.clone(),
+            self.validation.production.clone(),
+        ) else {
+            self.validation.save_error = Some("本批验证缺少生产信息或保存目录".into());
+            self.validation.result_open = true;
+            return;
+        };
         let records: Vec<_> = self
             .validation
             .rows
@@ -218,6 +234,7 @@ impl FlashApp {
                 port: row.port.name.clone(),
                 finished_at: row.finished_at.clone(),
                 checks: row.checks.clone().expect("finished validation row"),
+                startup_log: row.startup_log.clone(),
             })
             .collect();
         let (sender, receiver) = mpsc::channel();
@@ -226,9 +243,12 @@ impl FlashApp {
         match thread::Builder::new()
             .name("validation-csv".into())
             .spawn(move || {
-                let result = directory
-                    .and_then(|directory| verification_csv::append_batch(&directory, &records))
-                    .map_err(|error| format!("无法保存验证 CSV：{error:#}"));
+                let result = verification_csv::append_batch_with_production(
+                    &directory,
+                    &records,
+                    &production,
+                )
+                .map_err(|error| format!("无法保存验证 CSV：{error:#}"));
                 let _ = sender.send(result);
             }) {
             Ok(_) => self.validation.save_result = Some(receiver),
@@ -281,5 +301,7 @@ mod tests {
         let checks = row.checks.unwrap();
         assert!(!checks.passes());
         assert_eq!(checks.failures, ["设备已断开"]);
+        assert!(row.finished_at.ends_with("+08:00"));
+        assert_eq!(row.startup_log.lines().count(), 5);
     }
 }

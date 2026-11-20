@@ -187,10 +187,10 @@ custom_headers 可用于服务端要求的 Authorization、X-API-Key 等请求�
 
 csv_directory 可指定其他绝对路径。本地保存失败时不发送该记录，界面保留失败状态，供选择可写目录后重试。上传关闭、身份校验失败、HTTP 失败或上传队列暂满时，都应先查看该记录的本地保存结果，不能把上报状态当成本地文件状态。
 
-每个自动保存文件包含表头和一行设备记录。v0.5.5 在末尾追加第 20 列 unique_device_id。logs 单元格用换行连接日志行。缺失的身份或异常字段在 CSV 中用空字符串表示，在 HTTP JSON 中用 null 表示。
+每个自动保存文件包含表头和一行设备记录。生产任务按主板年周和任务类型归档，从 v0.5.8 起追加三项生产信息。logs 单元格用换行连接日志行，GUI 生成的时间采用北京时间 UTC+08:00。缺失的身份或异常字段在 CSV 中用空字符串表示，在 HTTP JSON 中用 null 表示。
 
 ~~~text
-schema_version,record_id,batch_id,port,chip,efuse_id,efuse_field,mac,status,started_at,finished_at,duration_ms,firmware_sha256,identity_error,validation_error,logs,operation,custom_fields,custom_field_errors,unique_device_id
+schema_version,record_id,batch_id,port,chip,efuse_id,efuse_field,mac,status,started_at,finished_at,duration_ms,firmware_sha256,identity_error,validation_error,logs,operation,custom_fields,custom_field_errors,unique_device_id,生产批次/工单号,主板年周,主板生产日期
 ~~~
 
 第 20 列取本条记录的 custom_fields.unique_device_id，优先使用硬件读取值，其次使用 UART 规则的提取值。缺失时留空。
@@ -201,7 +201,7 @@ RecordResult.csv_path 表示实际持久化路径，同时提供 operation、cus
 
 引擎提供显式重试：RecordService.poll() 取出 Failed、Deferred 或本地保存失败的结果后，再次提交同一记录。包含自动硬件 ID 时使用 `RecordService.submit_with_identity(&settings, same_draft, same_operation, same_hardware_id.as_deref())`，硬件 ID 必须来自本台后端只读事件；不应把 UART 字符串或改写的 MAC 作为该参数。原有 submit_with_operation(&settings, draft, operation) 等价于不提供硬件 ID，submit(&settings, draft) 继续作为 flash 的便捷入口。
 
-保留同一 RecordDraft、operation 和硬件 ID 快照，继续使用原 record_id/Idempotency-Key。已有 CSV 与同一记录按 20 列或旧版 19 列格式生成的内容逐字节一致时可直接复用。服务在内存中对近期已成功处理的记录去重，服务端仍需持久化幂等键。
+保留同一 RecordDraft、operation、硬件 ID 及生产信息快照，继续使用原 record_id/Idempotency-Key。已有 CSV 与同一记录生成的内容逐字节一致时可直接复用。未提供生产信息的记录也能复用内容一致的旧版 19 列或 20 列 CSV。服务在内存中对近期已成功处理的记录去重，服务端仍需持久化幂等键。
 
 GUI 对本次运行保留的失败记录提供两类显式重试：
 
