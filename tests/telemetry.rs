@@ -1,9 +1,10 @@
 use esp32c3_flashtool::{
     backend::DeviceIdentity,
     telemetry::{
-        CompiledExtractionRules, RecordDraft, RecordOperation, RecordResult, RecordService,
-        RecordStatus, TelemetrySettings, UploadState, load_settings_from,
-        parse_extraction_rules_json, save_settings_at, validate_settings,
+        CompiledExtractionRules, ExtractionOutcome, RecordDraft, RecordOperation, RecordResult,
+        RecordService, RecordStatus, TelemetrySettings, UNIQUE_DEVICE_ID_KEY, UploadState,
+        apply_hardware_unique_id, load_settings_from, parse_extraction_rules_json,
+        save_settings_at, validate_settings,
     },
     telemetry_http::{post_json, validate_custom_headers, validate_endpoint},
 };
@@ -261,6 +262,212 @@ fn custom_extraction_cannot_reintroduce_redacted_header_credentials() {
     assert!(result.custom_field_errors.contains_key("token"));
     let content = fs::read_to_string(result.csv_path.unwrap()).unwrap();
     assert!(!content.contains("telemetry-local-test-secret"));
+}
+
+#[test]
+fn hardware_unique_id_is_automatically_saved_and_posted_without_a_log_regex() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = LocalServer::new(vec![Reply::status(201)], Some(directory.path().to_owned()));
+    let mut configuration = settings(directory.path());
+    configuration.upload_enabled = true;
+    configuration.endpoint = server.endpoint.clone();
+    let mut service = RecordService::new(|| {});
+    service
+        .submit_with_identity(
+            &configuration,
+            draft(),
+            RecordOperation::Flash,
+            Some(&CUSTOM_ID.to_ascii_lowercase()),
+        )
+        .unwrap();
+    let result = receive_record(&mut service);
+    assert_eq!(result.upload_state, UploadState::Uploaded);
+    assert_eq!(result.custom_fields[UNIQUE_DEVICE_ID_KEY], CUSTOM_ID);
+    assert!(result.custom_field_errors.is_empty());
+    let csv = csv_fields(result.csv_path.as_ref().unwrap());
+    assert_eq!(
+        serde_json::from_str::<Value>(&csv["custom_fields"]).unwrap()[UNIQUE_DEVICE_ID_KEY],
+        CUSTOM_ID
+    );
+    assert_eq!(csv["efuse_id"], EFUSE);
+    assert_eq!(csv["mac"], MAC);
+    let posted: Value = serde_json::from_slice(&server.request().body).unwrap();
+    assert_eq!(posted["schema_version"], 1);
+    assert_eq!(posted["custom_fields"][UNIQUE_DEVICE_ID_KEY], CUSTOM_ID);
+    assert_eq!(posted["efuse_id"], EFUSE);
+    assert_eq!(posted["efuse_field"], "factory_mac");
+    assert_eq!(posted["mac"], MAC);
+    assert!(
+        posted.get("unique_device_id").is_none(),
+        "keep the existing custom field namespace"
+    );
+    server.assert_no_request();
+}
+
+#[test]
+fn hardware_unique_id_merge_normalizes_and_preserves_conflict_provenance() {
+    let matcher = CompiledExtractionRules::new(&custom_rules()).unwrap();
+    for logs in [
+        vec![],
+        vec![format!(
+            "UNIQUE DEVICE ID: {}",
+            CUSTOM_ID.to_ascii_lowercase()
+        )],
+    ] {
+        let mut fields = matcher.extract(&logs);
+        apply_hardware_unique_id(&mut fields, CUSTOM_ID).unwrap();
+        assert_eq!(fields.custom_fields[UNIQUE_DEVICE_ID_KEY], CUSTOM_ID);
+        assert!(
+            fields.errors.is_empty(),
+            "missing log captures are fulfilled by the hardware field"
+        );
+    }
+    let conflicting = "FFEEDDCCBBAA99887766554433221100";
+    let mut fields = matcher.extract(&[
+        format!("UNIQUE DEVICE ID: {CUSTOM_ID}"),
+        format!("UNIQUE DEVICE ID: {conflicting}"),
+    ]);
+    fields
+        .custom_fields
+        .insert("board".into(), "board-a".into());
+    fields
+        .errors
+        .insert("missing_other".into(), "not found".into());
+    apply_hardware_unique_id(&mut fields, CUSTOM_ID).unwrap();
+    assert_eq!(fields.custom_fields[UNIQUE_DEVICE_ID_KEY], CUSTOM_ID);
+    assert_eq!(fields.custom_fields["board"], "board-a");
+    assert_eq!(fields.errors["missing_other"], "not found");
+    assert!(fields.errors[UNIQUE_DEVICE_ID_KEY].contains("已采用硬件"));
+    assert!(!fields.errors[UNIQUE_DEVICE_ID_KEY].contains(CUSTOM_ID));
+    let mut same_error = matcher.extract(&[format!("UNIQUE DEVICE ID: {conflicting}")]);
+    apply_hardware_unique_id(&mut same_error, CUSTOM_ID).unwrap();
+    assert_eq!(
+        fields.errors[UNIQUE_DEVICE_ID_KEY],
+        same_error.errors[UNIQUE_DEVICE_ID_KEY]
+    );
+}
+
+#[test]
+fn hardware_unique_id_rejects_invalid_or_zero_but_accepts_exact_nonzero_ff_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut service = RecordService::new(|| {});
+    for invalid in [
+        "0".repeat(32),
+        "A".repeat(31),
+        "G".repeat(32),
+        format!(" {}", "A".repeat(32)),
+        EFUSE.into(),
+    ] {
+        assert!(
+            service
+                .submit_with_identity(
+                    &settings(directory.path()),
+                    draft(),
+                    RecordOperation::Flash,
+                    Some(&invalid)
+                )
+                .is_err()
+        );
+        assert_eq!(service.pending_count(), 0);
+        assert_eq!(service.pending_local_count(), 0);
+    }
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    let mut fields = ExtractionOutcome::default();
+    apply_hardware_unique_id(&mut fields, &"f".repeat(32)).unwrap();
+    assert_eq!(fields.custom_fields[UNIQUE_DEVICE_ID_KEY], "F".repeat(32));
+    service
+        .submit_with_identity(
+            &settings(directory.path()),
+            draft(),
+            RecordOperation::Flash,
+            Some(&"F".repeat(32)),
+        )
+        .unwrap();
+    let result = receive_record(&mut service);
+    assert_eq!(result.custom_fields[UNIQUE_DEVICE_ID_KEY], "F".repeat(32));
+}
+
+#[test]
+fn posted_hardware_id_wins_over_configured_uart_conflict_and_retry_stays_immutable() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = LocalServer::new(
+        vec![Reply::status(400), Reply::status(201)],
+        Some(directory.path().to_owned()),
+    );
+    let mut configuration = settings(directory.path());
+    configuration.upload_enabled = true;
+    configuration.endpoint = server.endpoint.clone();
+    configuration.extraction_rules = custom_rules();
+    let mut input = draft();
+    input
+        .logs
+        .push("UNIQUE DEVICE ID: FFEEDDCCBBAA99887766554433221100".into());
+    let mut service = RecordService::new(|| {});
+    let id = service
+        .submit_with_identity(
+            &configuration,
+            input.clone(),
+            RecordOperation::Flash,
+            Some(CUSTOM_ID),
+        )
+        .unwrap();
+    let failed = receive_record(&mut service);
+    assert_eq!(failed.upload_state, UploadState::Failed);
+    let path = failed.csv_path.clone().unwrap();
+    let old_csv = fs::read(&path).unwrap();
+    assert_eq!(failed.custom_fields[UNIQUE_DEVICE_ID_KEY], CUSTOM_ID);
+    assert!(failed.custom_field_errors[UNIQUE_DEVICE_ID_KEY].contains("已采用硬件"));
+    let first = server.request();
+    let posted: Value = serde_json::from_slice(&first.body).unwrap();
+    assert_eq!(posted["custom_fields"][UNIQUE_DEVICE_ID_KEY], CUSTOM_ID);
+    assert!(
+        posted["custom_field_errors"][UNIQUE_DEVICE_ID_KEY]
+            .as_str()
+            .unwrap()
+            .contains("已采用硬件")
+    );
+    assert_eq!(
+        service
+            .submit_with_identity(
+                &configuration,
+                input,
+                RecordOperation::Flash,
+                Some(CUSTOM_ID)
+            )
+            .unwrap(),
+        id
+    );
+    let retry = receive_record(&mut service);
+    assert_eq!(retry.upload_state, UploadState::Uploaded);
+    assert_eq!(fs::read(path).unwrap(), old_csv);
+    let second = server.request();
+    assert_eq!(first.body, second.body);
+    assert_eq!(second.headers["idempotency-key"], id);
+    server.assert_no_request();
+}
+
+#[test]
+fn absent_hardware_identity_preserves_user_uart_rules_without_fabricating_factory_data() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut configuration = settings(directory.path());
+    configuration.extraction_rules = custom_rules();
+    let mut input = readonly_draft();
+    input.logs = vec![format!("UNIQUE DEVICE ID: {}", "0".repeat(32))];
+    let mut service = RecordService::new(|| {});
+    service
+        .submit_with_identity(&configuration, input, RecordOperation::ReadOnly, None)
+        .unwrap();
+    let result = receive_record(&mut service);
+    assert_eq!(result.custom_fields[UNIQUE_DEVICE_ID_KEY], "0".repeat(32));
+    let fields = csv_fields(result.csv_path.as_ref().unwrap());
+    assert!(fields["efuse_id"].is_empty() && fields["mac"].is_empty());
+    let input = draft();
+    configuration.extraction_rules.clear();
+    service
+        .submit_with_identity(&configuration, input, RecordOperation::Flash, None)
+        .unwrap();
+    let result = receive_record(&mut service);
+    assert!(!result.custom_fields.contains_key(UNIQUE_DEVICE_ID_KEY));
 }
 
 fn readonly_draft() -> RecordDraft {

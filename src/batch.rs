@@ -49,6 +49,7 @@ pub enum BatchEventKind {
     Log,
     DeviceLog,
     Identity,
+    UniqueDeviceId,
 }
 
 /// Each claimed task has its own accumulator; neither driver VID/PID nor a
@@ -112,6 +113,7 @@ impl JobEvents {
                 (BatchEventKind::State, "正在校验 Flash 内容".into())
             }
             FlashProgress::Message(message) => (BatchEventKind::Log, message),
+            FlashProgress::UniqueDeviceId(value) => (BatchEventKind::UniqueDeviceId, value),
             FlashProgress::Identity(identity) => {
                 if let Some(previous) = &mut self.identity {
                     if identity.mac.is_some() {
@@ -127,7 +129,7 @@ impl JobEvents {
                 (
                     BatchEventKind::Identity,
                     format!(
-                        "只读设备身份：MAC {}；eFuse ID {}（工厂 MAC）",
+                        "出厂 MAC {}（原始 48 位值 {}）",
                         identity.mac.as_deref().unwrap_or("未提供"),
                         identity.efuse_id.as_deref().unwrap_or("未提供"),
                     ),
@@ -472,10 +474,22 @@ mod tests {
         }
     }
 
+    fn unique_id(port: &str) -> &'static str {
+        if port == "COM1" {
+            "1234567890ABCDEF0123456789ABCDEF"
+        } else {
+            "FEDCBA98765432100FEDCBA987654321"
+        }
+    }
+
     #[test]
     fn independent_device_identity_survives_logs_progress_and_terminal_results() {
         let batch = start_workers(vec!["COM1".into(), "COM2".into()], 2, |port, events| {
             events.progress(FlashProgress::Identity(identity(port)), "ESP32-C3");
+            events.progress(
+                FlashProgress::UniqueDeviceId(unique_id(port).into()),
+                "ESP32-C3",
+            );
             events.progress(
                 FlashProgress::Message("设备连接、芯片识别完成".into()),
                 "ESP32-C3",
@@ -518,6 +532,12 @@ mod tests {
             for event in &events[identity_event..] {
                 assert_eq!(event.identity, Some(identity(port)));
             }
+            let unique_events: Vec<_> = events
+                .iter()
+                .filter(|event| event.kind == BatchEventKind::UniqueDeviceId)
+                .map(|event| event.message.as_str())
+                .collect();
+            assert_eq!(unique_events, [unique_id(port)]);
             assert!(events.iter().any(|event| event.kind == BatchEventKind::Log));
             assert!(
                 events

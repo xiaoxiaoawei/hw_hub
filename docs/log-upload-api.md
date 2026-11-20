@@ -12,9 +12,27 @@ efuse_id 是芯片出厂 factory eFuse MAC 的 48 位原始值，以 12 位大�
 EFUSE_ID=246F28112233 MAC=24:6F:28:11:22:33
 ~~~
 
-这两个字段表示同一个 factory_mac，不是两组独立的 eFuse bank。记录不包含安全密钥、Flash 加密密钥或其他任意 eFuse 内容。
+这两个字段表示同一个 48 位 factory_mac。它们与 ESP32-C3 的 128 位 `ESP_EFUSE_OPTIONAL_UNIQUE_ID` 是独立字段，不能把 MAC 扩展或改名后当作该可选 ID。记录不包含安全密钥或 Flash 加密密钥。
 
-flash 上传前同时检查后端提供的 DeviceIdentity 和本次设备日志的正则提取结果。两类标识必须完整、唯一、一致，且 efuse_id 去格式后的值必须与 mac 相同。全 0、全 FF 也视为无效身份。身份缺失、出现冲突、日志与后端身份不匹配时，只保存本地 CSV，跳过上传并保留原因；不会拿其他 COM 的值补齐。自定义提取规则独立保存到 custom_fields，不替代这两项出厂身份检查。
+flash 上传前同时检查后端提供的 DeviceIdentity 和本次设备日志的正则提取结果。两类标识必须完整、唯一、一致，且 efuse_id 去格式后的值必须与 mac 相同。出厂 MAC 的全 0、全 FF 也视为无效身份。身份缺失、出现冲突、日志与后端身份不匹配时，只保存本地 CSV，跳过上传并保留原因；不会拿其他 COM 的值补齐。custom_fields 中的字段不替代这两项出厂身份检查。
+
+### ESP32-C3 自动读取 OPTIONAL_UNIQUE_ID
+
+烧录任务识别到 ESP32-C3 后，通过本次 bootloader/stub 连接只读获取 OPTIONAL_UNIQUE_ID 的 16 字节。有效值按字段字节顺序编码为 32 个大写十六进制字符，自动写入设备日志和 `custom_fields.unique_device_id`。
+
+| 字段 | 硬件来源 | 格式及兼容含义 |
+| --- | --- | --- |
+| efuse_id | 48 位出厂 MAC | 原有 12 位十六进制表示，含义保持不变。 |
+| mac | 同一个 48 位出厂 MAC | 原有冒号分隔表示，含义保持不变。 |
+| custom_fields.unique_device_id | ESP32-C3 的 128 位 OPTIONAL_UNIQUE_ID | 直接读取时使用 32 个大写十六进制字符。 |
+
+全零的 OPTIONAL_UNIQUE_ID 视为未配置。其他非零内容按原始字节保存。字段未配置或读取不可用时，设备日志会记录原因。烧录和上报按各自的结果与出厂身份校验继续处理。
+
+自动硬件值优先于同名 UART 正则结果。规则返回相同十六进制值时忽略大小写并使用大写硬件值；规则未命中时由硬件值补齐。不同值、非十六进制值或歧义结果会在 `custom_field_errors.unique_device_id` 记录冲突，同时保留硬件值。其他自定义字段照常处理。
+
+没有取得硬件值时，继续沿用既有 UART 自定义规则，不自动增加该字段的错误项。这些规则仍可产生同名日志字段；字段名本身不区分来源，也不保证该值经过硬件通道校验。独立的“批量读取日志”不探测 eFuse，继续按用户配置提取文本。
+
+此功能保持 schema_version 为 1，不新增顶层身份字段，也不改变逐条 CSV 的列顺序。独立记录的 custom_fields JSON 单元格、POST 正文及 ESP32-C3 烧录汇总导出都会包含已取得的 unique_device_id，无需先在 extraction_rules 中配置该名称。上传仍须由用户启用。
 
 ## 只读采集设备日志
 
@@ -53,7 +71,7 @@ Idempotency-Key: <record_id>
 | duration_ms | integer | 任务耗时，单位毫秒。 |
 | firmware_sha256 | string | flash 使用本批次已冻结的固件内容及地址布局摘要；read_only 使用空字符串。 |
 | logs | array of string | 该设备本次任务的日志行快照。 |
-| custom_fields | object of string | 自定义规则成功提取的字段名和值；未配置时为 {}。 |
+| custom_fields | object of string | 自定义规则成功提取的字段名和值，以及自动硬件通道取得的 unique_device_id；没有可用值时为 {}。 |
 | custom_field_errors | object of string | 未匹配、捕获冲突或值无效的字段名及原因；没有错误时为 {}。 |
 | identity_error | string 或 null | flash 出厂身份校验异常原因；read_only 不要求该身份。 |
 | validation_error | string 或 null | 时间、flash 固件 SHA256 或 read_only 成功状态/提取结果校验异常原因；异常记录仅存 CSV，不上传。 |
@@ -134,7 +152,7 @@ TelemetrySettings 的默认配置：
 }
 ~~~
 
-该规则从虚构示例 `UNIQUE DEVICE ID: 00112233445566778899AABBCCDDEEFF` 提取 32 位十六进制值，保存为 custom_fields.unique_device_id。JSON 中反斜杠必须转义：正则中的 `\s`、`\b` 在 JSON 字符串里分别写为 `\\s`、`\\b`。这只是设备输出文本的提取，不会为获取该字段额外读取芯片寄存器或 eFuse。
+该规则从虚构示例 `UNIQUE DEVICE ID: 00112233445566778899AABBCCDDEEFF` 提取 32 位十六进制值，保存为 custom_fields.unique_device_id。JSON 中反斜杠必须转义：正则中的 `\s`、`\b` 在 JSON 字符串里分别写为 `\\s`、`\\b`。JSON 规则本身只处理日志文本；ESP32-C3 烧录中的自动硬件读取独立执行，无需添加此规则。UART 读取模式仍可用该规则提取设备固件的输出。
 
 规则默认是 {}；留空也表示不配置自定义字段。可“复制示例”，空配置可直接“填入示例”，已有规则不会被示例覆盖。点击“保存设置”才生效；无效 JSON、重复字段名或正则错误会阻止保存，“取消”或关闭设置会还原已保存配置。
 
@@ -146,7 +164,7 @@ TelemetrySettings 的默认配置：
 | 捕获值 | 非空、非纯空白、无 NUL，最长 4096 字节，保留原大小写和内容。 |
 | 重复匹配 | 每字段最多检查 4096 次匹配；重复同值可以通过，不同值或超限会省略该字段并记录原因。 |
 
-字段只在同一设备本次任务日志内匹配，不拼接其他 COM 或历史批次。成功值进入 custom_fields，缺失或冲突原因进入 custom_field_errors。两者都保存为本地 CSV 的 JSON 单元格并进入符合上传条件的 POST 正文；自定义字段不会覆盖 port、status、efuse_id 等顶层字段。
+正则字段只在同一设备本次任务日志内匹配，不拼接其他 COM 或历史批次。成功值进入 custom_fields，缺失或冲突原因进入 custom_field_errors；同名 unique_device_id 与自动硬件值的合并采用上面的优先规则。两者都保存为本地 CSV 的 JSON 单元格并进入符合上传条件的 POST 正文；自定义字段不会覆盖 port、status、efuse_id 等顶层字段。
 
 匹配输入是本台设备日志行以换行连接的文本。跨行模式按 Rust regex 语法显式使用 `(?m)` 或 `(?s)`；规则不会自动获得这些模式。记录及导出前会先移除已配置请求头的凭据值，包含脱敏标记的捕获不作为有效业务字段。
 
@@ -177,7 +195,9 @@ schema_version,record_id,batch_id,port,chip,efuse_id,efuse_field,mac,status,star
 
 RecordResult.csv_path 表示实际持久化路径，同时提供 operation、custom_fields 和 custom_field_errors。upload_state 分别为 Disabled、SkippedIdentity、Uploaded、Failed、Deferred。CSV 内容不会随着 HTTP 结果被覆盖。队列提交返回错误时，调用者应保留原 RecordDraft 和 operation；上传队列暂满的 Deferred 结果仍有已保存的 CSV。
 
-引擎提供显式重试：RecordService.poll() 取出 Failed、Deferred 或本地保存失败的结果后，再次调用 RecordService.submit_with_operation(&settings, same_draft, same_operation)；原有 submit(&settings, draft) 是 flash 的便捷入口。保留同一 RecordDraft 和 operation 才能继续使用原 record_id/Idempotency-Key；已有 CSV 只有逐字节一致时才复用，内容不一致则拒绝覆盖和上传。服务在内存中对近期已成功处理的记录去重，服务端仍需持久化幂等键。
+引擎提供显式重试：RecordService.poll() 取出 Failed、Deferred 或本地保存失败的结果后，再次提交同一记录。包含自动硬件 ID 时使用 `RecordService.submit_with_identity(&settings, same_draft, same_operation, same_hardware_id.as_deref())`，硬件 ID 必须来自本台后端只读事件；不应把 UART 字符串或改写的 MAC 作为该参数。原有 submit_with_operation(&settings, draft, operation) 等价于不提供硬件 ID，submit(&settings, draft) 继续作为 flash 的便捷入口。
+
+保留同一 RecordDraft、operation 和硬件 ID 快照，继续使用原 record_id/Idempotency-Key；已有 CSV 只有逐字节一致时才复用，内容不一致则拒绝覆盖和上传。服务在内存中对近期已成功处理的记录去重，服务端仍需持久化幂等键。
 
 GUI 对本次运行保留的失败记录提供两类显式重试：
 
@@ -188,7 +208,7 @@ GUI 对本次运行保留的失败记录提供两类显式重试：
 
 客户端不会在下次启动时自动扫描并重传历史 CSV。补发同一条业务记录时保留原记录和幂等键；不需要重新烧录或生成新的批次。
 
-界面的“导出本批 CSV”是用户选择路径生成的批次汇总，包含原有的端口、芯片、状态、进度、起止时间、耗时、详情、固件及摘要，并追加批次 ID、eFuse 出厂 MAC、MAC 与已配置自定义字段的列。它与自动保存的逐记录 CSV 文件格式、保存时机不同；API 记录使用上面的 schema。
+界面的“导出本批 CSV”是用户选择路径生成的批次汇总，包含原有的端口、芯片、状态、进度、起止时间、耗时、详情、固件及摘要，并追加批次 ID、eFuse 出厂 MAC、MAC 与已配置自定义字段的列。ESP32-C3 烧录批次还自动包含 unique_device_id 列，无需自定义规则；可选字段未取得时留空。它与自动保存的逐记录 CSV 文件格式、保存时机不同；API 记录使用上面的 schema。
 
 ## 服务端联调示例
 

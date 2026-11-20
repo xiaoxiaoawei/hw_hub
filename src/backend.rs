@@ -7,7 +7,7 @@ use espflash::{
     connection::{Connection, ResetAfterOperation, ResetBeforeOperation},
     flasher::{FlashSize, Flasher},
     image_format::Segment,
-    target::ProgressCallbacks,
+    target::{Chip, ProgressCallbacks},
 };
 use serialport::{FlowControl, SerialPortInfo, SerialPortType, UsbPortInfo};
 
@@ -699,7 +699,13 @@ fn open_checked<T>(
 pub enum FlashProgress {
     Connecting,
     Identity(DeviceIdentity),
-    Writing { fraction: f32, address: u32 },
+    /// ESP32-C3's independent 128-bit OPTIONAL_UNIQUE_ID, in the same byte
+    /// order as esp_efuse_read_field_blob(..., uid, 128), uppercase 32 hex.
+    UniqueDeviceId(String),
+    Writing {
+        fraction: f32,
+        address: u32,
+    },
     Verifying,
     Message(String),
 }
@@ -765,6 +771,70 @@ fn emit_factory_identity(mac: Option<&str>, callback: &mut dyn FnMut(FlashProgre
         ));
     }
     Ok(())
+}
+
+// ESP-IDF v5.5.1: OPTIONAL_UNIQUE_ID is BLK2 bits 0..127, distinct from MAC.
+// https://github.com/espressif/esp-idf/blob/v5.5.1/components/efuse/esp32c3/esp_efuse_table.csv#L178
+// utility_fill_buff stores each ascending register's least-significant byte
+// first, matching pinned espflash read_efuse_le::<[u8; 16]> on our x64 targets:
+// https://github.com/espressif/esp-idf/blob/v5.5.1/components/efuse/src/esp_efuse_utility.c#L90
+const C3_RS_ERR0_OFFSET: u32 = 0x1c0;
+const C3_BLOCK2_RS_FAIL: u32 = 1 << 11;
+
+fn c3_block2_corrections(status: u32) -> Result<u8> {
+    // C3 fail bits are shifted relative to error-count fields: BLK2 fail is
+    // bit 11, not bit 7; its corrected-byte count is bits 6:4. Do not reject
+    // errors in MAC, user-data or key blocks. Corrected shadow bytes remain
+    // usable; only the documented uncorrectable flag suppresses this ID.
+    // https://github.com/espressif/esp-idf/blob/v5.5.1/components/hal/esp32c3/efuse_hal.c#L83
+    if status & C3_BLOCK2_RS_FAIL != 0 {
+        bail!("ESP32-C3 eFuse BLOCK2 的 RS 校验报告不可纠正错误，未使用 OPTIONAL_UNIQUE_ID");
+    }
+    Ok(((status >> 4) & 0x7) as u8)
+}
+
+fn optional_unique_id(bytes: [u8; 16]) -> Option<String> {
+    // This field is optional: all-zero is unprovisioned. Preserve every other
+    // byte pattern, including FF; do not replace missing data with a MAC/hash.
+    if bytes.iter().all(|byte| *byte == 0) {
+        None
+    } else {
+        Some(bytes.iter().map(|byte| format!("{byte:02X}")).collect())
+    }
+}
+
+fn emit_optional_unique_id(
+    chip: Chip,
+    read: impl FnOnce() -> Result<([u8; 16], u8)>,
+    callback: &mut dyn FnMut(FlashProgress),
+) {
+    if chip != Chip::Esp32c3 {
+        return;
+    }
+    // Optional metadata cannot fail an otherwise healthy flash session. There
+    // is one probe and no retry/reset, ROM eFuse command, or eFuse register write.
+    match read() {
+        Ok((bytes, corrected)) => {
+            if corrected != 0 {
+                callback(FlashProgress::Message(format!(
+                    "OPTIONAL_UNIQUE_ID：BLOCK2 报告 {corrected} 个已纠正错误字节，保留纠正后的读取值"
+                )));
+            }
+            if let Some(id) = optional_unique_id(bytes) {
+                callback(FlashProgress::Message(
+                    "设备 ID 来源：ESP32-C3 eFuse OPTIONAL_UNIQUE_ID（16 字节）".into(),
+                ));
+                callback(FlashProgress::UniqueDeviceId(id));
+            } else {
+                callback(FlashProgress::Message(
+                    "ESP32-C3 OPTIONAL_UNIQUE_ID 全为 0，视为未配置".into(),
+                ));
+            }
+        }
+        Err(error) => callback(FlashProgress::Message(format!(
+            "ESP32-C3 OPTIONAL_UNIQUE_ID 不可用：{error:#}"
+        ))),
+    }
 }
 
 /// Runs synchronously on one worker. Separate invocations never share a port.
@@ -876,6 +946,28 @@ fn flash_impl(
     // espflash Chip::mac_address reads only the chip-specific MAC0/MAC1 eFuse
     // fields. Do not read secret blocks, change keys, or program any eFuse.
     emit_factory_identity(device.mac_address.as_deref(), callback)?;
+    emit_optional_unique_id(
+        target_chip,
+        || {
+            let status = flasher
+                .connection()
+                .read_reg(target_chip.efuse_reg() + C3_RS_ERR0_OFFSET)
+                .context("无法读取 BLOCK2 RS 状态")?;
+            let corrected = c3_block2_corrections(status)?;
+            // This public pinned API issues exactly four ReadReg operations
+            // for this 128-bit aligned field, using existing command timeouts.
+            // RD_DIS protects BLK4-10, not BLK2; do not read keys or interpret
+            // unrelated read-protection bits as protection of this public ID.
+            let bytes = target_chip
+                .read_efuse_le::<[u8; 16]>(
+                    flasher.connection(),
+                    espflash::target::efuse::esp32c3::OPTIONAL_UNIQUE_ID,
+                )
+                .context("无法读取 ESP_EFUSE_OPTIONAL_UNIQUE_ID 的 16 字节")?;
+            Ok((bytes, corrected))
+        },
+        callback,
+    );
     // espflash 4.7.0 silently substitutes 4 MiB for an unknown JEDEC size.
     // Do not treat that fallback as actual hardware capacity. In this pinned
     // version flash_detect leaves its raw 0x9F read result in SPI W0. Read it
@@ -1058,6 +1150,142 @@ impl ProgressCallbacks for SessionProgress<'_> {
 mod tests {
     use super::*;
     use crate::firmware::FirmwareSegment;
+
+    #[test]
+    fn pinned_optional_unique_id_layout_and_blob_byte_order_match_esp_idf() {
+        let field = espflash::target::efuse::esp32c3::OPTIONAL_UNIQUE_ID;
+        assert_eq!(
+            (field.block, field.word, field.bit_start, field.bit_count),
+            (2, 0, 0, 128)
+        );
+        assert_eq!(Chip::Esp32c3.efuse_reg(), 0x6000_8800);
+        // Synthetic register image. IDF fill_buff emits each low byte first;
+        // formatting each word as eight hex digits or a u128 reverses the ID.
+        let words = [0x0123_4567_u32, 0x89ab_cdef, 0x1020_3040, 0xaabb_ccdd];
+        let bytes: [u8; 16] = words
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            optional_unique_id(bytes).as_deref(),
+            Some("67452301EFCDAB8940302010DDCCBBAA")
+        );
+        let leading_zero = [0x3322_1100_u32, 0x7766_5544, 0xbbaa_9988, 0xffee_ddcc];
+        let bytes: [u8; 16] = leading_zero
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            optional_unique_id(bytes).as_deref(),
+            Some("00112233445566778899AABBCCDDEEFF")
+        );
+    }
+
+    #[test]
+    fn optional_unique_id_is_emitted_once_and_preserves_all_nonzero_patterns() {
+        for bytes in [[0x12; 16], [0xff; 16]] {
+            let mut calls = 0;
+            let mut events = Vec::new();
+            emit_optional_unique_id(
+                Chip::Esp32c3,
+                || {
+                    calls += 1;
+                    Ok((bytes, 0))
+                },
+                &mut |event| events.push(event),
+            );
+            let ids: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    FlashProgress::UniqueDeviceId(id) => Some(id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(calls, 1);
+            assert_eq!(ids.len(), 1);
+            assert_eq!(ids[0].len(), 32);
+            assert_eq!(
+                *ids[0],
+                bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<String>()
+            );
+        }
+    }
+
+    #[test]
+    fn blank_or_failed_optional_id_is_diagnostic_only_and_never_becomes_a_mac() {
+        for (result, reason) in [
+            (Ok(([0; 16], 0)), "未配置"),
+            (
+                Err(anyhow::anyhow!("synthetic read timeout")),
+                "synthetic read timeout",
+            ),
+        ] {
+            let mut events = Vec::new();
+            emit_optional_unique_id(Chip::Esp32c3, || result, &mut |event| events.push(event));
+            assert!(matches!(
+                events.as_slice(),
+                [FlashProgress::Message(message)] if message.contains(reason)
+            ));
+        }
+    }
+
+    #[test]
+    fn only_block2_uncorrectable_rs_flag_suppresses_the_optional_id() {
+        assert!(c3_block2_corrections(1 << 11).is_err());
+        assert_eq!(
+            c3_block2_corrections(1 << 7).unwrap(),
+            0,
+            "C3 bit7 belongs to another block"
+        );
+        let unrelated = !(C3_BLOCK2_RS_FAIL | (7 << 4));
+        assert_eq!(c3_block2_corrections(unrelated).unwrap(), 0);
+        let mut events = Vec::new();
+        emit_optional_unique_id(
+            Chip::Esp32c3,
+            || Ok(([0x34; 16], c3_block2_corrections(unrelated | (2 << 4))?)),
+            &mut |event| events.push(event),
+        );
+        assert!(events.iter().any(|event| matches!(event, FlashProgress::UniqueDeviceId(id) if id == "34343434343434343434343434343434")));
+        assert!(events.iter().any(
+            |event| matches!(event, FlashProgress::Message(message) if message.contains("已纠正"))
+        ));
+        let mut events = Vec::new();
+        emit_optional_unique_id(
+            Chip::Esp32c3,
+            || Ok(([0x34; 16], c3_block2_corrections(1 << 11)?)),
+            &mut |event| events.push(event),
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, FlashProgress::UniqueDeviceId(_)))
+        );
+    }
+
+    #[test]
+    fn other_chips_never_read_c3_registers_or_fabricate_optional_ids() {
+        for chip in [
+            Chip::Esp32,
+            Chip::Esp32s2,
+            Chip::Esp32s3,
+            Chip::Esp32c2,
+            Chip::Esp32c6,
+            Chip::Esp32h2,
+        ] {
+            emit_optional_unique_id(
+                chip,
+                || panic!("must not read C3 fields from another chip"),
+                &mut |_| panic!("unsupported chip must not emit an ID"),
+            );
+        }
+    }
 
     #[cfg(windows)]
     #[test]

@@ -2,6 +2,11 @@
 
 应用版本以 `Cargo.toml` 的 `[package].version` 为唯一来源。发布前先补充本文件，再使用 `python scripts/bump-version.py <版本>` 同步包和锁文件；`--check` 检查一致性，`--dry-run` 预览更新。正式版本格式为 `MAJOR.MINOR.PATCH`，Git 标签格式为 `vMAJOR.MINOR.PATCH`。
 
+## [0.5.4] - 2026-11-20
+
+- ESP32-C3 烧录连接时直接读取 128 位 `OPTIONAL_UNIQUE_ID`。每个串口的日志显示 `UNIQUE DEVICE ID`。
+- 已读取的 ID 自动保存到单台及整批 CSV，并随启用的 POST 上报发送。出厂 MAC 仍使用原有接口字段。
+
 ## [0.5.3] - 2026-11-19
 
 - 放大串口日志窗口。可拖动窗口边缘或角落调整宽高，日志标题统一为「COMx LOG」。

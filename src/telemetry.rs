@@ -34,6 +34,8 @@ const MAX_ATTEMPTS: usize = 3;
 const MAX_EXTRACTION_RULES: usize = 32;
 const MAX_EXTRACTION_RULE_BYTES: usize = 32 * 1024;
 const MAX_CUSTOM_VALUE_BYTES: usize = 4096;
+pub const UNIQUE_DEVICE_ID_KEY: &str = "unique_device_id";
+const MISSING_CAPTURE: &str = "本设备日志未找到第 1 个捕获组";
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -287,9 +289,46 @@ fn extract_custom_value(regex: &Regex, text: &str) -> Result<String> {
             value = Some(captured);
         }
     }
-    value
-        .map(str::to_owned)
-        .context("本设备日志未找到第 1 个捕获组")
+    value.map(str::to_owned).context(MISSING_CAPTURE)
+}
+
+fn normalize_hardware_unique_id(value: &str) -> Result<String> {
+    ensure!(
+        value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "硬件 OPTIONAL_UNIQUE_ID 必须包含 32 个十六进制字符"
+    );
+    ensure!(
+        !value.bytes().all(|byte| byte == b'0'),
+        "硬件 OPTIONAL_UNIQUE_ID 未配置（全 0）"
+    );
+    Ok(value.to_ascii_uppercase())
+}
+
+/// Merge only an ID obtained from the backend's direct read-only hardware
+/// field. UART text must use the normal regex extraction path instead.
+/// Hardware wins; missing regex captures are fulfilled by it, while ambiguous
+/// or contradictory regex captures remain explicit errors without leaking IDs.
+pub fn apply_hardware_unique_id(outcome: &mut ExtractionOutcome, value: &str) -> Result<()> {
+    let value = normalize_hardware_unique_id(value)?;
+    let conflict = outcome
+        .custom_fields
+        .get(UNIQUE_DEVICE_ID_KEY)
+        .is_some_and(|captured| !captured.eq_ignore_ascii_case(&value));
+    let extraction_error = outcome
+        .errors
+        .get(UNIQUE_DEVICE_ID_KEY)
+        .is_some_and(|error| error != MISSING_CAPTURE);
+    outcome.errors.remove(UNIQUE_DEVICE_ID_KEY);
+    if conflict || extraction_error {
+        outcome.errors.insert(
+            UNIQUE_DEVICE_ID_KEY.into(),
+            "日志规则结果与硬件值冲突或无法确定唯一值；已采用硬件 OPTIONAL_UNIQUE_ID".into(),
+        );
+    }
+    outcome
+        .custom_fields
+        .insert(UNIQUE_DEVICE_ID_KEY.into(), value);
+    Ok(())
 }
 
 pub fn load_settings() -> Result<TelemetrySettings> {
@@ -503,6 +542,7 @@ struct LocalTask {
     draft: RecordDraft,
     record_id: String,
     operation: RecordOperation,
+    hardware_unique_device_id: Option<String>,
 }
 struct UploadTask {
     settings: TelemetrySettings,
@@ -627,6 +667,22 @@ impl RecordService {
         draft: RecordDraft,
         operation: RecordOperation,
     ) -> Result<String> {
+        self.submit_with_identity(settings, draft, operation, None)
+    }
+
+    /// The optional ID must come from the direct hardware progress event, not
+    /// from UART text or a reformatted factory MAC. Old callers retain their
+    /// existing regex behavior by omitting this argument.
+    pub fn submit_with_identity(
+        &mut self,
+        settings: &TelemetrySettings,
+        draft: RecordDraft,
+        operation: RecordOperation,
+        unique_device_id: Option<&str>,
+    ) -> Result<String> {
+        let hardware_unique_device_id = unique_device_id
+            .map(normalize_hardware_unique_id)
+            .transpose()?;
         ensure!(self.startup_error.is_none(), "无法启动本地 CSV 保存线程");
         ensure!(
             self.pending.len() < LOCAL_QUEUE_CAPACITY,
@@ -669,6 +725,7 @@ impl RecordService {
             draft,
             record_id: id.clone(),
             operation,
+            hardware_unique_device_id,
         };
         if self.sender.try_send(task).is_err() {
             self.local_pending.fetch_sub(1, Ordering::AcqRel);
@@ -733,7 +790,13 @@ enum LocalOutcome {
 }
 
 fn persist_task(task: LocalTask) -> Result<LocalOutcome> {
-    let record = prepare_record(task.record_id, task.draft, &task.settings, task.operation);
+    let record = prepare_record(
+        task.record_id,
+        task.draft,
+        &task.settings,
+        task.operation,
+        task.hardware_unique_device_id.as_deref(),
+    );
     let directory = match &task.settings.csv_directory {
         Some(path) => path.clone(),
         None => default_records_directory()?,
@@ -783,15 +846,24 @@ fn prepare_record(
     draft: RecordDraft,
     settings: &TelemetrySettings,
     operation: RecordOperation,
+    hardware_unique_device_id: Option<&str>,
 ) -> DeviceRecord {
     let logs = redact_header_credentials(draft.logs.clone(), &settings.custom_headers);
-    let extracted = match CompiledExtractionRules::new(&settings.extraction_rules) {
+    let mut extracted = match CompiledExtractionRules::new(&settings.extraction_rules) {
         Ok(rules) => rules.extract(&logs),
         Err(error) => ExtractionOutcome {
             custom_fields: BTreeMap::new(),
             errors: BTreeMap::from([("_rules".into(), error.to_string())]),
         },
     };
+    if let Some(value) = hardware_unique_device_id
+        && let Err(error) = apply_hardware_unique_id(&mut extracted, value)
+    {
+        extracted.custom_fields.remove(UNIQUE_DEVICE_ID_KEY);
+        extracted
+            .errors
+            .insert(UNIQUE_DEVICE_ID_KEY.into(), error.to_string());
+    }
     let identity = if operation == RecordOperation::ReadOnly && draft.identity.is_none() {
         Err(anyhow!("本次只读日志未提取到无歧义的自定义字段"))
     } else {

@@ -85,6 +85,7 @@ struct JobRow {
     started_at: String,
     finished_at: String,
     chip_identity: Option<DeviceIdentity>,
+    unique_device_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -199,6 +200,7 @@ struct PendingRecord {
     draft: RecordDraft,
     device: DeviceLogKey,
     operation: RecordOperation,
+    unique_device_id: Option<String>,
 }
 
 impl PendingRecord {
@@ -729,7 +731,14 @@ impl FlashApp {
                 started_at: String::new(),
                 finished_at: String::new(),
                 chip_identity: None,
+                unique_device_id: None,
             });
+            if kind == BatchEventKind::UniqueDeviceId {
+                self.device_logs
+                    .append_line(&port, format!("{now}  UNIQUE DEVICE ID: {message}"));
+                row.unique_device_id = Some(message);
+                continue;
+            }
             let first_terminal =
                 kind == BatchEventKind::State && is_terminal(&state) && row.finished_at.is_empty();
             if state == JobState::Connecting && row.started.is_empty() {
@@ -873,16 +882,18 @@ impl FlashApp {
             draft,
             device,
             operation: self.batch_operation,
+            unique_device_id: row.unique_device_id.clone(),
         });
         self.retry_record_submissions();
     }
 
     fn retry_record_submissions(&mut self) {
         while let Some(pending) = self.pending_records.front() {
-            match self.record_service.submit_with_operation(
+            match self.record_service.submit_with_identity(
                 &pending.settings,
                 pending.draft.clone(),
                 pending.operation,
+                pending.unique_device_id.as_deref(),
             ) {
                 Ok(id) => {
                     let pending = self
@@ -2235,8 +2246,18 @@ impl FlashApp {
             "固件",
             "固件SHA256",
         ];
-        let custom_keys = || settings.extraction_rules.keys().map(String::as_str);
-        append_csv(&mut output, header.into_iter().chain(custom_keys()));
+        let mut custom_keys: BTreeSet<_> = settings
+            .extraction_rules
+            .keys()
+            .map(String::as_str)
+            .collect();
+        if !reading && self.batch_chip == ChipModel::Esp32c3 {
+            custom_keys.insert(telemetry::UNIQUE_DEVICE_ID_KEY);
+        }
+        append_csv(
+            &mut output,
+            header.into_iter().chain(custom_keys.iter().copied()),
+        );
         for (port, row) in &self.jobs {
             let progress = format!("{:.1}%", row.progress * 100.0);
             let duration = row
@@ -2248,9 +2269,14 @@ impl FlashApp {
                 .current_lines
                 .get(port)
                 .map_or(&[][..], Vec::as_slice);
-            let fields = rules
-                .extract_record(logs, &settings.custom_headers)
-                .custom_fields;
+            let mut fields = rules.extract_record(logs, &settings.custom_headers);
+            if let Some(unique_device_id) = &row.unique_device_id
+                && let Err(error) =
+                    telemetry::apply_hardware_unique_id(&mut fields, unique_device_id)
+            {
+                self.error = Some(format!("无法导出 {port} 的设备 ID：{error:#}"));
+                return;
+            }
             append_csv(
                 &mut output,
                 [
@@ -2276,7 +2302,11 @@ impl FlashApp {
                     self.firmware_hash.as_str(),
                 ]
                 .into_iter()
-                .chain(custom_keys().map(|key| fields.get(key).map_or("", String::as_str))),
+                .chain(
+                    custom_keys
+                        .iter()
+                        .map(|key| fields.custom_fields.get(*key).map_or("", String::as_str)),
+                ),
             );
         }
         match fs::write(&path, output) {
@@ -3649,6 +3679,7 @@ mod tests {
             started_at: "2026-11-19T00:00:00Z".into(),
             finished_at: "2026-11-19T00:00:01.250Z".into(),
             chip_identity: None,
+            unique_device_id: None,
         }
     }
 
