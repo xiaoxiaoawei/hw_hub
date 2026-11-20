@@ -3,6 +3,8 @@ mod firmware_drop;
 mod settings;
 mod software_update;
 mod startup_log;
+mod validation;
+mod validation_ui;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -33,6 +35,7 @@ use esp32c3_flashtool::{
 };
 use firmware_drop::FirmwareFileDrop;
 use startup_log::StartupLogTask;
+use validation::ValidationWorkspace;
 
 const ACCENT: Color32 = Color32::from_rgb(22, 139, 245);
 const ACCENT_LIGHT: Color32 = Color32::from_rgb(29, 52, 74);
@@ -50,6 +53,12 @@ const DANGER: Color32 = Color32::from_rgb(245, 114, 127);
 enum FirmwareLayout {
     Merged,
     Segments,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Workspace {
+    Flash,
+    Validation,
 }
 
 struct FirmwareRow {
@@ -286,6 +295,8 @@ impl ScanSchedule {
 }
 
 pub struct FlashApp {
+    workspace: Workspace,
+    validation: ValidationWorkspace,
     selected_chip: ChipModel,
     pending_chip: ChipModel,
     batch_chip: ChipModel,
@@ -433,6 +444,8 @@ impl FlashApp {
             ),
         };
         let mut app = Self {
+            workspace: Workspace::Flash,
+            validation: ValidationWorkspace::default(),
             selected_chip: ChipModel::default(),
             pending_chip: ChipModel::default(),
             batch_chip: ChipModel::default(),
@@ -537,7 +550,11 @@ impl FlashApp {
     }
 
     fn busy(&self) -> bool {
-        self.running() || self.startup_log.is_some() || self.driver_busy || self.installer_preparing
+        self.running()
+            || self.validation_running()
+            || self.startup_log.is_some()
+            || self.driver_busy
+            || self.installer_preparing
     }
 
     fn scan_ports(&mut self) {
@@ -572,6 +589,9 @@ impl FlashApp {
             self.scan_schedule.device_event(Instant::now());
         }
         if let Some(result) = self.scanner.poll() {
+            if let Ok(observed) = &result {
+                self.invalidate_validation_ports(observed);
+            }
             if let (Ok(observed), Some(batch)) = (&result, &self.batch) {
                 for (name, identity) in &self.batch_port_identities {
                     if !observed
@@ -1205,6 +1225,7 @@ impl FlashApp {
         let mut wait = false;
         let mut exit = false;
         let mut retry = false;
+        let mut show_validation = false;
         let response = egui::Modal::new(egui::Id::new("unfinished_record_exit"))
             .frame(
                 egui::Frame::new()
@@ -1223,11 +1244,15 @@ impl FlashApp {
                     if secondary_button(ui, "返回设置重试保存", [164.0, 36.0]).clicked() {
                         retry = true;
                     }
-                } else {
+                } else if self.record_service.pending_count() > 0 {
                     ui.label(format!(
                         "本地已保存，仍有 {} 条上传未完成。",
                         self.record_service.pending_count()
                     ));
+                }
+                if self.validation.save_error.is_some() {
+                    ui.label("本批验证结果尚未保存。");
+                    show_validation = secondary_button(ui, "返回验证结果", [128.0, 36.0]).clicked();
                 }
                 ui.horizontal(|ui| {
                     if primary_button(ui, "继续等待", [116.0, 38.0]).clicked() {
@@ -1245,6 +1270,11 @@ impl FlashApp {
         if retry {
             self.close_confirm_open = false;
             self.open_settings();
+        }
+        if show_validation {
+            self.close_confirm_open = false;
+            self.workspace = Workspace::Validation;
+            self.validation.result_open = true;
         }
         if wait || response.should_close() {
             self.close_confirm_open = false;
@@ -1421,9 +1451,22 @@ impl FlashApp {
                 .strong()
                 .color(INK),
         );
-        if nav_item(ui, Icon::Grid, "批量烧录", !self.settings_open).clicked() {
-            self.settings_open = false;
-            self.discard_settings_draft();
+        for (workspace, icon, label) in [
+            (Workspace::Flash, Icon::Grid, "批量烧录"),
+            (Workspace::Validation, Icon::Shield, "批量验证"),
+        ] {
+            if nav_item(
+                ui,
+                icon,
+                label,
+                self.workspace == workspace && !self.settings_open,
+            )
+            .clicked()
+            {
+                self.workspace = workspace;
+                self.settings_open = false;
+                self.discard_settings_draft();
+            }
         }
         ui.add_space(20.0);
         ui.label(
@@ -1433,8 +1476,12 @@ impl FlashApp {
                 .strong()
                 .color(INK),
         );
+        let (chip, baud) = match self.workspace {
+            Workspace::Flash => (self.selected_chip, self.baud_input.as_str()),
+            Workspace::Validation => (ChipModel::Esp32c3, self.validation.baud_input.as_str()),
+        };
         ui.label(
-            RichText::new(self.selected_chip.label())
+            RichText::new(chip.label())
                 .heading()
                 .size(14.0)
                 .strong()
@@ -1443,11 +1490,15 @@ impl FlashApp {
         ui.label(
             RichText::new(format!(
                 "{} · {} 台并发",
-                if parse_baud_input(&self.baud_input, 115_200).is_ok() {
-                    self.baud.to_string()
-                } else {
-                    "波特率无效".into()
-                },
+                parse_baud_input(
+                    baud,
+                    if self.workspace == Workspace::Flash {
+                        115_200
+                    } else {
+                        1
+                    }
+                )
+                .map_or_else(|_| "波特率无效".into(), |rate| rate.to_string()),
                 self.concurrency
             ))
             .size(12.0)
@@ -1552,11 +1603,14 @@ impl FlashApp {
         let row = ui.horizontal(|ui| {
             title_rect = ui
                 .label(
-                    RichText::new("设备烧录工作台")
-                        .heading()
-                        .size(22.0)
-                        .strong()
-                        .color(INK),
+                    RichText::new(match self.workspace {
+                        Workspace::Flash => "设备烧录工作台",
+                        Workspace::Validation => "ESP32-C3 批量验证",
+                    })
+                    .heading()
+                    .size(22.0)
+                    .strong()
+                    .color(INK),
                 )
                 .rect;
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1574,6 +1628,7 @@ impl FlashApp {
         });
         let modal_open = self.settings_open
             || self.device_read_setup.open
+            || self.validation.result_open
             || self.update_dialog_open
             || self.chip_picker_open
             || self.pending_driver_license.is_some()
@@ -2119,6 +2174,8 @@ impl FlashApp {
                     "批次正在运行…"
                 } else if self.startup_log.is_some() {
                     "正在读取启动日志…"
+                } else if self.validation_running() {
+                    "正在批量验证…"
                 } else if self.driver_busy {
                     "等待驱动安装…"
                 } else {
@@ -2382,6 +2439,7 @@ impl eframe::App for FlashApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.collect_events();
         self.poll_startup_log();
+        self.poll_validation();
         self.poll_records();
         self.collect_update_events(ctx);
         self.poll_self_update(ctx);
@@ -2400,6 +2458,7 @@ impl eframe::App for FlashApp {
             } else if self.record_service.pending_count() > 0
                 || !self.pending_records.is_empty()
                 || !self.failed_records.is_empty()
+                || self.validation.save_error.is_some()
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.close_confirm_open = true;
@@ -2421,7 +2480,10 @@ impl eframe::App for FlashApp {
                     .stroke(egui::Stroke::new(1.0_f32, BORDER))
                     .inner_margin(egui::Margin::symmetric(16, 11)),
             )
-            .show(ctx, |ui| self.actions_panel(ui));
+            .show(ctx, |ui| match self.workspace {
+                Workspace::Flash => self.actions_panel(ui),
+                Workspace::Validation => self.validation_actions(ui),
+            });
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -2432,7 +2494,10 @@ impl eframe::App for FlashApp {
                 self.heading(ui);
                 ui.add_space(15.0);
                 egui::ScrollArea::vertical()
-                    .id_salt("workspace_content")
+                    .id_salt(match self.workspace {
+                        Workspace::Flash => "workspace_flash",
+                        Workspace::Validation => "workspace_validation",
+                    })
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         if let Some(message) = &self.error {
@@ -2443,13 +2508,18 @@ impl eframe::App for FlashApp {
                             banner(ui, message, false);
                             ui.add_space(12.0);
                         }
-                        card(ui, |ui| {
-                            ui.add_enabled_ui(!busy, |ui| self.firmware_panel(ui));
-                        });
-                        ui.add_space(12.0);
-                        card(ui, |ui| self.ports_panel(ui));
-                        ui.add_space(12.0);
-                        card(ui, |ui| self.logs_panel(ui));
+                        match self.workspace {
+                            Workspace::Flash => {
+                                card(ui, |ui| {
+                                    ui.add_enabled_ui(!busy, |ui| self.firmware_panel(ui));
+                                });
+                                ui.add_space(12.0);
+                                card(ui, |ui| self.ports_panel(ui));
+                                ui.add_space(12.0);
+                                card(ui, |ui| self.logs_panel(ui));
+                            }
+                            Workspace::Validation => self.validation_panel(ui),
+                        }
                         ui.add_space(8.0);
                     });
             });
@@ -2463,12 +2533,16 @@ impl eframe::App for FlashApp {
             && self.pending_driver_license.is_none()
             && !self.chip_picker_open
             && !self.device_read_setup.open
+            && !self.validation.result_open
         {
             self.open_update_dialog();
         }
         self.update_dialog(ctx);
         self.settings_window(ctx);
         self.device_log_windows(ctx);
+        if !self.close_confirm_open {
+            self.validation_result_dialog(ctx);
+        }
         self.confirm_record_exit(ctx);
         if self.busy() || self.update_checking || self.scanner.is_scanning() {
             ctx.request_repaint_after(Duration::from_millis(100));

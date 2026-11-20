@@ -12,3 +12,5 @@ pub mod serial_capture;
 pub mod telemetry;
 pub mod telemetry_http;
 pub mod updater;
+pub mod verification;
+pub mod verification_csv;

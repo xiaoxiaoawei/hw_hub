@@ -174,12 +174,18 @@ impl FlashApp {
 
     fn update_wait_reason(&self) -> Option<&'static str> {
         restart_safety_reason(
-            self.running() || self.startup_log.is_some(),
+            self.running() || self.validation_running() || self.startup_log.is_some(),
             self.driver_busy,
             self.record_service.pending_local_count(),
             self.pending_records.len(),
             self.failed_records.len(),
         )
+        .or_else(|| {
+            self.validation
+                .save_error
+                .is_some()
+                .then_some("请先重试保存验证结果。")
+        })
         .or_else(|| {
             ((self.settings_open || self.resume_settings_after_update)
                 && self.has_unsaved_settings())
@@ -188,6 +194,7 @@ impl FlashApp {
         .or_else(|| (self.record_service.pending_count() > 0).then_some("等待日志上传结束…"))
         .or_else(|| {
             (self.close_confirm_open
+                || self.validation.result_open
                 || self.chip_picker_open
                 || self.pending_driver_license.is_some())
             .then_some("等待当前窗口操作结束…")

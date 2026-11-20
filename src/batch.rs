@@ -2,7 +2,7 @@
 use crate::{
     backend::{self, DeviceIdentity, FlashProgress, Port},
     firmware::PreparedFirmware,
-    serial_capture::{self, CaptureEnd, CaptureEvent, CaptureOptions},
+    serial_capture::{self, CaptureEnd, CaptureEvent, CaptureOptions, CaptureSummary},
     telemetry::{CompiledExtractionRules, TelemetrySettings},
 };
 use anyhow::{Context, Result, ensure};
@@ -164,6 +164,7 @@ pub struct Batch {
 enum BatchKind {
     Flash,
     Read,
+    Validation,
 }
 
 impl BatchKind {
@@ -171,6 +172,7 @@ impl BatchKind {
         match self {
             Self::Flash => "烧录",
             Self::Read => "读取日志",
+            Self::Validation => "启动验证",
         }
     }
 }
@@ -297,6 +299,19 @@ impl Batch {
         ))
     }
 
+    /// Reset each frozen device into normal firmware boot and collect its raw
+    /// console for ten seconds. Success here means complete console transport;
+    /// the application evaluates its verification criteria independently.
+    /// No firmware, extraction regex, eFuse probe or flash operation is used.
+    pub fn start_validation(ports: Vec<Port>, baud: u32, concurrency: usize) -> Result<Self> {
+        start_validation_with_capture(
+            ports,
+            baud,
+            concurrency,
+            serial_capture::capture_startup_log,
+        )
+    }
+
     pub fn cancel_queued(&self) {
         self.queue
             .lock()
@@ -325,6 +340,75 @@ impl Batch {
     pub fn is_running(&self) -> bool {
         self.remaining.load(Ordering::SeqCst) > 0
     }
+}
+
+fn start_validation_with_capture(
+    ports: Vec<Port>,
+    baud: u32,
+    concurrency: usize,
+    capture: impl Fn(
+        &Port,
+        u32,
+        &AtomicBool,
+        &mut dyn FnMut(CaptureEvent) -> bool,
+    ) -> Result<CaptureSummary>
+    + Send
+    + Sync
+    + 'static,
+) -> Result<Batch> {
+    let names: Vec<_> = ports.iter().map(|port| port.name.clone()).collect();
+    validate_queue(&names, concurrency)?;
+    ensure!(baud > 0, "启动日志波特率必须大于 0");
+    ensure!(
+        ports.iter().all(|port| !port.identity.trim().is_empty()),
+        "设备身份为空，请重新扫描后选择设备"
+    );
+    let expected: HashMap<_, _> = ports
+        .into_iter()
+        .map(|port| (backend::port_name_key(&port.name), port))
+        .collect();
+    Ok(start_workers_for(
+        names,
+        concurrency,
+        BatchKind::Validation,
+        move |port, events| {
+            let snapshot = expected
+                .get(&backend::port_name_key(port))
+                .context("本批启动验证设备身份快照丢失")?;
+            let mut lines_received = 0usize;
+            let result = capture(snapshot, baud, &AtomicBool::new(false), &mut |event| {
+                match event {
+                    CaptureEvent::Opened => {
+                        events.state = JobState::Reading;
+                        events.send(BatchEventKind::State, "已连接，准备采集启动日志".into());
+                    }
+                    CaptureEvent::Resetting => {
+                        events.send(BatchEventKind::Log, "正在正常启动复位".into())
+                    }
+                    CaptureEvent::Line(line) => {
+                        lines_received += 1;
+                        events.send(BatchEventKind::DeviceLog, line);
+                    }
+                }
+                true
+            })?;
+            // An early stop, limit or cancellation cannot certify a complete
+            // observation interval. Already forwarded lines stay with this COM.
+            match result.end {
+                CaptureEnd::TimedOut => {}
+                CaptureEnd::LimitReached => {
+                    anyhow::bail!("启动日志超过本次读取上限，采集结果不完整")
+                }
+                CaptureEnd::Cancelled => anyhow::bail!("启动日志读取已取消，采集结果不完整"),
+                CaptureEnd::Stopped => anyhow::bail!("启动日志提前停止，采集结果不完整"),
+            }
+            ensure!(
+                result.bytes_read > 0 && lines_received > 0,
+                "未收到启动日志，请检查波特率、复位电路和固件输出通道"
+            );
+            Ok(())
+        },
+    ))
 }
 
 fn validate_queue(ports: &[String], concurrency: usize) -> Result<()> {
@@ -405,6 +489,7 @@ where
                         let message = match kind {
                             BatchKind::Flash => "已停止排队，未写入",
                             BatchKind::Read => "已停止排队，未读取日志",
+                            BatchKind::Validation => "已停止排队，未复位或读取启动日志",
                         };
                         Some((JobState::Cancelled, message.into()))
                     } else {
@@ -431,6 +516,7 @@ where
                                 match kind {
                                     BatchKind::Flash => "写入与校验完成",
                                     BatchKind::Read => "日志读取完成，已提取配置字段",
+                                    BatchKind::Validation => "启动日志采集完成，待规则判定",
                                 }
                                 .into(),
                             ),
@@ -480,6 +566,181 @@ mod tests {
         } else {
             "FEDCBA98765432100FEDCBA987654321"
         }
+    }
+
+    fn validation_port(name: &str) -> Port {
+        Port {
+            name: name.into(),
+            identity: format!("frozen-physical-{name}"),
+            description: "same USB driver".into(),
+            usb: true,
+            suggested: false,
+        }
+    }
+
+    fn capture_summary(end: CaptureEnd, bytes: usize, lines: usize) -> CaptureSummary {
+        CaptureSummary {
+            bytes_read: bytes,
+            decoded_bytes: bytes,
+            lines,
+            elapsed: Duration::from_secs(10),
+            end,
+            limit: (end == CaptureEnd::LimitReached)
+                .then_some(serial_capture::CaptureLimit::TotalBytes),
+        }
+    }
+
+    #[test]
+    fn validation_rejects_bad_queue_baud_or_identity_before_invoking_capture() {
+        let valid = validation_port("COM1");
+        let mut missing_identity = valid.clone();
+        missing_identity.identity = " ".into();
+        for (ports, baud, concurrency) in [
+            (vec![], 115_200, 1),
+            (vec![valid.clone(), valid.clone()], 115_200, 1),
+            (vec![valid.clone()], 0, 1),
+            (vec![valid.clone()], 115_200, 0),
+            (vec![valid], 115_200, 17),
+            (vec![missing_identity], 115_200, 1),
+        ] {
+            assert!(
+                start_validation_with_capture(ports, baud, concurrency, |_, _, _, _| panic!(
+                    "invalid input must never capture/reset"
+                ))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn validation_streams_each_com_without_regex_and_only_complete_console_transport_succeeds() {
+        let names = ["COM1", "COM2", "COM3", "COM4", "COM5", "COM6"];
+        let ports = names.iter().map(|name| validation_port(name)).collect();
+        let batch =
+            start_validation_with_capture(ports, 115_200, 2, |snapshot, baud, cancel, callback| {
+                assert_eq!(
+                    snapshot.identity,
+                    format!("frozen-physical-{}", snapshot.name)
+                );
+                assert_eq!(baud, 115_200);
+                assert!(!cancel.load(Ordering::Acquire));
+                assert!(callback(CaptureEvent::Opened));
+                assert!(callback(CaptureEvent::Resetting));
+                if snapshot.name == "COM6" {
+                    return Ok(capture_summary(CaptureEnd::TimedOut, 0, 0));
+                }
+                // Deliberately contains FAIL: transport must not apply product
+                // verification rules or require configured regex/firmware here.
+                assert!(callback(CaptureEvent::Line(format!(
+                    "{} SELF_TEST=FAIL",
+                    snapshot.name
+                ))));
+                let end = match snapshot.name.as_str() {
+                    "COM1" => CaptureEnd::TimedOut,
+                    "COM2" => CaptureEnd::LimitReached,
+                    "COM3" => CaptureEnd::Stopped,
+                    "COM4" => CaptureEnd::Cancelled,
+                    _ => anyhow::bail!("synthetic serial disconnect after raw output"),
+                };
+                Ok(capture_summary(end, 23, 1))
+            })
+            .unwrap();
+        let mut events = Vec::new();
+        let mut finals = HashMap::new();
+        while finals.len() < names.len() {
+            let event = batch.receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+            if terminal(&event.state) {
+                finals.insert(event.port.clone(), event.clone());
+            }
+            events.push(event);
+        }
+        assert_eq!(finals["COM1"].state, JobState::Success);
+        assert_eq!(finals["COM1"].message, "启动日志采集完成，待规则判定");
+        for name in names {
+            let own: Vec<_> = events.iter().filter(|event| event.port == name).collect();
+            assert!(own.iter().any(|event| event.state == JobState::Queued && event.message == "等待启动验证"));
+            assert!(own.iter().any(
+                |event| event.kind == BatchEventKind::State && event.state == JobState::Reading
+            ));
+            assert!(
+                own.iter().any(|event| event.kind == BatchEventKind::Log
+                    && event.message == "正在正常启动复位")
+            );
+            if name != "COM1" {
+                assert_eq!(finals[name].state, JobState::Failed);
+            }
+            let raw: Vec<_> = own
+                .iter()
+                .filter(|event| event.kind == BatchEventKind::DeviceLog)
+                .collect();
+            if name == "COM6" {
+                assert!(raw.is_empty());
+                assert!(finals[name].message.contains("未收到启动日志"));
+            } else {
+                assert_eq!(raw.len(), 1);
+                assert_eq!(raw[0].message, format!("{name} SELF_TEST=FAIL"));
+            }
+            assert!(
+                own.iter().all(|event| event.identity.is_none()
+                    && event.kind != BatchEventKind::UniqueDeviceId)
+            );
+        }
+        assert!(
+            finals["COM5"]
+                .message
+                .contains("synthetic serial disconnect")
+        );
+    }
+
+    #[test]
+    fn validation_invalidation_and_queue_stop_never_reset_unclaimed_devices() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let gate = Arc::new(Barrier::new(2));
+        let worker_gate = gate.clone();
+        let invoked = Arc::new(Mutex::new(Vec::new()));
+        let calls = invoked.clone();
+        let batch = start_validation_with_capture(
+            ["COM1", "COM2", "COM3"]
+                .into_iter()
+                .map(validation_port)
+                .collect(),
+            115_200,
+            1,
+            move |snapshot, _, cancel, callback| {
+                calls.lock().unwrap().push(snapshot.name.clone());
+                entered_tx.send(()).unwrap();
+                worker_gate.wait();
+                assert!(
+                    !cancel.load(Ordering::Acquire),
+                    "queue stop must not interrupt the active capture"
+                );
+                callback(CaptureEvent::Opened);
+                callback(CaptureEvent::Line("boot complete".into()));
+                Ok(capture_summary(CaptureEnd::TimedOut, 14, 1))
+            },
+        )
+        .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        batch.invalidate_queued_port("COM1", "active capture must finish");
+        batch.invalidate_queued_port("COM2", "frozen device disappeared before validation");
+        batch.cancel_queued();
+        gate.wait();
+        let mut finals = HashMap::new();
+        while finals.len() < 3 {
+            let event = batch.receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+            if terminal(&event.state) {
+                finals.insert(event.port.clone(), event);
+            }
+        }
+        assert_eq!(*invoked.lock().unwrap(), ["COM1"]);
+        assert_eq!(finals["COM1"].state, JobState::Success);
+        assert_eq!(finals["COM2"].state, JobState::Failed);
+        assert_eq!(
+            finals["COM2"].message,
+            "frozen device disappeared before validation"
+        );
+        assert_eq!(finals["COM3"].state, JobState::Cancelled);
+        assert_eq!(finals["COM3"].message, "已停止排队，未复位或读取启动日志");
     }
 
     #[test]

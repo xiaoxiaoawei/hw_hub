@@ -2,6 +2,11 @@
 
 应用版本以 `Cargo.toml` 的 `[package].version` 为唯一来源。发布前先补充本文件，再使用 `python scripts/bump-version.py <版本>` 同步包和锁文件；`--check` 检查一致性，`--dry-run` 预览更新。正式版本格式为 `MAJOR.MINOR.PATCH`，Git 标签格式为 `vMAJOR.MINOR.PATCH`。
 
+## [0.5.7] - 2026-11-20
+
+- 新增 ESP32-C3「批量验证」，按所选 COM 复位并读取启动日志，检查两项传感器、MAC、设备 ID 和电池电压。
+- 每台设备的结果追加到同一份 `validation-results.csv`。保存后在结果弹窗显示各设备的 PASS 或失败原因。
+
 ## [0.5.6] - 2026-11-20
 
 - 在线 COM 的日志窗口新增「复位并读取启动日志」。可设置读取波特率，在同一窗口查看、复制原始启动输出，也可提前停止。

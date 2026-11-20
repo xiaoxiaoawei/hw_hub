@@ -36,6 +36,14 @@ ESP32-C3 烧录会从 `ESP_EFUSE_OPTIONAL_UNIQUE_ID` 读取 16 字节，按固�
 
 “软件设置 → 高级配置”中的日志上报默认关闭，接口地址为空。接入自己的服务端后，可配置 HTTP/HTTPS 地址、超时、身份提取规则和自定义请求头，再明确启用；没有预设的外部接收地址。网络失败不会改变烧录结果，已保存的 CSV 保持可用，可按当前设置手动重试上报。JSON 字段、幂等键、重试规则及联调示例见[日志上传接口](docs/log-upload-api.md)。
 
+## 批量验证
+
+在侧栏打开「批量验证」，勾选待测设备后点击「开始批量验证」。默认以 115200 波特率打开串口、复位 ESP32-C3 并采集启动输出。每台设备的日志可从该设备的终端按钮查看。
+
+验证要求 MAX30105、BMI270 均报告 `detected & working!`，输出有效的 MAC 和 `UNIQUE DEVICE ID`，且电池电压在 0–2922 mV 内（含端点）。结果保存后，弹窗显示各设备的 PASS 或失败原因。
+
+每轮结果在已配置的记录目录追加到同一份 `validation-results.csv`，每台设备占一行，带批次 ID、串口、时间、传感器状态、MAC、设备 ID、电池电压、结论和失败原因。可以从结果弹窗打开 CSV。
+
 ## 自动检查软件更新
 
 默认在每天首次启动时按系统本地日期检查 GitHub 最新正式 Release。可在“软件设置 → 通用设置”中关闭自动检查，也可随时手动检查。检查完成后弹窗显示结果，失败时提供原因和重试入口。
@@ -112,11 +120,11 @@ cargo run --locked
 python3 scripts/bump-version.py --help
 python3 scripts/bump-version.py --check
 # 先为下一版本写好 CHANGELOG，再预演并更新版本：
-python3 scripts/bump-version.py 0.5.7 --dry-run
-python3 scripts/bump-version.py 0.5.7
+python3 scripts/bump-version.py 0.5.8 --dry-run
+python3 scripts/bump-version.py 0.5.8
 ```
 
-提交并验证新版本后创建对应 Git 标签，例如 `git tag -a v0.5.7 -m "FlashTool v0.5.7"`，再推送分支和标签以触发发布。标签必须与 Cargo 版本相同。每次修复使用新版本和标签。
+提交并验证新版本后创建对应 Git 标签，例如 `git tag -a v0.5.8 -m "FlashTool v0.5.8"`，再推送分支和标签以触发发布。标签必须与 Cargo 版本相同。每次修复使用新版本和标签。
 
 GitHub Actions 验证 `vX.Y.Z` 标签与 Cargo 版本一致，通过格式、静态检查和测试后在 Windows 构建。正式 Release 统一使用 `FlashTool vX.Y.Z` 标题，上传版本 ZIP、源码 ZIP 和 SHA256 校验文件，验证成功后才发布并标记 Latest。已发布标签及附件保持不变；可手动选择只构建或发布一个已存在的版本标签。Latest 保持指向较高的正式版本，补发旧版本时保留更新版本的 Latest 标记。
 
