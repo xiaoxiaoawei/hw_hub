@@ -144,6 +144,11 @@ void bv_scan_reset(bv_scan_t *scan) {
     if (scan) memset(scan, 0, sizeof(*scan));
 }
 
+static bool complete_snapshot(const bv_evidence_t *e, bool response) {
+    if (e->malformed || e->invalid_name || e->conflicting) return false;
+    return response ? e->name_seen && e->diagnostic_seen : e->service_seen;
+}
+
 void bv_scan_observe(bv_scan_t *scan, const uint8_t address[6], uint8_t address_type,
                      const uint8_t *data, size_t length, bool response) {
     if (!scan || !address) return;
@@ -168,6 +173,21 @@ void bv_scan_observe(bv_scan_t *scan, const uint8_t address[6], uint8_t address_
     observe(&candidate->evidence, data, length, response, &candidate->named_match);
     uint8_t *raw = response ? candidate->scan_rsp : candidate->adv;
     size_t *raw_length = response ? &candidate->scan_rsp_len : &candidate->adv_len;
+    bv_evidence_t previous = {0}, incoming = {0};
+    bv_observe(&previous, raw, *raw_length, response);
+    bv_observe(&incoming, data, length, response);
+    /* Keep the last complete, actually received packet instead of erasing it
+       with a valid flags/name/diagnostic-only follow-up. All reports still
+       update sticky errors above; malformed/conflicting follow-ups retain the
+       old fail-closed behavior. No fields or raw bytes are spliced together. */
+    if (complete_snapshot(&previous, response) && !complete_snapshot(&incoming, response) &&
+        !candidate->evidence.malformed && !candidate->evidence.invalid_name &&
+        !candidate->evidence.conflicting) {
+        /* Voltage may vary between advertisements. Report the exact voltage
+           in the selected complete scan response, not a later partial one. */
+        if (response) candidate->evidence.battery_mv = previous.battery_mv;
+        return;
+    }
     memset(raw, 0, BV_MAX_AD_BYTES);
     *raw_length = 0;
     if (length <= BV_MAX_AD_BYTES && (data || !length)) {

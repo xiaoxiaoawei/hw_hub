@@ -129,7 +129,9 @@ static void write_line(const char *text) {
     portEXIT_CRITICAL(&state_lock);
     /* Primary onboard USB-to-TTL bridge is independent of native USB. */
     if (uart) { uart_write_bytes(UART_NUM_0, text, strlen(text)); uart_write_bytes(UART_NUM_0, "\n", 1); }
-    if (usb) {
+    /* The onboard UART bridge is primary. An installed but physically unused
+       native USB driver must not spend 2x20ms waiting on each log line. */
+    if (usb && usb_serial_jtag_is_connected()) {
         usb_serial_jtag_write_bytes(text, strlen(text), pdMS_TO_TICKS(20));
         usb_serial_jtag_write_bytes("\n", 1, pdMS_TO_TICKS(20));
     }
@@ -146,6 +148,8 @@ static bool emit(const char *kind, const char *status, const char *reason, const
     valid &= cJSON_AddStringToObject(json, "session", session) != NULL;
     if (!strcmp(kind, "ready")) valid &= cJSON_AddNumberToObject(json, "protocol", 2) != NULL;
     else valid &= cJSON_AddNumberToObject(json, "attempt", attempt) != NULL;
+    if (!strcmp(kind,"ready") || !strcmp(kind,"start"))
+        valid &= cJSON_AddNumberToObject(json,"scan_timeout_ms",BV_SCAN_MS) != NULL;
     if (status) valid &= cJSON_AddStringToObject(json, "status", status) != NULL;
     if (reason) valid &= cJSON_AddStringToObject(json, "reason", reason) != NULL;
     if (candidate) {
@@ -267,7 +271,25 @@ static int gap_event(struct ble_gap_event *event, void *arg) {
         report.response=event->disc.event_type==BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP;
         if (known || bv_packet_interesting(event->disc.data,report.length,report.response)) {
             memcpy(report.data,event->disc.data,report.length);
-            portENTER_CRITICAL(&state_lock); bool publish=active_attempt==generation; portEXIT_CRITICAL(&state_lock);
+            portENTER_CRITICAL(&state_lock);
+            bool publish=active_attempt==generation;
+            if (publish && !known) {
+                bool exists=false;
+                for (size_t i=0;i<known_count;++i) {
+                    if (known_keys[i].type==report.address_type && !memcmp(known_keys[i].address,report.address,6)) exists=true;
+                }
+                if (!exists) {
+                    if (known_count==BV_MAX_CANDIDATES) { publish=false; overflow=true; }
+                    else {
+                        known_keys[known_count].type=report.address_type;
+                        memcpy(known_keys[known_count++].address,report.address,6);
+                    }
+                }
+            }
+            portEXIT_CRITICAL(&state_lock);
+            /* Register a plausible address before returning from its first
+               callback, so an immediate following RSP cannot be filtered out
+               while the I/O task has not consumed the first ADV yet. */
             if (publish && xQueueSend(reports,&report,0)!=pdTRUE) overflow=true;
         }
     }
@@ -296,21 +318,6 @@ static void process_report(const report_t *report) {
     if (!finishing && report_overflowed(attempt)) { finish(false,"scan_report_overflow",false); return; }
     bv_scan_observe(&scan, report->address, report->address_type, report->data, report->length, report->response);
     if (scan.overflow && !finishing) { finish(false,"candidate_capacity_exceeded",false); return; }
-    /* Once a plausible address is known, preserve even its non-interesting
-       later packets for strict raw/conflict diagnostics; unrelated RF is ignored. */
-    for (size_t i=0; i<BV_MAX_CANDIDATES; ++i) {
-        const bv_candidate_t *candidate=&scan.candidates[i];
-        if (!candidate->used || candidate->address_type!=report->address_type || memcmp(candidate->address,report->address,6)) continue;
-        portENTER_CRITICAL(&state_lock);
-        bool exists=false;
-        for (size_t k=0;k<known_count;++k) if (known_keys[k].type==report->address_type && !memcmp(known_keys[k].address,report->address,6)) exists=true;
-        if (!exists && active_attempt==attempt && known_count<BV_MAX_CANDIDATES) {
-            known_keys[known_count].type=report->address_type;
-            memcpy(known_keys[known_count++].address,report->address,6);
-        }
-        portEXIT_CRITICAL(&state_lock);
-        break;
-    }
     if (finishing) return;
     if (bv_scan_matching_count(&scan) > 1) { finish(false,"multiple_lumysi_candidates",false); return; }
     const bv_candidate_t *candidate = bv_scan_single(&scan);
@@ -342,7 +349,6 @@ static void io_task(void *unused) {
     int sample=1, stable=1; int64_t changed=esp_timer_get_time(), pressed=0, next_heartbeat=0;
     while (true) {
         int64_t now=esp_timer_get_time();
-        if (now>=next_heartbeat) { heartbeat(); next_heartbeat=now+1000000; }
         uint8_t ignored[128]; /* No command or application write is required. */
         if (uart_ready) uart_read_bytes(UART_NUM_0,ignored,sizeof(ignored),0);
         portENTER_CRITICAL(&state_lock); bool usb=usb_ready; portEXIT_CRITICAL(&state_lock);
@@ -382,6 +388,10 @@ static void io_task(void *unused) {
                 else { if (pressed && now-pressed>=40000 && now-pressed<=1000000) start_attempt(); pressed=0; }
             }
         }
+        /* BLE report consumption, button handling and the hard scan deadline
+           take precedence over optional periodic serial diagnostics. */
+        now=esp_timer_get_time();
+        if (now>=next_heartbeat) { heartbeat(); next_heartbeat=now+1000000; }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }

@@ -248,7 +248,8 @@ static void candidates_keep_rsp_first_raw_snapshot_and_informational_battery(voi
     inconsistent.evidence.battery_mv = 2;
     assert(!bv_candidate_passes(&inconsistent));
     bv_scan_observe(&scan, address_a, 0, NULL, 0, true);
-    assert(bv_passes(&candidate->evidence) && !bv_candidate_passes(candidate));
+    assert(bv_candidate_passes(candidate) && candidate->evidence.battery_mv == 1);
+    assert(candidate->scan_rsp_len == length && !memcmp(candidate->scan_rsp, data, length));
 }
 
 static void packet_fragments_cannot_fabricate_complete_raw_pair(void) {
@@ -263,19 +264,66 @@ static void packet_fragments_cannot_fabricate_complete_raw_pair(void) {
     bv_scan_observe(&scan, address_a, 0, data, length, true);
     const bv_candidate_t *candidate = bv_scan_single(&scan);
     assert(candidate && bv_passes(&candidate->evidence));
-    assert(!bv_candidate_passes(candidate)); /* The actual latest RSP has no diagnostics. */
+    assert(!bv_candidate_passes(candidate)); /* Separate fragments are never a real complete RSP. */
     length = response(data, "Lumysi", 0, 1, 188, 999);
     bv_scan_observe(&scan, address_a, 0, data, length, true);
     assert(bv_candidate_passes(candidate));
+    uint8_t selected_rsp[BV_MAX_AD_BYTES];
+    size_t selected_length = length;
+    memcpy(selected_rsp, data, length);
     length = diagnostic(data, 0, 1, 188, 1000);
     bv_scan_observe(&scan, address_a, 0, data, length, true);
-    assert(bv_passes(&candidate->evidence) && !bv_candidate_passes(candidate));
-    length = response(data, "Lumysi", 0, 1, 188, 1001);
-    bv_scan_observe(&scan, address_a, 0, data, length, true);
     assert(bv_candidate_passes(candidate));
+    assert(candidate->evidence.battery_mv == 999); /* Metadata belongs to the actual selected complete RSP. */
+    assert(candidate->scan_rsp_len == selected_length && !memcmp(candidate->scan_rsp, selected_rsp, selected_length));
+    length = name_packet(data, "Lumysi", 9);
+    bv_scan_observe(&scan, address_a, 0, data, length, true);
+    assert(bv_candidate_passes(candidate) && candidate->evidence.battery_mv == 999);
+    assert(candidate->scan_rsp_len == selected_length && !memcmp(candidate->scan_rsp, selected_rsp, selected_length));
     const uint8_t flags_only[] = {2,1,6};
     bv_scan_observe(&scan, address_a, 0, flags_only, sizeof(flags_only), false);
-    assert(bv_passes(&candidate->evidence) && !bv_candidate_passes(candidate));
+    assert(bv_candidate_passes(candidate));
+    assert(candidate->adv_len == sizeof(adv) && !memcmp(candidate->adv, adv, sizeof(adv)));
+    length = response(data, "Lumysi", 0, 1, 188, 1001);
+    bv_scan_observe(&scan, address_a, 0, data, length, true);
+    assert(bv_candidate_passes(candidate) && candidate->evidence.battery_mv == 1001);
+    assert(candidate->scan_rsp_len == length && !memcmp(candidate->scan_rsp, data, length));
+}
+
+static void retained_complete_raw_proof_never_hides_new_errors_or_merges_other_devices(void) {
+    for (unsigned error = 0; error < 6; ++error) {
+        bv_scan_t scan;
+        bv_scan_reset(&scan);
+        uint8_t data[BV_MAX_AD_BYTES];
+        size_t length = response(data, "Lumysi", 0, 1, 188, 999);
+        bv_scan_observe(&scan, address_a, 0, adv, sizeof(adv), false);
+        bv_scan_observe(&scan, address_a, 0, data, length, true);
+        const bv_candidate_t *candidate = bv_scan_single(&scan);
+        assert(bv_candidate_passes(candidate));
+        if (error == 0) { data[0] = 0; data[1] = 1; length = 2; }
+        if (error == 1) length = diagnostic(data, 0x80000000, 1, 188, 1000);
+        if (error == 2) length = diagnostic(data, 0, 1, 187, 1000);
+        if (error == 3) length = name_packet(data, "Lumysi-other", 9);
+        if (error == 4) { length = diagnostic(data, 0, 1, 188, 1000); data[2] = 0xfe; }
+        if (error == 5) { length = name_packet(data, "Lumysi-x", 9); data[length - 1] = 0x80; }
+        bv_scan_observe(&scan, address_a, 0, data, length, true);
+        assert(!bv_candidate_passes(candidate));
+        length = response(data, "Lumysi", 0, 1, 188, 999);
+        bv_scan_observe(&scan, address_a, 0, data, length, true);
+        assert(!bv_candidate_passes(candidate)); /* A later good packet cannot clear sticky errors. */
+    }
+    bv_scan_t scan;
+    bv_scan_reset(&scan);
+    uint8_t data[BV_MAX_AD_BYTES];
+    bv_scan_observe(&scan, address_a, 0, adv, sizeof(adv), false);
+    size_t length = name_packet(data, "Lumysi", 9);
+    bv_scan_observe(&scan, address_a, 0, data, length, true);
+    length = diagnostic(data, 0, 1, 188, 1000);
+    bv_scan_observe(&scan, address_b, 0, data, length, true);
+    bv_scan_observe(&scan, address_a, 1, data, length, true);
+    assert(bv_scan_matching_count(&scan) == 1);
+    const bv_candidate_t *candidate = bv_scan_single(&scan);
+    assert(candidate && !candidate->evidence.diagnostic_seen && !bv_candidate_passes(candidate));
 }
 
 static void all_named_candidates_count_even_with_faults_missing_service_or_different_address_types(void) {
@@ -406,13 +454,14 @@ static void timeout_reason_preserves_diagnostic_only_when_complete_buffer_fits(v
 }
 
 int main(void) {
-    assert(BV_SCAN_MS == 25000);
+    assert(BV_SCAN_MS == 60000);
     parser_uses_substring_case_insensitive_complete_ascii_names();
     parser_checks_exact_service_full_fault_word_and_version_but_not_battery();
     parser_rejects_every_bad_manufacturer_ad_and_nonzero_after_padding();
     radio_prefilter_and_capacity_ignore_unrelated_reports_but_fail_closed_on_relevant_overflow();
     candidates_keep_rsp_first_raw_snapshot_and_informational_battery();
     packet_fragments_cannot_fabricate_complete_raw_pair();
+    retained_complete_raw_proof_never_hides_new_errors_or_merges_other_devices();
     all_named_candidates_count_even_with_faults_missing_service_or_different_address_types();
     sound_phases_last_exactly_three_continuous_half_seconds();
     immediate_result_waits_for_full_start_then_plays_full_outcome_without_restart();

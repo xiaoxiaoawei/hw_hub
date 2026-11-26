@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define BV_SCAN_MS 25000
+#define BV_SCAN_MS 60000
 #define BV_NAME_SIZE 32
 #define BV_MAX_AD_BYTES 31
 #define BV_MAX_CANDIDATES 32
@@ -55,7 +55,8 @@ void bv_scan_observe(bv_scan_t *scan, const uint8_t address[6], uint8_t address_
 size_t bv_scan_matching_count(const bv_scan_t *scan);
 /* NULL on ambiguity, no named match, or capacity overflow. */
 const bv_candidate_t *bv_scan_single(const bv_scan_t *scan);
-/* Independently reparse the latest, unmodified actual ADV/RSP pair.
- * Evidence assembled from separate RSP packets cannot fabricate raw proof. */
+/* Independently reparse the selected unmodified actual ADV/RSP pair. A valid
+ * shorter follow-up does not erase an already complete real packet. Sticky
+ * errors still reject; separate RSP fragments cannot fabricate raw proof. */
 bool bv_candidate_passes(const bv_candidate_t *candidate);
 #endif
