@@ -173,6 +173,9 @@ impl FlashApp {
     }
 
     fn update_wait_reason(&self) -> Option<&'static str> {
+        if self.software_reset.open || self.software_reset.in_progress() {
+            return Some("等待软件重启操作结束…");
+        }
         restart_safety_reason(
             self.running()
                 || self.validation_running()

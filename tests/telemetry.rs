@@ -625,6 +625,46 @@ fn production_snapshot_uses_the_frozen_destination_and_keeps_http_schema_unchang
 }
 
 #[test]
+fn partial_production_fields_are_preserved_as_blank_cells_and_validate_before_submission() {
+    let root = tempfile::tempdir().unwrap();
+    let production = ProductionBatch::parse(" partial-order ", "", "").unwrap();
+    let destination = production.record_directory(root.path(), RecordOperation::Flash);
+    assert_eq!(destination, root.path().join("烧录"));
+    let configuration = settings(&destination);
+    let mut service = RecordService::new(|| {});
+    service
+        .submit_with_production(
+            &configuration,
+            draft(),
+            RecordOperation::Flash,
+            Some(CUSTOM_ID),
+            Some(&production),
+        )
+        .unwrap();
+    let result = receive_record(&mut service);
+    let fields = csv_fields(result.csv_path.as_ref().unwrap());
+    assert_eq!(fields["生产批次/工单号"], "partial-order");
+    assert_eq!(fields["主板年周"], "");
+    assert_eq!(fields["主板生产日期"], "");
+    let mut invalid = production;
+    invalid.board_week = "../x".into();
+    let mut later = draft();
+    later.batch_id = "invalid-optional-production".into();
+    assert!(
+        service
+            .submit_with_production(
+                &configuration,
+                later,
+                RecordOperation::Flash,
+                Some(CUSTOM_ID),
+                Some(&invalid),
+            )
+            .is_err()
+    );
+    assert_eq!(service.pending_local_count(), 0);
+}
+
+#[test]
 fn readonly_records_append_the_same_production_columns_in_the_resolved_verification_directory() {
     let root = tempfile::tempdir().unwrap();
     let production = ProductionBatch::parse("read-order", "2647", "2026-11-20").unwrap();

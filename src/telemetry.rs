@@ -529,7 +529,7 @@ impl From<&ProductionBatch> for ProductionMetadata {
         Self {
             work_order: production.work_order.clone(),
             board_week: production.board_week.clone(),
-            board_date: production.board_date.to_string(),
+            board_date: production.board_date_text(),
         }
     }
 }
@@ -720,6 +720,15 @@ impl RecordService {
         unique_device_id: Option<&str>,
         production: Option<&ProductionBatch>,
     ) -> Result<String> {
+        let production = production
+            .map(|value| {
+                ProductionBatch::parse(
+                    &value.work_order,
+                    &value.board_week,
+                    &value.board_date_text(),
+                )
+            })
+            .transpose()?;
         let hardware_unique_device_id = unique_device_id
             .map(normalize_hardware_unique_id)
             .transpose()?;
@@ -766,7 +775,7 @@ impl RecordService {
             record_id: id.clone(),
             operation,
             hardware_unique_device_id,
-            production: production.map(ProductionMetadata::from),
+            production: production.as_ref().map(ProductionMetadata::from),
         };
         if self.sender.try_send(task).is_err() {
             self.local_pending.fetch_sub(1, Ordering::AcqRel);

@@ -87,7 +87,7 @@ impl FlashApp {
                 return;
             }
         };
-        let Some(setup) = self.prepare_record_setup(RecordOperation::ReadOnly, true) else {
+        let Some(setup) = self.prepare_record_setup(RecordOperation::ReadOnly) else {
             return;
         };
         let ports = self.selected_online_ports();
@@ -217,14 +217,12 @@ impl FlashApp {
     }
 
     fn save_validation_report(&mut self) {
-        let (Some(directory), Some(production)) = (
-            self.validation.report_directory.clone(),
-            self.validation.production.clone(),
-        ) else {
-            self.validation.save_error = Some("本批验证缺少生产信息或保存目录".into());
+        let Some(directory) = self.validation.report_directory.clone() else {
+            self.validation.save_error = Some("本批验证缺少保存目录".into());
             self.validation.result_open = true;
             return;
         };
+        let production = self.validation.production.clone();
         let records: Vec<_> = self
             .validation
             .rows
@@ -243,10 +241,10 @@ impl FlashApp {
         match thread::Builder::new()
             .name("validation-csv".into())
             .spawn(move || {
-                let result = verification_csv::append_batch_with_production(
+                let result = verification_csv::append_batch_with_optional_production(
                     &directory,
                     &records,
-                    &production,
+                    production.as_ref(),
                 )
                 .map_err(|error| format!("无法保存验证 CSV：{error:#}"));
                 let _ = sender.send(result);

@@ -283,6 +283,17 @@ impl FlashApp {
             .color(MUTED),
         );
         ui.add_space(10.0);
+        ui.horizontal_wrapped(|ui| {
+            if secondary_button(ui, "重置软件", [100.0, 32.0]).clicked() {
+                self.open_software_reset();
+            }
+            ui.label(
+                RichText::new("重新启动当前版本，保留设置与已保存记录。")
+                    .size(12.0)
+                    .color(MUTED),
+            );
+        });
+        ui.add_space(8.0);
         ui.separator();
         ui.label(RichText::new("本地 CSV 记录").heading().size(16.0).strong());
         ui.horizontal_wrapped(|ui| {

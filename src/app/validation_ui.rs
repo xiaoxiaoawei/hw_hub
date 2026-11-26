@@ -466,14 +466,17 @@ impl FlashApp {
                 ui.set_width((ctx.screen_rect().width() - 64.0).clamp(260.0, 760.0));
                 ui.label(RichText::new("本批验证结果").heading().size(20.0).strong());
                 if let Some(production) = &self.validation.production {
-                    ui.label(
-                        RichText::new(format!(
-                            "{} · 年周 {}",
-                            production.work_order, production.board_week
-                        ))
-                        .size(12.0)
-                        .color(MUTED),
-                    );
+                    let mut supplied = Vec::new();
+                    if !production.work_order.is_empty() {
+                        supplied.push(format!("工单 {}", production.work_order));
+                    }
+                    if !production.board_week.is_empty() {
+                        supplied.push(format!("年周 {}", production.board_week));
+                    }
+                    if production.board_date.is_some() {
+                        supplied.push(format!("生产日期 {}", production.board_date_text()));
+                    }
+                    ui.label(RichText::new(supplied.join(" · ")).size(12.0).color(MUTED));
                 }
                 if self.validation.report.is_none() {
                     ui.label(RichText::new("报告尚未保存").size(12.0).color(DANGER));

@@ -43,7 +43,7 @@ pub struct VerificationRecord {
 /// Preserve the legacy ten-column history format. Production metadata and
 /// startup logs belong in the separate per-work-order format below.
 pub fn append_batch(directory: &Path, records: &[VerificationRecord]) -> Result<PathBuf> {
-    append_records(directory, records, NAME, None)
+    append_records(directory, records, NAME, None, false)
 }
 
 /// Append full frozen captures to a deterministic CSV for this work order.
@@ -54,15 +54,36 @@ pub fn append_batch_with_production(
     records: &[VerificationRecord],
     production: &ProductionBatch,
 ) -> Result<PathBuf> {
-    ensure!(
-        !production.work_order.trim().is_empty(),
-        "生产工单号不能为空"
-    );
-    let name = format!(
-        "validation-{:x}.csv",
-        Sha256::digest(production.work_order.as_bytes())
-    );
-    append_records(directory, records, &name, Some(production))
+    append_batch_with_optional_production(directory, records, Some(production))
+}
+
+/// Preserve the full capture even when any or all production fields are blank.
+/// The default name deliberately differs from the legacy ten-column history.
+pub fn append_batch_with_optional_production(
+    directory: &Path,
+    records: &[VerificationRecord],
+    production: Option<&ProductionBatch>,
+) -> Result<PathBuf> {
+    let production = production
+        .map(|value| {
+            ProductionBatch::parse(
+                &value.work_order,
+                &value.board_week,
+                &value.board_date_text(),
+            )
+        })
+        .transpose()?;
+    let name = match production
+        .as_ref()
+        .filter(|value| !value.work_order.is_empty())
+    {
+        Some(production) => format!(
+            "validation-{:x}.csv",
+            Sha256::digest(production.work_order.as_bytes())
+        ),
+        None => "validation-records.csv".into(),
+    };
+    append_records(directory, records, &name, production.as_ref(), true)
 }
 
 /// Save a complete batch snapshot. Repeating identical rows is a no-op;
@@ -73,12 +94,13 @@ fn append_records(
     records: &[VerificationRecord],
     name: &str,
     production: Option<&ProductionBatch>,
+    include_capture: bool,
 ) -> Result<PathBuf> {
     ensure!(!records.is_empty(), "没有待保存的验证结果");
     let batch = &records[0].batch_id;
     ensure!(!batch.is_empty(), "验证批次标识不能为空");
     let mut header = HEADER.to_vec();
-    if production.is_some() {
+    if include_capture {
         header.extend(PRODUCTION_COLUMNS);
     }
     let mut rows = Vec::with_capacity(records.len());
@@ -86,11 +108,11 @@ fn append_records(
         ensure!(&record.batch_id == batch, "一次只能保存同一验证批次");
         ensure!(!record.port.is_empty(), "验证端口不能为空");
         let mut cells = record_cells(record);
-        if let Some(production) = production {
+        if include_capture {
             cells.extend([
-                production.work_order.clone(),
-                production.board_week.clone(),
-                production.board_date.to_string(),
+                production.map_or_else(String::new, |value| value.work_order.clone()),
+                production.map_or_else(String::new, |value| value.board_week.clone()),
+                production.map_or_else(String::new, ProductionBatch::board_date_text),
                 record.startup_log.clone(),
             ]);
         }
@@ -462,11 +484,46 @@ mod tests {
     }
 
     fn production(order: &str) -> ProductionBatch {
-        ProductionBatch {
-            work_order: order.into(),
-            board_week: "2026W01".into(),
-            board_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
-        }
+        ProductionBatch::parse(order, "2601", "2026-01-01").unwrap()
+    }
+
+    #[test]
+    fn optional_metadata_keeps_full_logs_without_overwriting_legacy_history() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = append_batch(root.path(), &[sample("legacy", "COM1", 2922)]).unwrap();
+        let legacy_bytes = fs::read(&legacy).unwrap();
+        let mut blank = sample("blank-production", "COM2", 2922);
+        blank.startup_log = "ESP-ROM:synthetic\nlast line".into();
+        let path =
+            append_batch_with_optional_production(root.path(), &[blank.clone()], None).unwrap();
+        assert_eq!(path.file_name().unwrap(), "validation-records.csv");
+        let before = fs::read(&path).unwrap();
+        let rows = parsed(&before);
+        assert_eq!(rows[0].len(), 14);
+        assert_eq!(&rows[1][10..13], ["", "", ""]);
+        assert_eq!(rows[1][13], blank.startup_log);
+        let date_only = ProductionBatch::parse(" \t", " ", " 2024-02-29 ").unwrap();
+        let later = sample("date-only", "COM3", 2922);
+        assert_eq!(
+            append_batch_with_optional_production(root.path(), &[later], Some(&date_only)).unwrap(),
+            path
+        );
+        let after = fs::read(&path).unwrap();
+        assert!(after.starts_with(&before));
+        assert_eq!(&parsed(&after)[2][10..13], ["", "", "2024-02-29"]);
+        assert_eq!(fs::read(legacy).unwrap(), legacy_bytes);
+        let order_only = ProductionBatch::parse(" work-order-only ", "", "").unwrap();
+        let grouped = append_batch_with_production(
+            root.path(),
+            &[sample("order-only", "COM4", 2922)],
+            &order_only,
+        )
+        .unwrap();
+        assert_ne!(grouped, path);
+        assert_eq!(
+            &parsed(&fs::read(grouped).unwrap())[1][10..13],
+            ["work-order-only", "", ""]
+        );
     }
 
     #[test]
@@ -493,7 +550,7 @@ mod tests {
         assert_eq!(rows[1][2], first.finished_at);
         assert_eq!(
             &rows[1][10..13],
-            [order.work_order.as_str(), "2026W01", "2026-01-01"]
+            [order.work_order.as_str(), "2601", "2026-01-01"]
         );
         assert_eq!(rows[1][13], first.startup_log);
         append_batch_with_production(dir.path(), std::slice::from_ref(&first), &order).unwrap();
@@ -554,13 +611,16 @@ mod tests {
         fs::write(&path, &before).unwrap();
         assert!(append_batch_with_production(dir.path(), &[row], &order).is_err());
         assert_eq!(fs::read(path).unwrap(), before);
-        assert!(
-            append_batch_with_production(
-                dir.path(),
-                &[sample("synthetic-empty", "COM1", 2922)],
-                &production("  ")
-            )
-            .is_err()
+        let unassigned = append_batch_with_production(
+            dir.path(),
+            &[sample("synthetic-empty", "COM1", 2922)],
+            &production("  "),
+        )
+        .unwrap();
+        assert_eq!(unassigned.file_name().unwrap(), "validation-records.csv");
+        assert_eq!(
+            &parsed(&fs::read(unassigned).unwrap())[1][10..13],
+            ["", "2601", "2026-01-01"]
         );
     }
 

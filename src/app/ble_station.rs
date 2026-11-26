@@ -10,10 +10,10 @@ use std::{
 };
 
 const STATION_LOG_WAIT: Duration = Duration::from_secs(10);
-// The station reports its 25-second timeout itself. Allow a short delivery
-// window before synthesizing a result for a silent station.
-const SCAN_RESULT_DEADLINE: Duration = Duration::from_secs(28);
+// Give the station time to deliver its result after the scan deadline.
+const SCAN_RESULT_GRACE: Duration = Duration::from_secs(3);
 const SCAN_TIMEOUT_REASON: &str = "scan_timeout";
+const MISSING_RESULT_REASON: &str = "scan_timeout:station_result_missing";
 const MAX_LINE_BYTES: usize = 4_096;
 const MAX_ATTEMPT_LOG_BYTES: usize = 512 * 1024;
 const MAX_PENDING_RECORDS: usize = 32;
@@ -47,17 +47,29 @@ struct PendingRecord {
     record: Record,
     production: Option<ProductionBatch>,
     root: PathBuf,
+    scan_timeout_ms: Option<u32>,
 }
 
 struct ScanAttempt {
     number: u32,
     started: Instant,
+    timeout_ms: Option<u32>,
     log: String,
+}
+
+impl ScanAttempt {
+    fn result_overdue(&self, elapsed: Duration) -> bool {
+        let scan_time = Duration::from_millis(u64::from(
+            self.timeout_ms.unwrap_or(ble_verification::SCAN_TIMEOUT_MS),
+        ));
+        elapsed >= scan_time + SCAN_RESULT_GRACE
+    }
 }
 
 struct BleTask {
     port: Port,
     session: Option<String>,
+    scan_timeout_ms: Option<u32>,
     last_attempt: u32,
     opened: Option<Instant>,
     warned_awaiting: bool,
@@ -70,7 +82,7 @@ struct BleTask {
 
 enum StationMessage {
     Opened,
-    Line(String),
+    Line { line: String, received_at: Instant },
     Closed(Result<(), String>),
 }
 
@@ -120,6 +132,7 @@ impl BleWorkspace {
             },
             production: task.production.clone(),
             root: task.root.clone(),
+            scan_timeout_ms: attempt.timeout_ms,
         });
         self.save_next();
     }
@@ -138,7 +151,7 @@ impl BleWorkspace {
             uid: result.uid.clone(),
             passed: result.status == Status::Pass,
             timed_out,
-            detail: result_detail(result),
+            detail: result_detail(result, pending.scan_timeout_ms),
             time: pending.record.timestamp.clone(),
             report: None,
             save_error: None,
@@ -177,10 +190,15 @@ impl BleWorkspace {
         task.stop.store(true, Ordering::Release);
     }
 
-    fn ingest_line(&mut self, task: &mut BleTask, line: String) {
+    fn ingest_line_at(&mut self, task: &mut BleTask, line: String, received_at: Instant) {
         self.push_log(line.clone());
         if task.stop.load(Ordering::Acquire) {
             return;
+        }
+        if task.attempt.as_ref().is_some_and(|attempt| {
+            attempt.result_overdue(received_at.saturating_duration_since(attempt.started))
+        }) {
+            self.fail_attempt(task, MISSING_RESULT_REASON.into());
         }
         if let Some(attempt) = &mut task.attempt {
             if attempt.log.len() + line.len() + 1 > MAX_ATTEMPT_LOG_BYTES - MAX_LINE_BYTES {
@@ -200,6 +218,7 @@ impl BleWorkspace {
                         self.status = "工装已就绪，请短按 IO7 按键".into();
                     }
                 }
+                task.scan_timeout_ms = event.scan_timeout_ms;
             }
             Ok(Some(Event::Start(event)))
                 if task.attempt.is_none()
@@ -225,7 +244,8 @@ impl BleWorkspace {
                 self.status = "正在扫描并核对 Lumysi 广播…".into();
                 task.attempt = Some(ScanAttempt {
                     number: event.attempt,
-                    started: Instant::now(),
+                    started: received_at,
+                    timeout_ms: event.scan_timeout_ms.or(task.scan_timeout_ms),
                     log: format!("{line}\n"),
                 });
             }
@@ -316,8 +336,7 @@ impl FlashApp {
         match self.launch_ble(ctx) {
             Ok(task) => {
                 self.error = None;
-                self.notice = (task.production.is_none() && !self.production_inputs.is_blank())
-                    .then(|| "生产信息不完整，报告将保存到未分批的蓝牙验证目录。".into());
+                self.notice = None;
                 self.ble.result_open = false;
                 self.ble.logs.clear();
                 self.ble.latest = None;
@@ -329,7 +348,11 @@ impl FlashApp {
     }
 
     fn launch_ble(&self, ctx: &egui::Context) -> anyhow::Result<BleTask> {
-        let production = self.production_inputs.parse().ok();
+        let production = if self.production_inputs.is_blank() {
+            None
+        } else {
+            Some(self.production_inputs.parse()?)
+        };
         let root = record_root(&self.telemetry_settings)?;
         let port = self
             .ports
@@ -357,7 +380,12 @@ impl FlashApp {
                     &worker_port,
                     &worker_stop,
                     || send(StationMessage::Opened),
-                    |line| send(StationMessage::Line(line)),
+                    |line| {
+                        send(StationMessage::Line {
+                            line,
+                            received_at: Instant::now(),
+                        })
+                    },
                 )
                 .map_err(|error| format!("{error:#}"));
                 send(StationMessage::Closed(result));
@@ -365,6 +393,7 @@ impl FlashApp {
         Ok(BleTask {
             port,
             session: None,
+            scan_timeout_ms: None,
             last_attempt: 0,
             opened: None,
             warned_awaiting: false,
@@ -415,7 +444,9 @@ impl FlashApp {
                         task.opened = Some(Instant::now());
                         self.ble.status = "串口已打开，正在读取工装日志…".into();
                     }
-                    StationMessage::Line(line) => self.ble.ingest_line(&mut task, line),
+                    StationMessage::Line { line, received_at } => {
+                        self.ble.ingest_line_at(&mut task, line, received_at);
+                    }
                     StationMessage::Closed(result) => {
                         if !task.stop.load(Ordering::Acquire) {
                             let error = result.err().unwrap_or_else(|| "工装已断开".into());
@@ -435,16 +466,16 @@ impl FlashApp {
                 {
                     task.warned_awaiting = true;
                     self.ble.status =
-                        "仍在监听，尚未收到工装状态。请核对板载 USB 转 TTL 的 COM 口和 v0.1.2 工装固件。"
+                        "仍在监听，尚未收到工装状态。请核对板载 USB 转 TTL 的 COM 口和工装固件。"
                             .into();
                 }
                 if task
                     .attempt
                     .as_ref()
-                    .is_some_and(|attempt| attempt.started.elapsed() >= SCAN_RESULT_DEADLINE)
+                    .is_some_and(|attempt| attempt.result_overdue(attempt.started.elapsed()))
                 {
                     self.ble
-                        .fail_attempt(&mut task, "scan_timeout:station_result_missing".into());
+                        .fail_attempt(&mut task, MISSING_RESULT_REASON.into());
                 }
                 self.ble.task = Some(task);
             }
@@ -482,12 +513,15 @@ fn is_scan_timeout(result: &ResultEvent) -> bool {
         })
 }
 
-fn result_detail(result: &ResultEvent) -> String {
+fn result_detail(result: &ResultEvent, scan_timeout_ms: Option<u32>) -> String {
     let mut details = Vec::new();
     if let Some(reason) = &result.reason {
         let timed_out = is_scan_timeout(result);
         let reason = if timed_out {
-            details.push("25 秒内未通过蓝牙验证".into());
+            details.push(match scan_timeout_ms {
+                Some(ms) => format!("{} 秒内未通过蓝牙验证", f64::from(ms) / 1000.0),
+                None => "蓝牙验证扫描超时".into(),
+            });
             reason.split_once(':').map_or("", |(_, cause)| cause)
         } else {
             reason.as_str()
@@ -620,6 +654,12 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
 
+    impl BleWorkspace {
+        fn ingest_line(&mut self, task: &mut BleTask, line: String) {
+            self.ingest_line_at(task, line, Instant::now());
+        }
+    }
+
     fn sample_task(root: &Path) -> (BleTask, mpsc::Sender<StationMessage>) {
         let (sender, receiver) = mpsc::channel();
         let task = BleTask {
@@ -631,6 +671,7 @@ mod tests {
                 identity: "sample-fixture".into(),
             },
             session: None,
+            scan_timeout_ms: None,
             last_attempt: 0,
             opened: None,
             warned_awaiting: false,
@@ -734,8 +775,19 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (mut task, _sender) = sample_task(root.path());
         let mut workspace = BleWorkspace::default();
-        workspace.ingest_line(&mut task, line(json!({"event":"ready", "protocol":2})));
-        workspace.ingest_line(&mut task, line(json!({"event":"start", "attempt":1})));
+        workspace.ingest_line(
+            &mut task,
+            line(json!({"event":"ready", "protocol":2, "scan_timeout_ms":60000})),
+        );
+        workspace.ingest_line(
+            &mut task,
+            line(json!({"event":"start", "attempt":1, "scan_timeout_ms":60000})),
+        );
+        let attempt = task.attempt.as_ref().unwrap();
+        for millis in [28_000, 60_000, 62_999] {
+            assert!(!attempt.result_overdue(Duration::from_millis(millis)));
+        }
+        assert!(attempt.result_overdue(Duration::from_secs(63)));
         workspace.ingest_line(
             &mut task,
             line(json!({
@@ -746,7 +798,7 @@ mod tests {
         let latest = workspace.latest.as_ref().unwrap();
         assert!(workspace.result_open && latest.timed_out && !latest.passed);
         assert!(latest.report.is_none());
-        assert!(latest.detail.contains("25 秒") && latest.detail.contains("Lumysi"));
+        assert!(latest.detail.contains("60 秒") && latest.detail.contains("Lumysi"));
 
         workspace.result_open = false;
         let saved = workspace
@@ -760,6 +812,72 @@ mod tests {
         let report = workspace.latest.as_ref().unwrap().report.as_ref().unwrap();
         let data = fs::read_to_string(report).unwrap();
         assert!(data.contains("scan_timeout:no_lumysi_candidate"));
+    }
+
+    #[test]
+    fn legacy_timeout_is_still_reported_without_claiming_the_new_duration() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut task, _sender) = sample_task(root.path());
+        let mut workspace = BleWorkspace::default();
+        workspace.ingest_line(&mut task, line(json!({"event":"start", "attempt":1})));
+        let attempt = task.attempt.as_ref().unwrap();
+        assert_eq!(attempt.timeout_ms, None);
+        assert!(!attempt.result_overdue(Duration::from_secs(60)));
+        assert!(attempt.result_overdue(Duration::from_secs(63)));
+
+        workspace.ingest_line(
+            &mut task,
+            line(json!({
+                "event": "result", "attempt": 1, "status": "FAIL",
+                "reason": "scan_timeout:no_lumysi_candidate",
+            })),
+        );
+        let latest = workspace.latest.as_ref().unwrap();
+        assert!(workspace.result_open && latest.timed_out);
+        assert!(latest.detail.contains("扫描超时") && !latest.detail.contains("60 秒"));
+        workspace
+            .save_result
+            .take()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn queued_results_use_serial_arrival_time_for_the_watchdog() {
+        for (arrival_ms, passed) in [(62_999, true), (63_000, false)] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut task, _sender) = sample_task(root.path());
+            let mut workspace = BleWorkspace::default();
+            let started = Instant::now();
+            workspace.ingest_line_at(
+                &mut task,
+                line(json!({"event":"start", "attempt":1, "scan_timeout_ms":60000})),
+                started,
+            );
+            workspace.ingest_line_at(
+                &mut task,
+                line(pass_payload(1)),
+                started + Duration::from_millis(arrival_ms),
+            );
+            let latest = workspace.latest.as_ref().unwrap();
+            assert_eq!(latest.passed, passed);
+            assert_eq!(workspace.result_open, !passed);
+            let report = workspace
+                .save_result
+                .take()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                fs::read_to_string(report)
+                    .unwrap()
+                    .contains(MISSING_RESULT_REASON),
+                !passed
+            );
+        }
     }
 
     #[test]

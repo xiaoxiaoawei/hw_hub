@@ -5,6 +5,7 @@ mod device_read;
 mod firmware_drop;
 mod production_setup;
 mod settings;
+mod software_reset;
 mod software_update;
 mod startup_log;
 mod validation;
@@ -40,6 +41,7 @@ use esp32c3_flashtool::{
 };
 use firmware_drop::FirmwareFileDrop;
 use production_setup::{ProductionInputs, RecordSetup, effective_record_directory, record_root};
+use software_reset::SoftwareReset;
 use startup_log::StartupLogTask;
 use validation::ValidationWorkspace;
 
@@ -355,6 +357,7 @@ pub struct FlashApp {
     record_notes: BTreeMap<DeviceLogKey, String>,
     record_submit_error: Option<String>,
     close_confirm_open: bool,
+    software_reset: SoftwareReset,
     allow_exit: bool,
     error: Option<String>,
     notice: Option<String>,
@@ -514,6 +517,7 @@ impl FlashApp {
             record_notes: BTreeMap::new(),
             record_submit_error: None,
             close_confirm_open: false,
+            software_reset: SoftwareReset::default(),
             allow_exit: false,
             error: None,
             notice: None,
@@ -571,6 +575,7 @@ impl FlashApp {
             || self.startup_log.is_some()
             || self.driver_busy
             || self.installer_preparing
+            || self.software_reset.in_progress()
     }
 
     fn scan_ports(&mut self) {
@@ -651,7 +656,7 @@ impl FlashApp {
             self.error = Some("请先勾选在线的待烧录串口。".into());
             return;
         }
-        let Some(setup) = self.prepare_record_setup(RecordOperation::Flash, true) else {
+        let Some(setup) = self.prepare_record_setup(RecordOperation::Flash) else {
             return;
         };
         let mut inputs = Vec::new();
@@ -1614,15 +1619,26 @@ impl FlashApp {
                 {
                     self.open_settings();
                 }
-                ui.label(
-                    RichText::new(format!(
-                        "{} 个串口在线",
-                        self.ports.iter().filter(|row| row.online).count()
-                    ))
-                    .size(12.0)
-                    .color(meta),
-                );
+                if ui
+                    .add_enabled_ui(
+                        !self.installer_preparing && !self.software_reset.in_progress(),
+                        |ui| secondary_button(ui, "重置软件", [90.0, 34.0]),
+                    )
+                    .inner
+                    .on_hover_text("重新启动当前版本，保留设置与已保存记录")
+                    .clicked()
+                {
+                    self.open_software_reset();
+                }
             });
+            ui.label(
+                RichText::new(format!(
+                    "{} 个串口在线",
+                    self.ports.iter().filter(|row| row.online).count()
+                ))
+                .size(12.0)
+                .color(meta),
+            );
             if !self.failed_records.is_empty() {
                 if ui
                     .add(
@@ -1679,7 +1695,8 @@ impl FlashApp {
             || self.update_dialog_open
             || self.chip_picker_open
             || self.pending_driver_license.is_some()
-            || self.close_confirm_open;
+            || self.close_confirm_open
+            || self.software_reset.open;
         if !modal_open
             && let Some(blank) = header_drag_region(row.response.rect, title_rect, controls_left)
         {
@@ -2426,7 +2443,7 @@ impl FlashApp {
             [
                 production.work_order.clone(),
                 production.board_week.clone(),
-                production.board_date.to_string(),
+                production.board_date_text(),
             ]
         });
         append_csv(
@@ -2505,6 +2522,7 @@ impl eframe::App for FlashApp {
         self.poll_validation();
         self.poll_ble();
         self.poll_records();
+        self.poll_software_reset(ctx);
         self.collect_update_events(ctx);
         self.poll_self_update(ctx);
         self.poll_ports();
@@ -2597,12 +2615,13 @@ impl eframe::App for FlashApp {
                         ui.add_space(8.0);
                     });
             });
-        if !busy {
+        if !busy && !self.software_reset.open {
             self.chip_dialog(ctx);
             self.driver_license_dialog(ctx);
             self.device_read_dialog(ctx);
         }
         if self.update_prompt_pending
+            && !self.software_reset.open
             && !self.close_confirm_open
             && self.pending_driver_license.is_none()
             && !self.chip_picker_open
@@ -2612,16 +2631,19 @@ impl eframe::App for FlashApp {
         {
             self.open_update_dialog();
         }
-        self.update_dialog(ctx);
-        self.settings_window(ctx);
-        self.device_log_windows(ctx);
-        if !self.close_confirm_open {
-            self.validation_result_dialog(ctx);
-            if !self.validation.result_open && !self.update_dialog_open && !self.settings_open {
-                self.ble_result_dialog(ctx);
+        if !self.software_reset.open {
+            self.update_dialog(ctx);
+            self.settings_window(ctx);
+            self.device_log_windows(ctx);
+            if !self.close_confirm_open {
+                self.validation_result_dialog(ctx);
+                if !self.validation.result_open && !self.update_dialog_open && !self.settings_open {
+                    self.ble_result_dialog(ctx);
+                }
             }
         }
         self.confirm_record_exit(ctx);
+        self.software_reset_dialog(ctx);
         if self.busy() || self.update_checking || self.scanner.is_scanning() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -2641,9 +2663,9 @@ fn restart_safety_reason(
     failed_records: usize,
 ) -> Option<&'static str> {
     if running || driver_busy {
-        Some("当前任务未结束，完成后可重启更新。")
+        Some("当前任务未结束，完成后可重启软件。")
     } else if local_pending > 0 || queued_records > 0 {
-        Some("本地 CSV 正在保存，完成后可重启更新。")
+        Some("本地 CSV 正在保存，完成后可重启软件。")
     } else if failed_records > 0 {
         Some("仍有本地记录未保存，请先到设置中重试保存。")
     } else {

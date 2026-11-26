@@ -91,7 +91,7 @@ impl FlashApp {
     fn start_read(&mut self, ports: Vec<Port>, baud: u32) {
         self.error = None;
         self.notice = None;
-        let Some(setup) = self.prepare_record_setup(RecordOperation::ReadOnly, false) else {
+        let Some(setup) = self.prepare_record_setup(RecordOperation::ReadOnly) else {
             return;
         };
         let options = CaptureOptions {

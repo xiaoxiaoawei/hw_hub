@@ -12,7 +12,7 @@ pub const PRODUCTION_HEADERS: [&str; 3] = ["生产批次/工单号", "主板年�
 pub struct ProductionBatch {
     pub work_order: String,
     pub board_week: String,
-    pub board_date: NaiveDate,
+    pub board_date: Option<NaiveDate>,
 }
 
 impl ProductionBatch {
@@ -20,35 +20,51 @@ impl ProductionBatch {
         let work_order = work_order.trim();
         let board_week = board_week.trim();
         let board_date = board_date.trim();
-        ensure!(!work_order.is_empty(), "请填写生产批次/工单号");
-        ensure!(
-            board_week.len() == 4 && board_week.bytes().all(|byte| byte.is_ascii_digit()),
-            "主板年周必须为四位数字 YYWW"
-        );
-        let week = board_week.as_bytes();
-        let week_number = (week[2] - b'0') * 10 + week[3] - b'0';
-        ensure!(
-            (1..=53).contains(&week_number),
-            "主板年周的周数必须为 01–53"
-        );
-        ensure!(
-            board_date.len() == 10
-                && board_date.bytes().enumerate().all(|(index, byte)| {
-                    if matches!(index, 4 | 7) {
-                        byte == b'-'
-                    } else {
-                        byte.is_ascii_digit()
-                    }
-                }),
-            "主板生产日期必须为 YYYY-MM-DD"
-        );
-        let board_date = NaiveDate::parse_from_str(board_date, "%Y-%m-%d")
-            .context("主板生产日期不是有效日期")?;
+        if !board_week.is_empty() {
+            ensure!(
+                board_week.len() == 4 && board_week.bytes().all(|byte| byte.is_ascii_digit()),
+                "已填写的主板年周必须为四位数字 YYWW"
+            );
+            let week = board_week.as_bytes();
+            let week_number = (week[2] - b'0') * 10 + week[3] - b'0';
+            ensure!(
+                (1..=53).contains(&week_number),
+                "主板年周的周数必须为 01–53"
+            );
+        }
+        let board_date = if board_date.is_empty() {
+            None
+        } else {
+            ensure!(
+                board_date.len() == 10
+                    && board_date.bytes().enumerate().all(|(index, byte)| {
+                        if matches!(index, 4 | 7) {
+                            byte == b'-'
+                        } else {
+                            byte.is_ascii_digit()
+                        }
+                    }),
+                "已填写的主板生产日期必须为 YYYY-MM-DD"
+            );
+            Some(
+                NaiveDate::parse_from_str(board_date, "%Y-%m-%d")
+                    .context("主板生产日期不是有效日期")?,
+            )
+        };
         Ok(Self {
             work_order: work_order.to_owned(),
             board_week: board_week.to_owned(),
             board_date,
         })
+    }
+
+    pub fn is_blank(&self) -> bool {
+        self.work_order.is_empty() && self.board_week.is_empty() && self.board_date.is_none()
+    }
+
+    pub fn board_date_text(&self) -> String {
+        self.board_date
+            .map_or_else(String::new, |date| date.to_string())
     }
 
     /// Join validated metadata to the configured root without filesystem I/O.
@@ -79,12 +95,9 @@ mod tests {
         let batch = ProductionBatch::parse("  工单-001  ", " 2653 ", " 2024-02-29 ").unwrap();
         assert_eq!(batch.work_order, "工单-001");
         assert_eq!(batch.board_week, "2653");
-        assert_eq!(
-            batch.board_date,
-            NaiveDate::from_ymd_opt(2024, 2, 29).unwrap()
-        );
+        assert_eq!(batch.board_date, NaiveDate::from_ymd_opt(2024, 2, 29));
         assert!(ProductionBatch::parse("订单", "0001", "2026-11-20").is_ok());
-        assert!(ProductionBatch::parse(" \t\n", "2601", "2026-11-20").is_err());
+        assert!(ProductionBatch::parse(" \t\n", "2601", "2026-11-20").is_ok());
     }
 
     #[test]
@@ -125,13 +138,42 @@ mod tests {
             "26-01-01",
             "２０２６-01-01",
             "2026-01-01T00:00:00",
-            "",
         ] {
             assert!(
                 ProductionBatch::parse("order", "2601", date).is_err(),
                 "accepted invalid date: {date:?}"
             );
         }
+    }
+
+    #[test]
+    fn each_production_field_is_independently_optional_without_fabricated_values() {
+        let blank = ProductionBatch::parse(" \t", " ", "\n").unwrap();
+        assert!(blank.is_blank());
+        assert_eq!(blank.board_date_text(), "");
+        for (order, week, date) in [
+            ("order", "", ""),
+            ("", "2653", ""),
+            ("", "", "2024-02-29"),
+            ("order", "2601", ""),
+        ] {
+            let parsed = ProductionBatch::parse(order, week, date).unwrap();
+            assert!(!parsed.is_blank());
+            assert_eq!(parsed.work_order, order);
+            assert_eq!(parsed.board_week, week);
+            assert_eq!(parsed.board_date_text(), date);
+        }
+        assert!(ProductionBatch::parse("", "../1", "").is_err());
+        assert!(ProductionBatch::parse("", "", "2023-02-29").is_err());
+        let root = Path::new("configured-records");
+        assert_eq!(
+            blank.record_directory(root, RecordOperation::Flash),
+            root.join("烧录")
+        );
+        assert_eq!(
+            blank.record_directory(root, RecordOperation::ReadOnly),
+            root.join("验证")
+        );
     }
 
     #[test]

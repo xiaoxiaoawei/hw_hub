@@ -14,6 +14,7 @@ pub const EVENT_PREFIX: &str = "BLE_VERIFY ";
 pub const PASS_MARKER: &str = "PASS！";
 pub const EXPECTED_FIRMWARE: &str = "1.188";
 pub const PROTOCOL_VERSION: u32 = 2;
+pub const SCAN_TIMEOUT_MS: u32 = 60_000;
 pub const NAME_TOKEN: &str = "Lumysi";
 const SERVICE_LE: [u8; 16] = [
     0x4b, 0x91, 0x31, 0xc3, 0xc9, 0xc5, 0xcc, 0x8f, 0x9e, 0x45, 0xb5, 0x1f, 0x01, 0xc2, 0xaf, 0x4f,
@@ -62,6 +63,8 @@ impl Status {
 pub struct ReadyEvent {
     pub session: String,
     pub protocol: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_timeout_ms: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +72,8 @@ pub struct ReadyEvent {
 pub struct StartEvent {
     pub session: String,
     pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_timeout_ms: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,15 +194,29 @@ impl Event {
     fn validate(&self) -> Result<()> {
         valid_session(self.session())?;
         match self {
-            Self::Start(event) => ensure!(event.attempt >= 1, "蓝牙验证 attempt 必须大于 0"),
+            Self::Start(event) => {
+                ensure!(event.attempt >= 1, "蓝牙验证 attempt 必须大于 0");
+                validate_scan_timeout(event.scan_timeout_ms)?;
+            }
             Self::Result(event) => event.validate()?,
-            Self::Ready(event) => ensure!(
-                event.protocol == PROTOCOL_VERSION,
-                "需要 BLE 验证协议 v2 固件"
-            ),
+            Self::Ready(event) => {
+                ensure!(
+                    event.protocol == PROTOCOL_VERSION,
+                    "需要 BLE 验证协议 v2 固件"
+                );
+                validate_scan_timeout(event.scan_timeout_ms)?;
+            }
         }
         Ok(())
     }
+}
+
+fn validate_scan_timeout(timeout_ms: Option<u32>) -> Result<()> {
+    ensure!(
+        timeout_ms.is_none_or(|value| (1..=SCAN_TIMEOUT_MS).contains(&value)),
+        "蓝牙验证扫描时限必须大于 0 且不超过 60 秒"
+    );
+    Ok(())
 }
 
 /// Non-protocol console lines are ignored. A malformed protocol line is an
@@ -423,20 +442,23 @@ pub fn append_batch(
             ProductionBatch::parse(
                 &production.work_order,
                 &production.board_week,
-                &production.board_date.to_string(),
+                &production.board_date_text(),
             )
         })
         .transpose()?;
-    let (directory, name) = if let Some(production) = &production {
-        (
-            root.join(&production.board_week).join("蓝牙验证"),
-            format!(
-                "ble-validation-{:x}.csv",
-                Sha256::digest(production.work_order.as_bytes())
-            ),
-        )
-    } else {
-        (root.join("蓝牙验证"), "ble-validation.csv".to_owned())
+    let directory = production
+        .as_ref()
+        .map_or_else(|| root.to_owned(), |value| root.join(&value.board_week))
+        .join("蓝牙验证");
+    let name = match production
+        .as_ref()
+        .filter(|value| !value.work_order.is_empty())
+    {
+        Some(production) => format!(
+            "ble-validation-{:x}.csv",
+            Sha256::digest(production.work_order.as_bytes())
+        ),
+        None => "ble-validation.csv".to_owned(),
     };
     let rows = records
         .iter()
@@ -491,7 +513,7 @@ fn record_cells(record: &Record, production: Option<&ProductionBatch>) -> Result
         evidence_log(record, service_fallback),
         production.map_or_else(String::new, |value| value.work_order.clone()),
         production.map_or_else(String::new, |value| value.board_week.clone()),
-        production.map_or_else(String::new, |value| value.board_date.to_string()),
+        production.map_or_else(String::new, ProductionBatch::board_date_text),
     ]
     .into_iter()
     .collect::<Vec<_>>();
@@ -637,6 +659,19 @@ mod tests {
             parse_line(&line(&start)).unwrap(),
             Some(Event::Start(_))
         ));
+        for event in [&ready, &start] {
+            let mut with_timeout = event.clone();
+            with_timeout["scan_timeout_ms"] = json!(SCAN_TIMEOUT_MS);
+            match parse_line(&line(&with_timeout)).unwrap().unwrap() {
+                Event::Ready(event) => assert_eq!(event.scan_timeout_ms, Some(SCAN_TIMEOUT_MS)),
+                Event::Start(event) => assert_eq!(event.scan_timeout_ms, Some(SCAN_TIMEOUT_MS)),
+                Event::Result(_) => unreachable!(),
+            }
+            for invalid in [0, SCAN_TIMEOUT_MS + 1] {
+                with_timeout["scan_timeout_ms"] = json!(invalid);
+                assert!(parse_line(&line(&with_timeout)).is_err());
+            }
+        }
         for legacy in [
             json!({"event":"ready","session":session(),"mac":MAC}),
             json!({"event":"ready","session":session(),"protocol":2,"mac":MAC}),
@@ -834,6 +869,43 @@ mod tests {
         let mut with_bad_version = value;
         with_bad_version["firmware"] = "1.187".into();
         assert!(parse_line(&line(&with_bad_version)).is_ok());
+    }
+
+    #[test]
+    fn partial_production_fields_route_without_fabricated_year_week_or_date() {
+        let root = tempfile::tempdir().unwrap();
+        let first = record(1);
+        let default_path = append_batch(root.path(), &[first], None).unwrap();
+        let before = fs::read(&default_path).unwrap();
+        let date_only = ProductionBatch::parse(" ", "\t", " 2024-02-29 ").unwrap();
+        assert_eq!(
+            append_batch(root.path(), &[record(2)], Some(&date_only)).unwrap(),
+            default_path
+        );
+        let after = fs::read(&default_path).unwrap();
+        assert!(after.starts_with(&before));
+        assert_eq!(&rows(&after)[2][14..], ["", "", "2024-02-29"]);
+        let order_only = ProductionBatch::parse(" order-only ", "", "").unwrap();
+        let grouped = append_batch(root.path(), &[record(3)], Some(&order_only)).unwrap();
+        assert_eq!(
+            grouped.parent(),
+            Some(root.path().join("蓝牙验证").as_path())
+        );
+        assert_ne!(grouped, default_path);
+        assert_eq!(
+            &rows(&fs::read(grouped).unwrap())[1][14..],
+            ["order-only", "", ""]
+        );
+        let week_only = ProductionBatch::parse("", "2642", "").unwrap();
+        let week_path = append_batch(root.path(), &[record(4)], Some(&week_only)).unwrap();
+        assert_eq!(
+            week_path,
+            root.path().join("2642/蓝牙验证/ble-validation.csv")
+        );
+        assert_eq!(
+            &rows(&fs::read(week_path).unwrap())[1][14..],
+            ["", "2642", ""]
+        );
     }
 
     #[test]
