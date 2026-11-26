@@ -314,22 +314,29 @@ struct PacketEvidence {
     battery_mv: u16,
 }
 
-fn packet_evidence(adv: &[u8], scan_rsp: &[u8]) -> Result<PacketEvidence> {
-    let mut service_seen = false;
+fn advertised_service_uuid(adv: &[u8]) -> Result<Option<[u8; 16]>> {
+    let mut service = None;
     for (kind, value) in ad_fields(adv)? {
         if matches!(kind, 0x06 | 0x07) {
             ensure!(
                 !value.is_empty() && value.len().is_multiple_of(16),
                 "ADV 服务 UUID 字段长度无效"
             );
-            service_seen |= value
-                .as_chunks::<16>()
-                .0
-                .iter()
-                .any(|uuid| uuid == &SERVICE_LE);
+            for uuid in value.as_chunks::<16>().0 {
+                if uuid == &SERVICE_LE {
+                    service = Some(*uuid);
+                }
+            }
         }
     }
-    ensure!(service_seen, "ADV 缺少指定的完整服务 UUID");
+    Ok(service)
+}
+
+fn packet_evidence(adv: &[u8], scan_rsp: &[u8]) -> Result<PacketEvidence> {
+    ensure!(
+        advertised_service_uuid(adv)?.is_some(),
+        "ADV 缺少指定的完整服务 UUID"
+    );
     let mut name: Option<&[u8]> = None;
     let mut diagnostic: Option<&[u8]> = None;
     for (kind, value) in ad_fields(scan_rsp)? {
@@ -458,19 +465,14 @@ fn record_cells(record: &Record, production: Option<&ProductionBatch>) -> Result
         record.log.len() <= MAX_LOG_BYTES,
         "蓝牙验证尝试日志超过 512 KiB"
     );
+    let (csv_uid, service_fallback) = csv_device_id(&record.result)?;
     let cells = [
         record.run_id.clone(),
         record.result.attempt.to_string(),
         record.timestamp.clone(),
         String::new(), // Legacy configured_mac column: passive v2 has no target.
         record.result.mac.clone().unwrap_or_default(),
-        record
-            .result
-            .uid
-            .as_deref()
-            .map(normalize_uid)
-            .transpose()?
-            .unwrap_or_default(),
+        csv_uid,
         record.result.status.as_str().to_owned(),
         record.result.name.clone().unwrap_or_default(),
         record.result.firmware.clone().unwrap_or_default(),
@@ -486,7 +488,7 @@ fn record_cells(record: &Record, production: Option<&ProductionBatch>) -> Result
             .unwrap_or_default(),
         record.port.clone(),
         record.result.reason.clone().unwrap_or_default(),
-        evidence_log(record),
+        evidence_log(record, service_fallback),
         production.map_or_else(String::new, |value| value.work_order.clone()),
         production.map_or_else(String::new, |value| value.board_week.clone()),
         production.map_or_else(String::new, |value| value.board_date.to_string()),
@@ -496,7 +498,30 @@ fn record_cells(record: &Record, production: Option<&ProductionBatch>) -> Result
     Ok(cells)
 }
 
-fn evidence_log(record: &Record) -> String {
+/// CSV compatibility only: an advertised service is a shared protocol marker,
+/// not a unique device identity. Never infer it from a name or a MAC address.
+fn csv_device_id(result: &ResultEvent) -> Result<(String, bool)> {
+    if let Some(uid) = &result.uid {
+        return Ok((normalize_uid(uid)?, false));
+    }
+    let service = result
+        .adv_hex
+        .as_deref()
+        .and_then(|hex| decode_packet(hex).ok())
+        .and_then(|bytes| advertised_service_uuid(&bytes).ok().flatten());
+    Ok(match service {
+        Some(uuid) => (
+            uuid.iter()
+                .rev()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            true,
+        ),
+        None => (String::new(), false),
+    })
+}
+
+fn evidence_log(record: &Record, service_fallback: bool) -> String {
     let mut log = record.log.clone();
     if record.result.adv_hex.is_some() || record.result.scan_rsp_hex.is_some() {
         if !log.is_empty() && !log.ends_with('\n') {
@@ -509,6 +534,13 @@ fn evidence_log(record: &Record) -> String {
         if let Some(value) = &record.result.scan_rsp_hex {
             log.push_str(&format!("scan_rsp_hex={}\n", value.to_ascii_uppercase()));
         }
+    }
+    if service_fallback {
+        if !log.is_empty() && !log.ends_with('\n') {
+            log.push('\n');
+        }
+        log.push_str("unique_device_id_source=ble_service_uuid\n");
+        log.push_str("service_uuid_note=shared across devices offering this BLE service\n");
     }
     log
 }
@@ -524,6 +556,7 @@ mod tests {
 
     const MAC: &str = "001122AABBCC";
     const UID: &str = "00112233445566778899AABBCCDDEEFF";
+    const SERVICE_ID: &str = "4fafc2011fb5459e8fccc5c9c331914b";
     const NAME: &str = "Z-LuMySi-Q";
     fn session() -> String {
         "ab".repeat(32)
@@ -804,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn ungrouped_csv_logs_actual_mac_blank_uid_and_canonical_raw_evidence_in_the_old_seventeen_columns()
+    fn ungrouped_csv_logs_actual_mac_observed_service_fallback_and_raw_evidence_in_the_old_seventeen_columns()
      {
         let root = tempfile::tempdir().unwrap();
         let mut first = record(1);
@@ -822,7 +855,13 @@ mod tests {
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[1][6], "FAIL");
         assert_eq!(parsed[2][6], PASS_MARKER);
-        assert_eq!(&parsed[2][3..6], ["", MAC, ""]);
+        assert_eq!(&parsed[1][3..6], ["", MAC, ""]);
+        assert_eq!(&parsed[2][3..6], ["", MAC, SERVICE_ID]);
+        assert!(parsed[2][13].contains("unique_device_id_source=ble_service_uuid\n"));
+        assert!(
+            parsed[2][13]
+                .contains("service_uuid_note=shared across devices offering this BLE service\n")
+        );
         assert!(parsed[2][14..].iter().all(String::is_empty));
         assert!(parsed[2][13].contains(&format!("adv_hex={}", hex(&adv()))));
         assert!(parsed[2][13].contains("scan_rsp_hex="));
@@ -879,9 +918,112 @@ mod tests {
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[1][3], MAC);
         assert_eq!(parsed[1][5], UID);
-        assert_eq!(&parsed[2][3..6], ["", MAC, ""]);
+        assert_eq!(&parsed[2][3..6], ["", MAC, SERVICE_ID]);
         assert_eq!(&parsed[2][14..], ["synthetic-order", "2648", "2026-11-26"]);
         append_batch(root.path(), &[current], Some(&production)).unwrap();
+        assert_eq!(fs::read(path).unwrap(), after);
+    }
+
+    #[test]
+    fn csv_service_fallback_requires_a_complete_matching_advertised_uuid_not_a_name_or_static_default()
+     {
+        let mut wrong = SERVICE_LE;
+        wrong[0] ^= 1;
+        let mut truncated = adv();
+        truncated.push(5);
+        let mut padding_junk = adv();
+        padding_junk.extend([0, 1]);
+        let cases = [
+            (Some(hex(&field(0x06, &SERVICE_LE))), true),
+            (
+                Some(hex(&field(0x07, &SERVICE_LE)).to_ascii_lowercase()),
+                true,
+            ),
+            (None, false),
+            (Some(String::new()), false),
+            (Some(hex(&field(0x07, &wrong))), false),
+            (Some(hex(&field(0x09, &SERVICE_LE))), false),
+            (Some(hex(&field(0x07, &[]))), false),
+            (Some(hex(&field(0x07, &SERVICE_LE[..15]))), false),
+            (Some(hex(&truncated)), false),
+            (Some(hex(&padding_junk)), false),
+        ];
+        let root = tempfile::tempdir().unwrap();
+        let mut records = Vec::new();
+        for (index, (advertisement, expected)) in cases.into_iter().enumerate() {
+            let mut current = record(index as u32 + 1);
+            current.result.status = Status::Fail;
+            current.result.adv_hex = advertisement;
+            current.result.reason = Some("synthetic diagnostic capture".into());
+            let cells = record_cells(&current, None).unwrap();
+            assert_eq!(
+                cells[5],
+                if expected { SERVICE_ID } else { "" },
+                "case {index}"
+            );
+            assert_eq!(
+                cells[4], MAC,
+                "the actual MAC is separate from the service fallback"
+            );
+            assert_eq!(
+                cells[13].contains("unique_device_id_source=ble_service_uuid\n"),
+                expected
+            );
+            records.push(current);
+        }
+        let path = append_batch(root.path(), &records, None).unwrap();
+        let parsed = rows(&fs::read(path).unwrap());
+        assert_eq!(parsed[0], HEADER);
+        assert_eq!(parsed[1][5], SERVICE_ID);
+        assert_eq!(parsed[2][5], SERVICE_ID);
+        assert!(parsed[3..].iter().all(|row| row[5].is_empty()));
+    }
+
+    #[test]
+    fn a_true_logged_uid_wins_without_relabeling_the_record_or_changing_the_wire_result() {
+        let mut current = record(1);
+        current.result.uid = Some(UID.to_ascii_lowercase());
+        let cells = record_cells(&current, None).unwrap();
+        assert_eq!(cells[5], UID);
+        assert!(!cells[13].contains("unique_device_id_source=ble_service_uuid"));
+        assert_eq!(
+            current.result.uid.as_deref(),
+            Some(UID.to_ascii_lowercase().as_str())
+        );
+        let wire = pass();
+        assert!(wire.get("uid").is_none());
+        assert!(
+            result(&wire).uid.is_none(),
+            "CSV compatibility must not invent a BLE wire UID"
+        );
+    }
+
+    #[test]
+    fn old_passive_rows_with_blank_uid_stay_byte_preserved_and_are_never_rewritten_by_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let old_record = record(1);
+        let mut legacy = record_cells(&old_record, None).unwrap();
+        legacy[5].clear();
+        legacy[13] = evidence_log(&old_record, false);
+        let directory = root.path().join("蓝牙验证");
+        let path = crate::verification_csv::append_rows(
+            &directory,
+            "ble-validation.csv",
+            &HEADER,
+            &[legacy],
+            &[0, 11, 1],
+            None,
+        )
+        .unwrap();
+        let before = fs::read(&path).unwrap();
+        let new_record = record(2);
+        append_batch(root.path(), &[new_record], None).unwrap();
+        let after = fs::read(&path).unwrap();
+        assert!(after.starts_with(&before));
+        let parsed = rows(&after);
+        assert_eq!(parsed[1][5], "");
+        assert_eq!(parsed[2][5], SERVICE_ID);
+        assert!(append_batch(root.path(), &[old_record], None).is_err());
         assert_eq!(fs::read(path).unwrap(), after);
     }
 

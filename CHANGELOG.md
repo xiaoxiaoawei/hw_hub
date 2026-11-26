@@ -2,6 +2,10 @@
 
 应用版本以 `Cargo.toml` 的 `[package].version` 为唯一来源。发布前先补充本文件，再使用 `python scripts/bump-version.py <版本>` 同步包和锁文件；`--check` 检查一致性，`--dry-run` 预览更新。正式版本格式为 `MAJOR.MINOR.PATCH`，Git 标签格式为 `vMAJOR.MINOR.PATCH`。
 
+## [0.6.2] - 2026-11-26
+
+- 蓝牙验证 CSV 优先保存日志里的设备 UID。设备 UID 缺失时，若实际主广播包含 Lumysi 服务 UUID，则按标准字节序去掉连字符写入 `unique_device_id`，并在同一行的日志里标明来源。
+
 ## [0.6.1] - 2026-11-26
 
 - 蓝牙验证直接读取 ESP32-S3 工装串口，选择 COM 后即可查看启动、就绪和扫描日志。工装可在同一连接中连续验证。

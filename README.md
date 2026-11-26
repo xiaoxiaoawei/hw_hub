@@ -53,7 +53,9 @@ ESP32-C3 烧录会从 `ESP_EFUSE_OPTIONAL_UNIQUE_ID` 读取 16 字节，按固�
 2. 工装就绪后，短按并松开 GPIO7。工装主动扫描最多 45 秒，查找名称含 Lumysi 的设备。仅该轮发现一台候选且主广播服务 UUID、扫描响应厂商诊断、版本 `1.188` 与零故障位齐备时，工装才鸣响通过音并输出 `PASS！`。
 3. FlashTool 读取本次扫描日志，复核原始主广播和扫描响应，保存通过结果后弹窗。更换待测设备后可在原连接上继续短按。
 
-填写有效生产信息时，报告追加到 `记录根目录/主板年周/蓝牙验证` 下的工单 CSV。留空时，报告保存在 `记录根目录/蓝牙验证/ble-validation.csv`。记录含实际 BLE MAC、北京时间、故障位、电池采样、原始广播与串口日志。当前广播定义未提供 UID，UID 列留空。
+填写有效生产信息时，报告追加到 `记录根目录/主板年周/蓝牙验证` 下的工单 CSV。留空时，报告保存在 `记录根目录/蓝牙验证/ble-validation.csv`。记录含实际 BLE MAC、北京时间、故障位、电池采样、原始广播与串口日志。
+
+从 v0.6.2 起，蓝牙验证 CSV 的 `unique_device_id` 优先保存工装报告的设备 UID。缺少 UID 时，软件从实际主广播提取 Lumysi 服务 UUID，去掉连字符后写入 `4fafc2011fb5459e8fccc5c9c331914b`，并在 `attempt_log` 标注 `unique_device_id_source=ble_service_uuid`。同类设备可使用同一个服务 UUID，区分该轮观测到的设备时请查看 `observed_mac`。
 
 ## 自动检查软件更新
 
@@ -131,11 +133,11 @@ cargo run --locked
 python3 scripts/bump-version.py --help
 python3 scripts/bump-version.py --check
 # 先为下一版本写好 CHANGELOG，再预演并更新版本：
-python3 scripts/bump-version.py 0.6.2 --dry-run
-python3 scripts/bump-version.py 0.6.2
+python3 scripts/bump-version.py 0.6.3 --dry-run
+python3 scripts/bump-version.py 0.6.3
 ```
 
-提交并验证新版本后创建对应 Git 标签，例如 `git tag -a v0.6.2 -m "FlashTool v0.6.2"`，再推送分支和标签以触发发布。标签必须与 Cargo 版本相同。每次修复使用新版本和标签。
+提交并验证新版本后创建对应 Git 标签，例如 `git tag -a v0.6.3 -m "FlashTool v0.6.3"`，再推送分支和标签以触发发布。标签必须与 Cargo 版本相同。每次修复使用新版本和标签。
 
 GitHub Actions 验证 `vX.Y.Z` 标签与 Cargo 版本一致，通过格式、静态检查和测试后在 Windows 构建。正式 Release 统一使用 `FlashTool vX.Y.Z` 标题，上传版本 ZIP、源码 ZIP 和 SHA256 校验文件，验证成功后才发布并标记 Latest。已发布标签及附件保持不变；可手动选择只构建或发布一个已存在的版本标签。Latest 保持指向较高的正式版本，补发旧版本时保留更新版本的 Latest 标记。
 

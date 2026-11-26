@@ -662,6 +662,8 @@ mod tests {
         assert!(view.time.ends_with("+08:00"));
         assert!(saved.contains("QA-WO") && saved.contains("Lumysi-1234"));
         assert!(saved.contains("PASS！") && saved.contains("123456789ABC"));
+        assert!(saved.contains("\"4fafc2011fb5459e8fccc5c9c331914b\""));
+        assert!(saved.contains("unique_device_id_source=ble_service_uuid"));
         assert!(view.uid.is_none());
         assert!(!task.stop.load(Ordering::Acquire));
     }
