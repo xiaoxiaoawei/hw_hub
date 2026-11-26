@@ -58,27 +58,6 @@ impl FlashApp {
                         self.scan_ports();
                     }
                 });
-                ui.add_space(9.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new("目标 BLE MAC · 必填").size(12.0).color(MUTED));
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.ble.mac_input)
-                                .id_salt("ble_expected_mac")
-                                .desired_width(270.0)
-                                .hint_text("AA:BB:CC:DD:EE:FF"),
-                        );
-                    });
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new("目标设备 UID · 必填").size(12.0).color(MUTED));
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.ble.uid_input)
-                                .id_salt("ble_expected_uid")
-                                .desired_width(350.0)
-                                .hint_text("填写待测设备 UID"),
-                        );
-                    });
-                });
             });
             ui.add_space(9.0);
             if let Some(error) = &self.scan_error {
@@ -86,7 +65,15 @@ impl FlashApp {
             }
             ui.add(
                 egui::Label::new(
-                    RichText::new("连接工装后，按下工装上的 GPIO7 物理按钮开始验证。")
+                    RichText::new("连接工装并等待就绪，短按并松开 GPIO7 开始扫描。")
+                        .size(12.0)
+                        .color(MUTED),
+                )
+                .wrap(),
+            );
+            ui.add(
+                egui::Label::new(
+                    RichText::new("根据原始主广播与扫描响应校验名称、服务 UUID 和载荷；MAC 来自实际广播，UID 仅在取得时显示。")
                         .size(12.0)
                         .color(MUTED),
                 )
@@ -96,7 +83,6 @@ impl FlashApp {
 
         if let Some(result) = &self.ble.latest {
             // Freeze the displayed result before actions can mutate the workspace.
-            let mac = result.mac.clone();
             let observed_mac = result.observed_mac.clone();
             let uid = result.uid.clone();
             let passed = result.passed;
@@ -128,19 +114,18 @@ impl FlashApp {
                     ui.label(RichText::new(&time).size(11.0).color(MUTED));
                 }
                 ui.add_space(5.0);
-                ble_identity_value(ui, "目标 BLE MAC", &mac);
-                if !passed {
-                    if let Some(observed_mac) = &observed_mac {
-                        ble_identity_value(ui, "观察到的 BLE MAC", observed_mac);
-                    } else {
-                        ui.label(
-                            RichText::new("本次没有记录到广播地址")
-                                .size(11.0)
-                                .color(MUTED),
-                        );
-                    }
+                if let Some(observed_mac) = observed_mac.as_deref().filter(|mac| !mac.is_empty()) {
+                    ble_identity_value(ui, "观察到的 BLE MAC", observed_mac);
+                } else if !passed {
+                    ui.label(
+                        RichText::new("本次没有记录到广播地址")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
                 }
-                ble_identity_value(ui, "设备 UID", &uid);
+                if let Some(uid) = uid.as_deref().filter(|uid| !uid.is_empty()) {
+                    ble_identity_value(ui, "设备 UID", uid);
+                }
                 if !detail.is_empty() {
                     ui.add_space(5.0);
                     if passed {
@@ -236,20 +221,16 @@ impl FlashApp {
             .ports
             .iter()
             .any(|row| row.online && row.port.name == self.ble.port_name);
-        let ready = !self.busy()
-            && !self.ble.has_unsaved()
-            && online
-            && !self.ble.mac_input.trim().is_empty()
-            && !self.ble.uid_input.trim().is_empty();
+        let ready = !self.busy() && !self.ble.has_unsaved() && online;
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(
                     RichText::new(if self.ble.capturing() {
-                        "正在验证目标设备"
+                        "正在验证广播"
                     } else if connected {
                         "工装会话进行中"
                     } else {
-                        "选择工装并填写目标设备"
+                        "选择 ESP32-S3 工装串口"
                     })
                     .size(15.0)
                     .strong(),
@@ -285,15 +266,11 @@ impl FlashApp {
             self.ble.pass_open = false;
             return;
         };
-        if !result.passed
-            || result.report.is_none()
-            || result.save_error.is_some()
-            || self.ble.capturing()
-        {
+        if !result.passed || result.report.is_none() || result.save_error.is_some() {
             self.ble.pass_open = false;
             return;
         }
-        let mac = result.mac.clone();
+        let observed_mac = result.observed_mac.clone();
         let uid = result.uid.clone();
         let time = result.time.clone();
         let mut close = false;
@@ -318,8 +295,12 @@ impl FlashApp {
                     );
                 });
                 ui.add_space(14.0);
-                ble_identity_value(ui, "BLE MAC", &mac);
-                ble_identity_value(ui, "设备 UID", &uid);
+                if let Some(mac) = observed_mac.as_deref().filter(|mac| !mac.is_empty()) {
+                    ble_identity_value(ui, "BLE MAC", mac);
+                }
+                if let Some(uid) = uid.as_deref().filter(|uid| !uid.is_empty()) {
+                    ble_identity_value(ui, "设备 UID", uid);
+                }
                 if !time.is_empty() {
                     ui.label(RichText::new(&time).size(11.0).color(MUTED));
                 }

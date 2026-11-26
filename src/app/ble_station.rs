@@ -1,37 +1,36 @@
 use super::*;
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, ensure};
 use esp32c3_flashtool::{
     backend,
-    ble_verification::{self, Event, Record, ResultEvent, Status, Target},
+    ble_verification::{self, Event, Record, ResultEvent, Status},
 };
 use std::{
-    io::{self, Read, Write},
+    io::{self, Read},
     sync::atomic::{AtomicBool, Ordering},
 };
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const STATION_LOG_WAIT: Duration = Duration::from_secs(10);
 const SCAN_TIMEOUT: Duration = Duration::from_secs(55);
 const MAX_LINE_BYTES: usize = 4_096;
 const MAX_ATTEMPT_LOG_BYTES: usize = 512 * 1024;
+const MAX_PENDING_RECORDS: usize = 32;
 
 #[derive(Default)]
 pub(super) struct BleWorkspace {
     pub(super) port_name: String,
-    pub(super) mac_input: String,
-    pub(super) uid_input: String,
     pub(super) status: String,
     pub(super) logs: VecDeque<String>,
     pub(super) latest: Option<BleResultView>,
     pub(super) pass_open: bool,
     task: Option<BleTask>,
+    queued: VecDeque<PendingRecord>,
     pending: Option<PendingRecord>,
     save_result: Option<mpsc::Receiver<Result<PathBuf, String>>>,
 }
 
 pub(super) struct BleResultView {
-    pub(super) mac: String,
     pub(super) observed_mac: Option<String>,
-    pub(super) uid: String,
+    pub(super) uid: Option<String>,
     pub(super) passed: bool,
     pub(super) detail: String,
     pub(super) time: String,
@@ -42,7 +41,7 @@ pub(super) struct BleResultView {
 #[derive(Clone)]
 struct PendingRecord {
     record: Record,
-    production: ProductionBatch,
+    production: Option<ProductionBatch>,
     root: PathBuf,
 }
 
@@ -54,17 +53,19 @@ struct ScanAttempt {
 
 struct BleTask {
     port: Port,
-    session: String,
-    target: Target,
-    production: ProductionBatch,
+    session: Option<String>,
+    last_attempt: u32,
+    opened: Option<Instant>,
+    warned_awaiting: bool,
+    production: Option<ProductionBatch>,
     root: PathBuf,
     receiver: mpsc::Receiver<StationMessage>,
-    armed: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     attempt: Option<ScanAttempt>,
 }
 
 enum StationMessage {
+    Opened,
     Line(String),
     Closed(Result<(), String>),
 }
@@ -91,7 +92,7 @@ impl BleWorkspace {
     }
 
     pub(super) fn has_unsaved(&self) -> bool {
-        self.pending.is_some()
+        self.pending.is_some() || !self.queued.is_empty()
     }
 
     fn push_log(&mut self, line: String) {
@@ -105,23 +106,10 @@ impl BleWorkspace {
         let Some(attempt) = task.attempt.take() else {
             return;
         };
-        task.stop.store(true, Ordering::Release);
-        let timestamp = beijing_now().to_rfc3339();
-        self.latest = Some(BleResultView {
-            mac: task.target.mac.clone(),
-            observed_mac: result.observed_mac.clone(),
-            uid: task.target.unique_device_id.clone(),
-            passed: result.status == Status::Pass,
-            detail: result_detail(&result),
-            time: timestamp.clone(),
-            report: None,
-            save_error: None,
-        });
-        self.pending = Some(PendingRecord {
+        self.queued.push_back(PendingRecord {
             record: Record {
-                run_id: task.session.clone(),
-                target: task.target.clone(),
-                timestamp,
+                run_id: result.session.clone(),
+                timestamp: beijing_now().to_rfc3339(),
                 port: task.port.name.clone(),
                 result,
                 log: attempt.log,
@@ -129,31 +117,57 @@ impl BleWorkspace {
             production: task.production.clone(),
             root: task.root.clone(),
         });
+        self.save_next();
+    }
+
+    fn save_next(&mut self) {
+        if self.pending.is_some() || self.pass_open {
+            return;
+        }
+        let Some(pending) = self.queued.pop_front() else {
+            return;
+        };
+        let result = &pending.record.result;
+        self.latest = Some(BleResultView {
+            observed_mac: result.mac.clone(),
+            uid: result.uid.clone(),
+            passed: result.status == Status::Pass,
+            detail: result_detail(result),
+            time: pending.record.timestamp.clone(),
+            report: None,
+            save_error: None,
+        });
+        self.pending = Some(pending);
         self.save();
     }
 
     fn fail_attempt(&mut self, task: &mut BleTask, message: String) {
-        if let Some(attempt) = task.attempt.as_mut() {
+        if let (Some(session), Some(attempt)) = (&task.session, task.attempt.as_mut()) {
             attempt
                 .log
                 .push_str(&format!("{}  {message}\n", timestamp()));
             let result = ResultEvent {
-                session: task.session.clone(),
+                session: session.clone(),
                 attempt: attempt.number,
-                mac: task.target.mac.clone(),
-                observed_mac: None,
+                mac: None,
                 status: Status::Fail,
                 name: None,
                 firmware: None,
                 fault_bits: None,
                 battery_mv: None,
                 reason: Some(message),
+                adv_hex: None,
+                scan_rsp_hex: None,
+                uid: None,
             };
             self.begin_result(task, result);
-        } else {
-            task.stop.store(true, Ordering::Release);
-            self.status = message;
         }
+    }
+
+    fn disconnect(&mut self, task: &mut BleTask, message: String) {
+        self.status = message.clone();
+        self.fail_attempt(task, message);
+        task.stop.store(true, Ordering::Release);
     }
 
     fn ingest_line(&mut self, task: &mut BleTask, line: String) {
@@ -169,14 +183,32 @@ impl BleWorkspace {
             attempt.log.push_str(&line);
             attempt.log.push('\n');
         }
-        match ble_verification::parse_line_for_target(&line, &task.session, &task.target) {
-            Ok(Some(Event::Ready(_))) if !task.armed.swap(true, Ordering::AcqRel) => {
-                self.status = "工装已就绪，请短按 IO7 按键".into();
+        match ble_verification::parse_line(&line) {
+            Ok(Some(Event::Ready(event))) => {
+                if task.session.as_deref() != Some(event.session.as_str()) {
+                    self.fail_attempt(task, "工装已重启，本次扫描中断".into());
+                    task.session = Some(event.session);
+                    task.last_attempt = 0;
+                    if !self.has_unsaved() {
+                        self.status = "工装已就绪，请短按 IO7 按键".into();
+                    }
+                }
             }
             Ok(Some(Event::Start(event)))
-                if task.armed.load(Ordering::Acquire) && task.attempt.is_none() =>
+                if task.attempt.is_none()
+                    && task
+                        .session
+                        .as_ref()
+                        .is_none_or(|session| session == &event.session)
+                    && event.attempt > task.last_attempt =>
             {
-                self.status = "正在扫描并核对目标设备…".into();
+                task.last_attempt = event.attempt;
+                if self.queued.len() >= MAX_PENDING_RECORDS {
+                    self.status = "待保存结果已满，请先关闭通过提示或重试保存".into();
+                    return;
+                }
+                task.session = Some(event.session);
+                self.status = "正在扫描并核对 Lumysi 广播…".into();
                 task.attempt = Some(ScanAttempt {
                     number: event.attempt,
                     started: Instant::now(),
@@ -184,10 +216,11 @@ impl BleWorkspace {
                 });
             }
             Ok(Some(Event::Result(result)))
-                if task
-                    .attempt
-                    .as_ref()
-                    .is_some_and(|attempt| attempt.number == result.attempt) =>
+                if task.session.as_ref() == Some(&result.session)
+                    && task
+                        .attempt
+                        .as_ref()
+                        .is_some_and(|attempt| attempt.number == result.attempt) =>
             {
                 self.begin_result(task, result);
             }
@@ -211,7 +244,7 @@ impl BleWorkspace {
                 let result = ble_verification::append_batch(
                     &pending.root,
                     &[pending.record],
-                    &pending.production,
+                    pending.production.as_ref(),
                 )
                 .map_err(|err| format!("{err:#}"));
                 let _ = sender.send(result);
@@ -222,6 +255,8 @@ impl BleWorkspace {
     }
 
     fn finish_save(&mut self, result: Result<PathBuf, String>) {
+        let connected = self.is_connected();
+        let capturing = self.capturing();
         let Some(latest) = &mut self.latest else {
             return;
         };
@@ -229,7 +264,14 @@ impl BleWorkspace {
             Ok(path) => {
                 self.pending = None;
                 latest.report = Some(path);
-                self.status = "记录已保存，可连接下一台待验证设备".into();
+                self.status = if capturing {
+                    "正在扫描，上一条记录已保存"
+                } else if connected {
+                    "记录已保存，可短按 IO7 验证下一台"
+                } else {
+                    "记录已保存，工装已断开"
+                }
+                .into();
                 self.pass_open = latest.passed;
             }
             Err(error) => {
@@ -260,7 +302,8 @@ impl FlashApp {
         match self.launch_ble(ctx) {
             Ok(task) => {
                 self.error = None;
-                self.notice = None;
+                self.notice = (task.production.is_none() && !self.production_inputs.is_blank())
+                    .then(|| "生产信息不完整，报告将保存到未分批的蓝牙验证目录。".into());
                 self.ble.pass_open = false;
                 self.ble.logs.clear();
                 self.ble.latest = None;
@@ -272,8 +315,7 @@ impl FlashApp {
     }
 
     fn launch_ble(&self, ctx: &egui::Context) -> anyhow::Result<BleTask> {
-        let target = Target::new(&self.ble.mac_input, &self.ble.uid_input)?;
-        let production = self.production_inputs.parse().context("请填写生产信息")?;
+        let production = self.production_inputs.parse().ok();
         let root = record_root(&self.telemetry_settings)?;
         let port = self
             .ports
@@ -284,45 +326,37 @@ impl FlashApp {
             .context("请选择在线的 ESP32-S3 工装串口")?
             .port
             .clone();
-        let batch_id = telemetry::new_batch_id();
-        let session = batch_id
-            .strip_prefix("batch-")
-            .context("无法生成工装会话")?
-            .to_owned();
-        let command = ble_verification::target_command(&session, &target)?;
         let (sender, receiver) = mpsc::sync_channel(128);
-        let armed = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
-        let worker_armed = Arc::clone(&armed);
         let worker_stop = Arc::clone(&stop);
         let worker_port = port.clone();
         let ctx = ctx.clone();
         thread::Builder::new()
             .name("ble-verifier-serial".into())
             .spawn(move || {
+                let send = |message| {
+                    let delivered = sender.send(message).is_ok();
+                    ctx.request_repaint();
+                    delivered
+                };
                 let result = listen(
                     &worker_port,
-                    &command,
-                    &worker_armed,
                     &worker_stop,
-                    |line| {
-                        let delivered = sender.send(StationMessage::Line(line)).is_ok();
-                        ctx.request_repaint();
-                        delivered
-                    },
+                    || send(StationMessage::Opened),
+                    |line| send(StationMessage::Line(line)),
                 )
                 .map_err(|error| format!("{error:#}"));
-                let _ = sender.send(StationMessage::Closed(result));
-                ctx.request_repaint();
+                send(StationMessage::Closed(result));
             })?;
         Ok(BleTask {
             port,
-            session,
-            target,
+            session: None,
+            last_attempt: 0,
+            opened: None,
+            warned_awaiting: false,
             production,
             root,
             receiver,
-            armed,
             stop,
             attempt: None,
         })
@@ -331,7 +365,7 @@ impl FlashApp {
     pub(super) fn disconnect_ble(&mut self) {
         if let Some(mut task) = self.ble.task.take() {
             if !task.stop.load(Ordering::Acquire) {
-                self.ble.fail_attempt(&mut task, "已断开工装".into());
+                self.ble.disconnect(&mut task, "已断开工装".into());
             }
             self.ble.task = Some(task);
         }
@@ -345,7 +379,7 @@ impl FlashApp {
                     .any(|port| port.name == task.port.name && port.identity == task.port.identity)
             {
                 self.ble
-                    .fail_attempt(&mut task, "工装已拔出或串口身份改变".into());
+                    .disconnect(&mut task, "工装已拔出或串口身份改变".into());
             }
             self.ble.task = Some(task);
         }
@@ -363,11 +397,15 @@ impl FlashApp {
                     }
                 };
                 match message {
+                    StationMessage::Opened => {
+                        task.opened = Some(Instant::now());
+                        self.ble.status = "串口已打开，正在读取工装日志…".into();
+                    }
                     StationMessage::Line(line) => self.ble.ingest_line(&mut task, line),
                     StationMessage::Closed(result) => {
                         if !task.stop.load(Ordering::Acquire) {
                             let error = result.err().unwrap_or_else(|| "工装已断开".into());
-                            self.ble.fail_attempt(&mut task, error);
+                            self.ble.disconnect(&mut task, error);
                         }
                         closed = true;
                         break;
@@ -375,6 +413,17 @@ impl FlashApp {
                 }
             }
             if !closed {
+                if task.session.is_none()
+                    && !task.warned_awaiting
+                    && task
+                        .opened
+                        .is_some_and(|time| time.elapsed() >= STATION_LOG_WAIT)
+                {
+                    task.warned_awaiting = true;
+                    self.ble.status =
+                        "仍在监听，尚未收到工装状态。请核对板载 USB 转 TTL 的 COM 口和 v0.1.1 工装固件。"
+                            .into();
+                }
                 if task
                     .attempt
                     .as_ref()
@@ -386,6 +435,7 @@ impl FlashApp {
             }
         }
         self.ble.poll_save();
+        self.ble.save_next();
     }
 
     pub(super) fn retry_ble_save(&mut self) {
@@ -413,6 +463,10 @@ fn result_detail(result: &ResultEvent) -> String {
         details.push(
             match reason.as_str() {
                 "expected_target_not_seen" => "未发现目标 BLE 地址",
+                "no_lumysi_candidate" => "未发现名称含 Lumysi 的设备",
+                "multiple_lumysi_candidates" => "同时发现多台 Lumysi 设备",
+                "settle_window_incomplete" => "扫描结束前未完成候选设备复核",
+                "candidate_capacity_exceeded" | "scan_report_overflow" => "本轮广播过多，请重试",
                 "conflicting_packets" => "目标设备的广播内容互相冲突",
                 "malformed_advertising_data" => "广播数据格式无效",
                 "invalid_complete_name" => "完整广播名称格式不符",
@@ -445,9 +499,8 @@ fn result_detail(result: &ResultEvent) -> String {
 
 fn listen(
     expected: &Port,
-    command: &str,
-    armed: &AtomicBool,
     stop: &AtomicBool,
+    on_open: impl FnOnce() -> bool,
     mut on_line: impl FnMut(String) -> bool,
 ) -> anyhow::Result<()> {
     verify_station_port(expected)?;
@@ -464,24 +517,13 @@ fn listen(
         .open()
         .with_context(|| format!("无法打开 {}，请检查连接和串口占用", expected.name))?;
     verify_station_port(expected)?;
-    let opened = Instant::now();
-    let mut next_write = opened;
+    if stop.load(Ordering::Acquire) || !on_open() {
+        return Ok(());
+    }
     let mut frame = Vec::new();
+    let mut line_truncated = false;
     let mut chunk = [0_u8; 1_024];
     while !stop.load(Ordering::Acquire) {
-        if !armed.load(Ordering::Acquire) {
-            let now = Instant::now();
-            ensure!(
-                now.duration_since(opened) < HANDSHAKE_TIMEOUT,
-                "工装没有回应，请检查 ESP32-S3 蓝牙验证固件及 115200 串口连接"
-            );
-            if now >= next_write {
-                serial
-                    .write_all(command.as_bytes())
-                    .context("无法设置工装的目标地址")?;
-                next_write = now + Duration::from_secs(1);
-            }
-        }
         let count = match serial.read(&mut chunk) {
             Ok(0) => {
                 thread::sleep(Duration::from_millis(10));
@@ -505,16 +547,21 @@ fn listen(
                 if frame.last() == Some(&b'\r') {
                     frame.pop();
                 }
-                let line = String::from_utf8_lossy(&frame).into_owned();
+                let decoded = String::from_utf8_lossy(&frame);
+                let line = if line_truncated {
+                    format!("[日志行过长] {decoded}")
+                } else {
+                    decoded.into_owned()
+                };
                 frame.clear();
+                line_truncated = false;
                 if !on_line(line) {
                     return Ok(());
                 }
-            } else {
-                if frame.len() == MAX_LINE_BYTES {
-                    bail!("工装输出超长串口日志行");
-                }
+            } else if frame.len() < MAX_LINE_BYTES {
                 frame.push(*byte);
+            } else {
+                line_truncated = true;
             }
         }
     }
@@ -546,42 +593,43 @@ mod tests {
                 suggested: false,
                 identity: "sample-fixture".into(),
             },
-            session: "a".repeat(64),
-            target: Target::new("12:34:56:78:9a:bc", "0123456789ABCDEF0123456789ABCDEF").unwrap(),
-            production: ProductionBatch::parse("QA-WO", "2642", "2026-10-17").unwrap(),
+            session: None,
+            last_attempt: 0,
+            opened: None,
+            warned_awaiting: false,
+            production: Some(ProductionBatch::parse("QA-WO", "2642", "2026-10-17").unwrap()),
             root: root.to_path_buf(),
             receiver,
-            armed: Arc::new(AtomicBool::new(false)),
             stop: Arc::new(AtomicBool::new(false)),
             attempt: None,
         };
         (task, sender)
     }
 
-    fn line(mut payload: Value, task: &BleTask) -> String {
-        payload["session"] = json!(task.session);
-        payload["mac"] = json!(task.target.mac);
+    fn line(mut payload: Value) -> String {
+        payload["session"] = json!("a".repeat(64));
         format!("BLE_VERIFY {payload}")
     }
 
     fn pass_payload(attempt: u32) -> Value {
         json!({
             "event": "result", "attempt": attempt, "status": "PASS！",
-            "observed_mac": "123456789ABC", "name": "Lumysi-1234",
+            "mac": "123456789ABC", "name": "Lumysi-1234",
             "firmware": "1.188", "fault_bits": 0, "battery_mv": 661,
+            "adv_hex": "02010611064B9131C3C9C5CC8F9E45B51F01C2AF4F",
+            "scan_rsp_hex": "0DFFFFFF4C000000000100BC02950C094C756D7973692D31323334",
         })
     }
 
     #[test]
-    fn pass_requires_current_ack_start_attempt_and_durable_record() {
+    fn pass_requires_current_scan_start_raw_evidence_and_durable_record() {
         let root = tempfile::tempdir().unwrap();
         let (mut task, _sender) = sample_task(root.path());
         let mut workspace = BleWorkspace::default();
 
-        let start = line(json!({"event":"start", "attempt":1}), &task);
-        let ready = line(json!({"event":"ready"}), &task);
-        let result = line(pass_payload(1), &task);
-        workspace.ingest_line(&mut task, start.clone());
+        let start = line(json!({"event":"start", "attempt":1}));
+        let ready = line(json!({"event":"ready", "protocol":2}));
+        let result = line(pass_payload(1));
         workspace.ingest_line(&mut task, result.clone());
         assert!(workspace.latest.is_none() && task.attempt.is_none());
         workspace.ingest_line(&mut task, ready);
@@ -590,8 +638,11 @@ mod tests {
 
         workspace.ingest_line(&mut task, "PASS！".into());
         workspace.ingest_line(&mut task, result.replace(&"a".repeat(64), &"b".repeat(64)));
-        let wrong_attempt = line(pass_payload(2), &task);
+        let wrong_attempt = line(pass_payload(2));
         workspace.ingest_line(&mut task, wrong_attempt);
+        let mut no_diagnostics = pass_payload(1);
+        no_diagnostics["scan_rsp_hex"] = json!("0C094C756D7973692D31323334");
+        workspace.ingest_line(&mut task, line(no_diagnostics));
         assert!(workspace.latest.is_none() && !workspace.pass_open);
 
         workspace.ingest_line(&mut task, result);
@@ -610,7 +661,9 @@ mod tests {
         assert!(!workspace.has_unsaved());
         assert!(view.time.ends_with("+08:00"));
         assert!(saved.contains("QA-WO") && saved.contains("Lumysi-1234"));
-        assert!(saved.contains("PASS！") && saved.contains("0123456789ABCDEF0123456789ABCDEF"));
+        assert!(saved.contains("PASS！") && saved.contains("123456789ABC"));
+        assert!(view.uid.is_none());
+        assert!(!task.stop.load(Ordering::Acquire));
     }
 
     #[test]
@@ -618,12 +671,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (mut task, _sender) = sample_task(root.path());
         let mut workspace = BleWorkspace::default();
-        let ready = line(json!({"event":"ready"}), &task);
-        let start = line(json!({"event":"start", "attempt":1}), &task);
+        let ready = line(json!({"event":"ready", "protocol":2}));
+        let start = line(json!({"event":"start", "attempt":1}));
         workspace.ingest_line(&mut task, ready);
         workspace.ingest_line(&mut task, start);
         workspace.ingest_line(&mut task, "raw fixture log entry".into());
-        workspace.fail_attempt(&mut task, "工装已拔出".into());
+        workspace.disconnect(&mut task, "工装已拔出".into());
         let saved = workspace
             .save_result
             .take()
@@ -644,9 +697,9 @@ mod tests {
         fs::write(&unavailable, "not a directory").unwrap();
         let (mut task, _sender) = sample_task(&unavailable);
         let mut workspace = BleWorkspace::default();
-        let ready = line(json!({"event":"ready"}), &task);
-        let start = line(json!({"event":"start", "attempt":1}), &task);
-        let result = line(pass_payload(1), &task);
+        let ready = line(json!({"event":"ready", "protocol":2}));
+        let start = line(json!({"event":"start", "attempt":1}));
+        let result = line(pass_payload(1));
         for line in [ready, start, result] {
             workspace.ingest_line(&mut task, line);
         }
@@ -673,5 +726,56 @@ mod tests {
         assert!(workspace.pass_open && !workspace.has_unsaved());
         let report = workspace.latest.as_ref().unwrap().report.as_ref().unwrap();
         assert!(report.starts_with(unavailable.join("2642").join("蓝牙验证")));
+    }
+
+    #[test]
+    fn two_attempts_share_the_open_port_and_need_no_production_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut task, _sender) = sample_task(root.path());
+        task.production = None;
+        let mut workspace = BleWorkspace::default();
+        workspace.ingest_line(&mut task, "UART0 ready".into());
+        workspace.ingest_line(&mut task, line(json!({"event":"ready", "protocol":2})));
+        workspace.ingest_line(&mut task, line(json!({"event":"start", "attempt":1})));
+        workspace.ingest_line(
+            &mut task,
+            line(json!({
+                "event":"result", "attempt":1, "status":"FAIL", "mac":"123456789ABC",
+                "name":"Lumysi-3D38", "reason":"diagnostic_scan_response_missing",
+                "adv_hex":"02010611064B9131C3C9C5CC8F9E45B51F01C2AF4F051206000600",
+                "scan_rsp_hex":"0C094C756D7973692D33443338",
+            })),
+        );
+        workspace.ingest_line(&mut task, line(json!({"event":"start", "attempt":2})));
+        workspace.ingest_line(&mut task, line(pass_payload(2)));
+        assert_eq!(workspace.queued.len(), 1);
+
+        let wait_for_save = |workspace: &mut BleWorkspace| {
+            let saved = workspace
+                .save_result
+                .take()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+            workspace.finish_save(saved);
+        };
+        wait_for_save(&mut workspace);
+        assert!(!workspace.pass_open);
+        workspace.save_next();
+        wait_for_save(&mut workspace);
+        assert!(workspace.pass_open && !workspace.has_unsaved());
+        let report = workspace.latest.as_ref().unwrap().report.as_ref().unwrap();
+        assert_eq!(
+            report,
+            &root.path().join("蓝牙验证").join("ble-validation.csv")
+        );
+        let contents = fs::read_to_string(report).unwrap();
+        assert!(contents.contains("diagnostic_scan_response_missing"));
+        assert!(contents.contains("0DFFFFFF4C000000000100BC0295"));
+        assert!(contents.contains("PASS！") && contents.contains("Lumysi-3D38"));
+        assert!(!task.stop.load(Ordering::Acquire));
+
+        workspace.ingest_line(&mut task, line(json!({"event":"start", "attempt":2})));
+        assert!(task.attempt.is_none());
     }
 }

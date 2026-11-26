@@ -9,6 +9,12 @@ pub(super) struct ProductionInputs {
 }
 
 impl ProductionInputs {
+    pub(super) fn is_blank(&self) -> bool {
+        [&self.work_order, &self.board_week, &self.board_date]
+            .iter()
+            .all(|value| value.trim().is_empty())
+    }
+
     pub(super) fn parse(&self) -> anyhow::Result<ProductionBatch> {
         ProductionBatch::parse(&self.work_order, &self.board_week, &self.board_date)
     }
@@ -23,7 +29,12 @@ pub(super) struct RecordSetup {
 impl FlashApp {
     pub(super) fn production_input_panel(&mut self, ui: &mut egui::Ui, editable: bool) {
         card(ui, |ui| {
-            panel_title(ui, Icon::File, "生产信息");
+            let title = if self.workspace == Workspace::Bluetooth {
+                "生产信息（选填）"
+            } else {
+                "生产信息"
+            };
+            panel_title(ui, Icon::File, title);
             ui.add_enabled_ui(editable, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for (label, value, width, hint) in [
@@ -66,10 +77,7 @@ impl FlashApp {
         required: bool,
     ) -> Option<RecordSetup> {
         let inputs = &self.production_inputs;
-        let blank = [&inputs.work_order, &inputs.board_week, &inputs.board_date]
-            .iter()
-            .all(|value| value.trim().is_empty());
-        let production = if required || !blank {
+        let production = if required || !inputs.is_blank() {
             match inputs.parse() {
                 Ok(production) => Some(production),
                 Err(error) => {

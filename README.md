@@ -47,14 +47,13 @@ ESP32-C3 烧录会从 `ESP_EFUSE_OPTIONAL_UNIQUE_ID` 读取 16 字节，按固�
 
 ## 蓝牙验证
 
-将配套固件烧录到独立 ESP32-S3 工装，再通过原生 USB Serial/JTAG 或 UART0 转 USB 连接电脑。GPIO7 接低有效按键，GPIO1 接蜂鸣器。工装固件与烧录说明单独提供。[下载 ESP32-S3 工装固件](https://github.com/xiaoxiaoawei/hw_hub/releases/tag/esp32s3-verifier-v0.1.0)
+将 v0.1.1 工装固件烧录到独立 ESP32-S3，通过板载 USB 转 TTL（UART0）或原生 USB Serial/JTAG 连接电脑。GPIO7 接低有效按键，GPIO1 接蜂鸣器，串口为 115200 8N1。[下载 ESP32-S3 工装固件](https://github.com/xiaoxiaoawei/hw_hub/releases/tag/esp32s3-verifier-v0.1.1)
 
-1. 打开左侧「蓝牙验证」，填写生产批次/工单号、主板年周和主板生产日期。
-2. 选择工装 COM，填写客户确认的待测设备 **BLE 广播 MAC**，以及对应的 **设备 UID**（32 个十六进制字符）。UID 来自已有设备记录或工单。广播可能使用不同于工厂 MAC 的地址。
-3. 点击「连接工装」，等串口状态显示就绪，短按并松开工装 GPIO7。工装主动扫描最多 45 秒，读取主广播与扫描响应。
-4. 只有目标地址一致，且服务 UUID、设备完整名称及 1.188 自检数据符合要求时，工装才输出 `PASS！`。FlashTool 在保存本次结果后弹窗。每次连接验证一台设备，更换设备后填写新的 MAC 与 UID 并重新连接工装。
+1. 打开左侧「蓝牙验证」，选择板载 USB 转 TTL 对应的 COM，点击「连接工装」。FlashTool 直接显示串口日志，生产信息可选填。
+2. 工装就绪后，短按并松开 GPIO7。工装主动扫描最多 45 秒，查找名称含 Lumysi 的设备。仅该轮发现一台候选且主广播服务 UUID、扫描响应厂商诊断、版本 `1.188` 与零故障位齐备时，工装才鸣响通过音并输出 `PASS！`。
+3. FlashTool 读取本次扫描日志，复核原始主广播和扫描响应，保存通过结果后弹窗。更换待测设备后可在原连接上继续短按。
 
-蓝牙报告追加到 `记录根目录/主板年周/蓝牙验证` 下对应工单的 CSV，记录通过或失败、配置及观察到的 BLE 地址、UID、北京时间、固件版本、故障位、电池采样与工装日志。扫描不配对，电池采样值用于记录。
+填写有效生产信息时，报告追加到 `记录根目录/主板年周/蓝牙验证` 下的工单 CSV。留空时，报告保存在 `记录根目录/蓝牙验证/ble-validation.csv`。记录含实际 BLE MAC、北京时间、故障位、电池采样、原始广播与串口日志。当前广播定义未提供 UID，UID 列留空。
 
 ## 自动检查软件更新
 
@@ -132,11 +131,11 @@ cargo run --locked
 python3 scripts/bump-version.py --help
 python3 scripts/bump-version.py --check
 # 先为下一版本写好 CHANGELOG，再预演并更新版本：
-python3 scripts/bump-version.py 0.6.1 --dry-run
-python3 scripts/bump-version.py 0.6.1
+python3 scripts/bump-version.py 0.6.2 --dry-run
+python3 scripts/bump-version.py 0.6.2
 ```
 
-提交并验证新版本后创建对应 Git 标签，例如 `git tag -a v0.6.1 -m "FlashTool v0.6.1"`，再推送分支和标签以触发发布。标签必须与 Cargo 版本相同。每次修复使用新版本和标签。
+提交并验证新版本后创建对应 Git 标签，例如 `git tag -a v0.6.2 -m "FlashTool v0.6.2"`，再推送分支和标签以触发发布。标签必须与 Cargo 版本相同。每次修复使用新版本和标签。
 
 GitHub Actions 验证 `vX.Y.Z` 标签与 Cargo 版本一致，通过格式、静态检查和测试后在 Windows 构建。正式 Release 统一使用 `FlashTool vX.Y.Z` 标题，上传版本 ZIP、源码 ZIP 和 SHA256 校验文件，验证成功后才发布并标记 Latest。已发布标签及附件保持不变；可手动选择只构建或发布一个已存在的版本标签。Latest 保持指向较高的正式版本，补发旧版本时保留更新版本的 Latest 标记。
 

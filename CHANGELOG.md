@@ -2,6 +2,12 @@
 
 应用版本以 `Cargo.toml` 的 `[package].version` 为唯一来源。发布前先补充本文件，再使用 `python scripts/bump-version.py <版本>` 同步包和锁文件；`--check` 检查一致性，`--dry-run` 预览更新。正式版本格式为 `MAJOR.MINOR.PATCH`，Git 标签格式为 `vMAJOR.MINOR.PATCH`。
 
+## [0.6.1] - 2026-11-26
+
+- 蓝牙验证直接读取 ESP32-S3 工装串口，选择 COM 后即可查看启动、就绪和扫描日志。工装可在同一连接中连续验证。
+- 工装短按 GPIO7 后自动发现名称含 Lumysi 的广播，检查原始主广播及扫描响应。FlashTool 复核原始数据并保存后显示 `PASS！`。
+- 记录工装发现的实际 BLE MAC 与原始广播数据。生产信息选填，UID 列按工装实际提供的值记录。
+
 ## [0.6.0] - 2026-11-26
 
 - 新增「蓝牙验证」工作区。FlashTool 读取 ESP32-S3 工装的串口日志，在收到本次验证的通过消息并保存报告后显示 `PASS！`。
