@@ -1,0 +1,196 @@
+name: Publish approved ESP32-S3 verifier firmware
+
+on:
+  push:
+    branches: [Flash_tool]
+    paths:
+      - .github/workflows/esp32s3-verifier.yml
+      - scripts/package-esp32s3-verifier.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: esp32s3-verifier-v0.1.0
+  cancel-in-progress: false
+
+env:
+  FIRMWARE_TAG: esp32s3-verifier-v0.1.0
+  FIRMWARE_COMMIT: a5c67615878be656310edd0dae16bc92abc41c2c
+  FIRMWARE_RELEASE_ID: '459004875'
+
+jobs:
+  build:
+    if: github.repository == 'xiaoxiaoawei/hw_hub'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container: espressif/idf:v5.3.2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: a5c67615878be656310edd0dae16bc92abc41c2c
+          fetch-depth: 0
+          persist-credentials: false
+          path: firmware-source
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: release-tools
+      - name: Build, test, merge and verify the immutable firmware source
+        id: firmware
+        shell: bash
+        run: |
+          set -eo pipefail
+          source /opt/esp/idf/export.sh
+          set -u
+          test "$(git -C firmware-source rev-parse HEAD)" = "$FIRMWARE_COMMIT"
+          bash firmware-source/firmware/ble-verifier/scripts/build.sh \
+            "$RUNNER_TEMP/ble-verifier-build" "$RUNNER_TEMP/ble-verifier-export"
+          python release-tools/scripts/package-esp32s3-verifier.py \
+            --repo "$GITHUB_WORKSPACE/firmware-source" \
+            --manifest "$RUNNER_TEMP/ble-verifier-export/manifest.json" \
+            --commit "$FIRMWARE_COMMIT" --check
+          python release-tools/scripts/package-esp32s3-verifier.py \
+            --repo "$GITHUB_WORKSPACE/firmware-source" \
+            --manifest "$RUNNER_TEMP/ble-verifier-export/manifest.json" \
+            --commit "$FIRMWARE_COMMIT" --output-dir "$RUNNER_TEMP/firmware-release" --write
+          echo "assets_dir=$RUNNER_TEMP/firmware-release" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: esp32s3-verifier-v0.1.0-verified
+          path: |
+            ${{ steps.firmware.outputs.assets_dir }}/ESP32-S3-Verifier-v0.1.0-firmware.zip
+            ${{ steps.firmware.outputs.assets_dir }}/ESP32-S3-Verifier-v0.1.0-source.zip
+            ${{ steps.firmware.outputs.assets_dir }}/SHA256SUMS
+            ${{ steps.firmware.outputs.assets_dir }}/release-plan.json
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: esp32s3-verifier-v0.1.0-verified
+          path: ${{ runner.temp }}/firmware-release
+      - name: Resume only the approved draft, verify every asset, publish without Latest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ASSETS_DIR: ${{ runner.temp }}/firmware-release
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import tempfile
+          from urllib.parse import urlencode
+          import zipfile
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+          def api(endpoint, *arguments, raw=False):
+              result = subprocess.run(['gh', 'api', endpoint, *arguments], capture_output=True, timeout=90)
+              if result.returncode:
+                  status = re.search(rb'HTTP (\d+)', result.stderr)
+                  raise RuntimeError('GitHub API request failed (HTTP ' + (status[1].decode() if status else 'unknown') + ')')
+              return result.stdout if raw else json.loads(result.stdout)
+
+          repo = os.environ['GH_REPO']
+          require(repo == 'xiaoxiaoawei/hw_hub', 'Unexpected repository')
+          tag = os.environ['FIRMWARE_TAG']
+          commit = os.environ['FIRMWARE_COMMIT']
+          release_id = int(os.environ['FIRMWARE_RELEASE_ID'])
+          prefix = 'repos/' + repo
+          endpoint = f'{prefix}/releases/{release_id}'
+          directory = Path(os.environ['ASSETS_DIR'])
+          names = {'ESP32-S3-Verifier-v0.1.0-firmware.zip', 'ESP32-S3-Verifier-v0.1.0-source.zip', 'SHA256SUMS'}
+
+          def verify_tag():
+              obj = api(f'{prefix}/git/ref/tags/{tag}')['object']
+              for _ in range(8):
+                  if obj['type'] == 'commit':
+                      require(obj['sha'] == commit, 'Approved firmware tag commit changed')
+                      return
+                  require(obj['type'] == 'tag', 'Unexpected tag object')
+                  obj = api(f"{prefix}/git/tags/{obj['sha']}")['object']
+              raise ValueError('Could not resolve immutable firmware tag')
+
+          def validate_release(release, draft):
+              require(release.get('id') == release_id and release.get('tag_name') == tag, 'Release identity mismatch')
+              require(release.get('target_commitish') == commit, 'Release source commit mismatch')
+              require(release.get('name') == 'ESP32-S3 BLE Verifier v0.1.0', 'Release title mismatch')
+              require(release.get('draft') is draft and release.get('prerelease') is False, 'Only the approved draft may be resumed; published releases are never changed')
+
+          def application_latest():
+              latest = api(f'{prefix}/releases/latest')
+              require(not latest.get('draft') and not latest.get('prerelease') and re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', latest.get('tag_name', '')), 'Latest must remain a stable application release')
+              return latest['tag_name']
+
+          def verify_assets(release, complete):
+              assets = release.get('assets', [])
+              actual = {asset['name']: asset for asset in assets}
+              require(len(actual) == len(assets) and set(actual).issubset(names), 'Unexpected or duplicate draft asset')
+              if complete:
+                  require(set(actual) == names, 'Release assets are incomplete')
+              for name, asset in actual.items():
+                  require(asset.get('state') == 'uploaded' and asset.get('size') == expected[name]['bytes'], 'Existing asset size/state differs; nothing overwritten')
+                  digest = asset.get('digest') or ''
+                  if re.fullmatch(r'sha256:[0-9a-fA-F]{64}', digest):
+                      digest = digest.split(':', 1)[1].lower()
+                  else:
+                      data = api(f"{prefix}/releases/assets/{asset['id']}", '--header', 'Accept: application/octet-stream', raw=True)
+                      digest = hashlib.sha256(data).hexdigest()
+                  require(digest == expected[name]['sha256'], 'Existing asset digest differs; nothing overwritten')
+              return actual
+
+          try:
+              plan = json.loads((directory / 'release-plan.json').read_text())
+              require(plan.get('tag') == tag and plan.get('source_commit') == commit and plan.get('make_latest') is False and plan.get('publication_ready') is True, 'Build plan is not the approved source')
+              expected = plan['assets']
+              require(set(expected) == names, 'Unexpected firmware build assets')
+              for name in names:
+                  path = directory / name
+                  require(path.is_file() and not path.is_symlink(), 'Missing verified build asset')
+                  data = path.read_bytes()
+                  require(len(data) == expected[name]['bytes'] and hashlib.sha256(data).hexdigest() == expected[name]['sha256'], 'Build artifact size/digest mismatch')
+                  if name.endswith('.zip'):
+                      with zipfile.ZipFile(path) as archive:
+                          metadata = json.loads(archive.read('BUILD-METADATA.json'))
+                          require(archive.testzip() is None and metadata.get('source_commit') == commit and metadata.get('target') == 'esp32s3' and metadata.get('firmware_version') == '0.1.0', 'Firmware ZIP metadata/CRC mismatch')
+              verify_tag()
+              application_latest()
+              release = api(endpoint)
+              validate_release(release, True)
+              existing = verify_assets(release, False)
+              for name in sorted(names - set(existing)):
+                  validate_release(api(endpoint), True)
+                  upload = f'https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?' + urlencode({'name': name})
+                  api(upload, '--method', 'POST', '--header', 'Content-Type: application/octet-stream', '--header', f"Content-Length: {expected[name]['bytes']}", '--input', str(directory / name))
+              release = api(endpoint)
+              validate_release(release, True)
+              verify_assets(release, True)
+              verify_tag()
+              with tempfile.TemporaryDirectory() as temporary:
+                  request = Path(temporary) / 'publish.json'
+                  request.write_text(json.dumps({'draft': False, 'make_latest': 'false'}))
+                  api(endpoint, '--method', 'PATCH', '--input', str(request))
+              release = api(endpoint)
+              validate_release(release, False)
+              verify_assets(release, True)
+              print('Published verified firmware ' + tag + '; application Latest remains ' + application_latest())
+          except Exception as error:
+              message = str(error).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print('::error title=Firmware publication failed::' + message)
+              raise SystemExit(1)
+          PY
