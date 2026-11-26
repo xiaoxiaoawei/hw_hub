@@ -136,7 +136,7 @@ impl FlashApp {
                 }
                 if let Some(error) = &save_error {
                     ui.add_space(7.0);
-                    banner(ui, &format!("报告保存失败：{error}"), true);
+                    banner(ui, &format!("报告保存失败。{error}"), true);
                     if ui
                         .add_enabled_ui(!self.ble.capturing(), |ui| {
                             secondary_button(ui, "重试保存报告", [128.0, 32.0])
@@ -258,23 +258,28 @@ impl FlashApp {
         });
     }
 
-    pub(super) fn ble_pass_dialog(&mut self, ctx: &egui::Context) {
-        if !self.ble.pass_open {
+    pub(super) fn ble_result_dialog(&mut self, ctx: &egui::Context) {
+        if !self.ble.result_open {
             return;
         }
         let Some(result) = &self.ble.latest else {
-            self.ble.pass_open = false;
+            self.ble.result_open = false;
             return;
         };
-        if !result.passed || result.report.is_none() || result.save_error.is_some() {
-            self.ble.pass_open = false;
+        let timed_out = result.timed_out;
+        let saved = result.report.is_some() && result.save_error.is_none();
+        if !timed_out && (!result.passed || !saved) {
+            self.ble.result_open = false;
             return;
         }
         let observed_mac = result.observed_mac.clone();
         let uid = result.uid.clone();
         let time = result.time.clone();
+        let detail = result.detail.clone();
+        let report = result.report.clone();
+        let save_error = result.save_error.clone();
         let mut close = false;
-        let response = egui::Modal::new(egui::Id::new("ble_saved_pass_result"))
+        let response = egui::Modal::new(egui::Id::new("ble_verification_result"))
             .frame(
                 egui::Frame::new()
                     .fill(SURFACE)
@@ -287,11 +292,26 @@ impl FlashApp {
                 ui.label(RichText::new("BLE 验证结果").heading().size(20.0).strong());
                 ui.add_space(12.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("PASS！").size(56.0).strong().color(SUCCESS));
                     ui.label(
-                        RichText::new("本次验证通过，报告已保存")
-                            .size(13.0)
-                            .color(MUTED),
+                        RichText::new(if timed_out { "FAIL！" } else { "PASS！" })
+                            .size(56.0)
+                            .strong()
+                            .color(if timed_out { DANGER } else { SUCCESS }),
+                    );
+                    ui.label(
+                        RichText::new(if !timed_out {
+                            "本次验证通过，报告已保存"
+                        } else if saved {
+                            "扫描超时。报告已保存"
+                        } else if save_error.is_some() {
+                            "扫描超时。报告未保存"
+                        } else if self.ble.saving() {
+                            "扫描超时。报告正在保存"
+                        } else {
+                            "扫描超时。报告待保存"
+                        })
+                        .size(13.0)
+                        .color(MUTED),
                     );
                 });
                 ui.add_space(14.0);
@@ -304,19 +324,52 @@ impl FlashApp {
                 if !time.is_empty() {
                     ui.label(RichText::new(&time).size(11.0).color(MUTED));
                 }
+                if timed_out && (!detail.is_empty() || save_error.is_some()) {
+                    ui.add_space(7.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt(("ble_timeout_details", &time))
+                        .max_height((ctx.screen_rect().height() - 430.0).clamp(90.0, 180.0))
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            if !detail.is_empty() {
+                                ui.add(egui::Label::new(RichText::new(&detail).size(12.0)).wrap());
+                            }
+                            if let Some(error) = &save_error {
+                                banner(ui, &format!("报告保存失败。{error}"), true);
+                            }
+                        });
+                }
                 ui.add_space(12.0);
                 ui.separator();
                 ui.horizontal_wrapped(|ui| {
                     if secondary_button(ui, "关闭", [78.0, 33.0]).clicked() {
                         close = true;
                     }
-                    if primary_button(ui, "打开 CSV", [104.0, 33.0]).clicked() {
-                        self.open_ble_report();
+                    if save_error.is_some()
+                        && ui
+                            .add_enabled_ui(!self.ble.capturing() && !self.ble.saving(), |ui| {
+                                secondary_button(ui, "重试保存报告", [128.0, 33.0])
+                            })
+                            .inner
+                            .clicked()
+                    {
+                        self.retry_ble_save();
+                    }
+                    if saved {
+                        if primary_button(ui, "打开 CSV", [104.0, 33.0]).clicked() {
+                            self.open_ble_report();
+                        }
+                        if let Some(path) = &report {
+                            let response = text_button(ui, "复制路径");
+                            clipboard::copy_with_feedback(ui, response, || {
+                                path.display().to_string()
+                            });
+                        }
                     }
                 });
             });
         if close || response.should_close() {
-            self.ble.pass_open = false;
+            self.ble.result_open = false;
         }
     }
 }

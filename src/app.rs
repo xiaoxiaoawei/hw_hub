@@ -2608,7 +2608,7 @@ impl eframe::App for FlashApp {
             && !self.chip_picker_open
             && !self.device_read_setup.open
             && !self.validation.result_open
-            && !self.ble.pass_open
+            && !self.ble.result_open
         {
             self.open_update_dialog();
         }
@@ -2618,7 +2618,7 @@ impl eframe::App for FlashApp {
         if !self.close_confirm_open {
             self.validation_result_dialog(ctx);
             if !self.validation.result_open && !self.update_dialog_open && !self.settings_open {
-                self.ble_pass_dialog(ctx);
+                self.ble_result_dialog(ctx);
             }
         }
         self.confirm_record_exit(ctx);

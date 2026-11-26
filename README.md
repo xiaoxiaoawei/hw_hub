@@ -47,11 +47,11 @@ ESP32-C3 烧录会从 `ESP_EFUSE_OPTIONAL_UNIQUE_ID` 读取 16 字节，按固�
 
 ## 蓝牙验证
 
-将 v0.1.1 工装固件烧录到独立 ESP32-S3，通过板载 USB 转 TTL（UART0）或原生 USB Serial/JTAG 连接电脑。GPIO7 接低有效按键，GPIO1 接蜂鸣器，串口为 115200 8N1。[下载 ESP32-S3 工装固件](https://github.com/xiaoxiaoawei/hw_hub/releases/tag/esp32s3-verifier-v0.1.1)
+将 v0.1.2 工装固件烧录到独立 ESP32-S3，通过板载 USB 转 TTL（UART0）或原生 USB Serial/JTAG 连接电脑。GPIO7 接低有效按键，GPIO1 接蜂鸣器，串口为 115200 8N1。[下载 ESP32-S3 工装固件](https://github.com/xiaoxiaoawei/hw_hub/releases/tag/esp32s3-verifier-v0.1.2)
 
 1. 打开左侧「蓝牙验证」，选择板载 USB 转 TTL 对应的 COM，点击「连接工装」。FlashTool 直接显示串口日志，生产信息可选填。
-2. 工装就绪后，短按并松开 GPIO7。工装主动扫描最多 45 秒，查找名称含 Lumysi 的设备。仅该轮发现一台候选且主广播服务 UUID、扫描响应厂商诊断、版本 `1.188` 与零故障位齐备时，工装才鸣响通过音并输出 `PASS！`。
-3. FlashTool 读取本次扫描日志，复核原始主广播和扫描响应，保存通过结果后弹窗。更换待测设备后可在原连接上继续短按。
+2. 工装就绪后，短按并松开 GPIO7。工装同时播放 1.5 秒变频提示音并开始主动扫描，最多扫描 25 秒。仅该轮发现一台名称含 Lumysi 的候选，且主广播服务 UUID、扫描响应厂商诊断、版本 `1.188` 与零故障位齐备时，工装才播放通过音并输出 `PASS！`。
+3. FlashTool 读取本次扫描日志，复核原始主广播和扫描响应，保存通过结果后弹窗。收到工装的扫描超时结果时，软件显示红色 `FAIL！` 并保存失败记录。更换待测设备后可在原连接上继续短按。
 
 填写有效生产信息时，报告追加到 `记录根目录/主板年周/蓝牙验证` 下的工单 CSV。留空时，报告保存在 `记录根目录/蓝牙验证/ble-validation.csv`。记录含实际 BLE MAC、北京时间、故障位、电池采样、原始广播与串口日志。
 
@@ -133,11 +133,11 @@ cargo run --locked
 python3 scripts/bump-version.py --help
 python3 scripts/bump-version.py --check
 # 先为下一版本写好 CHANGELOG，再预演并更新版本：
-python3 scripts/bump-version.py 0.6.3 --dry-run
-python3 scripts/bump-version.py 0.6.3
+python3 scripts/bump-version.py 0.6.4 --dry-run
+python3 scripts/bump-version.py 0.6.4
 ```
 
-提交并验证新版本后创建对应 Git 标签，例如 `git tag -a v0.6.3 -m "FlashTool v0.6.3"`，再推送分支和标签以触发发布。标签必须与 Cargo 版本相同。每次修复使用新版本和标签。
+提交并验证新版本后创建对应 Git 标签，例如 `git tag -a v0.6.4 -m "FlashTool v0.6.4"`，再推送分支和标签以触发发布。标签必须与 Cargo 版本相同。每次修复使用新版本和标签。
 
 GitHub Actions 验证 `vX.Y.Z` 标签与 Cargo 版本一致，通过格式、静态检查和测试后在 Windows 构建。正式 Release 统一使用 `FlashTool vX.Y.Z` 标题，上传版本 ZIP、源码 ZIP 和 SHA256 校验文件，验证成功后才发布并标记 Latest。已发布标签及附件保持不变；可手动选择只构建或发布一个已存在的版本标签。Latest 保持指向较高的正式版本，补发旧版本时保留更新版本的 Latest 标记。
 

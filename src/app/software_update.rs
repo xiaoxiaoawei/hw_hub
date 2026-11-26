@@ -204,7 +204,7 @@ impl FlashApp {
         .or_else(|| {
             (self.close_confirm_open
                 || self.validation.result_open
-                || self.ble.pass_open
+                || self.ble.result_open
                 || self.chip_picker_open
                 || self.pending_driver_license.is_some())
             .then_some("等待当前窗口操作结束…")

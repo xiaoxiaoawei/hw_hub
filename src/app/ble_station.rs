@@ -10,7 +10,10 @@ use std::{
 };
 
 const STATION_LOG_WAIT: Duration = Duration::from_secs(10);
-const SCAN_TIMEOUT: Duration = Duration::from_secs(55);
+// The station reports its 25-second timeout itself. Allow a short delivery
+// window before synthesizing a result for a silent station.
+const SCAN_RESULT_DEADLINE: Duration = Duration::from_secs(28);
+const SCAN_TIMEOUT_REASON: &str = "scan_timeout";
 const MAX_LINE_BYTES: usize = 4_096;
 const MAX_ATTEMPT_LOG_BYTES: usize = 512 * 1024;
 const MAX_PENDING_RECORDS: usize = 32;
@@ -21,7 +24,7 @@ pub(super) struct BleWorkspace {
     pub(super) status: String,
     pub(super) logs: VecDeque<String>,
     pub(super) latest: Option<BleResultView>,
-    pub(super) pass_open: bool,
+    pub(super) result_open: bool,
     task: Option<BleTask>,
     queued: VecDeque<PendingRecord>,
     pending: Option<PendingRecord>,
@@ -32,6 +35,7 @@ pub(super) struct BleResultView {
     pub(super) observed_mac: Option<String>,
     pub(super) uid: Option<String>,
     pub(super) passed: bool,
+    pub(super) timed_out: bool,
     pub(super) detail: String,
     pub(super) time: String,
     pub(super) report: Option<PathBuf>,
@@ -121,22 +125,25 @@ impl BleWorkspace {
     }
 
     fn save_next(&mut self) {
-        if self.pending.is_some() || self.pass_open {
+        if self.pending.is_some() || self.result_open {
             return;
         }
         let Some(pending) = self.queued.pop_front() else {
             return;
         };
         let result = &pending.record.result;
+        let timed_out = is_scan_timeout(result);
         self.latest = Some(BleResultView {
             observed_mac: result.mac.clone(),
             uid: result.uid.clone(),
             passed: result.status == Status::Pass,
+            timed_out,
             detail: result_detail(result),
             time: pending.record.timestamp.clone(),
             report: None,
             save_error: None,
         });
+        self.result_open = timed_out;
         self.pending = Some(pending);
         self.save();
     }
@@ -208,6 +215,13 @@ impl BleWorkspace {
                     return;
                 }
                 task.session = Some(event.session);
+                if self
+                    .latest
+                    .as_ref()
+                    .is_some_and(|latest| latest.report.is_some())
+                {
+                    self.result_open = false;
+                }
                 self.status = "正在扫描并核对 Lumysi 广播…".into();
                 task.attempt = Some(ScanAttempt {
                     number: event.attempt,
@@ -272,7 +286,7 @@ impl BleWorkspace {
                     "记录已保存，工装已断开"
                 }
                 .into();
-                self.pass_open = latest.passed;
+                self.result_open |= latest.passed;
             }
             Err(error) => {
                 latest.save_error = Some(error);
@@ -304,7 +318,7 @@ impl FlashApp {
                 self.error = None;
                 self.notice = (task.production.is_none() && !self.production_inputs.is_blank())
                     .then(|| "生产信息不完整，报告将保存到未分批的蓝牙验证目录。".into());
-                self.ble.pass_open = false;
+                self.ble.result_open = false;
                 self.ble.logs.clear();
                 self.ble.latest = None;
                 self.ble.status = format!("正在连接 {}…", task.port.name);
@@ -421,15 +435,16 @@ impl FlashApp {
                 {
                     task.warned_awaiting = true;
                     self.ble.status =
-                        "仍在监听，尚未收到工装状态。请核对板载 USB 转 TTL 的 COM 口和 v0.1.1 工装固件。"
+                        "仍在监听，尚未收到工装状态。请核对板载 USB 转 TTL 的 COM 口和 v0.1.2 工装固件。"
                             .into();
                 }
                 if task
                     .attempt
                     .as_ref()
-                    .is_some_and(|attempt| attempt.started.elapsed() >= SCAN_TIMEOUT)
+                    .is_some_and(|attempt| attempt.started.elapsed() >= SCAN_RESULT_DEADLINE)
                 {
-                    self.ble.fail_attempt(&mut task, "工装扫描结果超时".into());
+                    self.ble
+                        .fail_attempt(&mut task, "scan_timeout:station_result_missing".into());
                 }
                 self.ble.task = Some(task);
             }
@@ -457,30 +472,52 @@ impl FlashApp {
     }
 }
 
+fn is_scan_timeout(result: &ResultEvent) -> bool {
+    result.status == Status::Fail
+        && result.reason.as_deref().is_some_and(|reason| {
+            reason == SCAN_TIMEOUT_REASON
+                || reason
+                    .split_once(':')
+                    .is_some_and(|(code, _)| code == SCAN_TIMEOUT_REASON)
+        })
+}
+
 fn result_detail(result: &ResultEvent) -> String {
     let mut details = Vec::new();
     if let Some(reason) = &result.reason {
-        details.push(
-            match reason.as_str() {
-                "expected_target_not_seen" => "未发现目标 BLE 地址",
-                "no_lumysi_candidate" => "未发现名称含 Lumysi 的设备",
-                "multiple_lumysi_candidates" => "同时发现多台 Lumysi 设备",
-                "settle_window_incomplete" => "扫描结束前未完成候选设备复核",
-                "candidate_capacity_exceeded" | "scan_report_overflow" => "本轮广播过多，请重试",
-                "conflicting_packets" => "目标设备的广播内容互相冲突",
-                "malformed_advertising_data" => "广播数据格式无效",
-                "invalid_complete_name" => "完整广播名称格式不符",
-                "required_service_missing" => "主广播缺少要求的服务 UUID",
-                "complete_name_missing" => "扫描响应缺少完整名称",
-                "diagnostic_scan_response_missing" => "扫描响应缺少有效的自检数据",
-                "nonzero_fault_bits" => "设备自检报告故障",
-                "firmware_version_mismatch" => "设备固件版本与要求的 1.188 不符",
-                "ambiguous_address_type" => "同一地址出现多种 BLE 地址类型",
-                "incomplete_scan" => "工装未读到完整广播",
-                other => other,
-            }
-            .into(),
-        );
+        let timed_out = is_scan_timeout(result);
+        let reason = if timed_out {
+            details.push("25 秒内未通过蓝牙验证".into());
+            reason.split_once(':').map_or("", |(_, cause)| cause)
+        } else {
+            reason.as_str()
+        };
+        if !reason.is_empty() {
+            details.push(
+                match reason {
+                    "station_result_missing" => "等待工装结果超时",
+                    "expected_target_not_seen" => "未发现目标 BLE 地址",
+                    "no_lumysi_candidate" => "未发现名称含 Lumysi 的设备",
+                    "multiple_lumysi_candidates" => "同时发现多台 Lumysi 设备",
+                    "settle_window_incomplete" => "扫描结束前未完成候选设备复核",
+                    "candidate_capacity_exceeded" | "scan_report_overflow" => {
+                        "本轮广播过多，请重试"
+                    }
+                    "conflicting_packets" => "目标设备的广播内容互相冲突",
+                    "malformed_advertising_data" => "广播数据格式无效",
+                    "invalid_complete_name" => "完整广播名称格式不符",
+                    "required_service_missing" => "主广播缺少要求的服务 UUID",
+                    "complete_name_missing" => "扫描响应缺少完整名称",
+                    "diagnostic_scan_response_missing" => "扫描响应缺少有效的自检数据",
+                    "nonzero_fault_bits" => "设备自检报告故障",
+                    "firmware_version_mismatch" => "设备固件版本与要求的 1.188 不符",
+                    "ambiguous_address_type" => "同一地址出现多种 BLE 地址类型",
+                    "incomplete_scan" => "工装未读到完整广播",
+                    other => other,
+                }
+                .into(),
+            );
+        }
     }
     if let Some(name) = &result.name {
         details.push(name.clone());
@@ -643,11 +680,11 @@ mod tests {
         let mut no_diagnostics = pass_payload(1);
         no_diagnostics["scan_rsp_hex"] = json!("0C094C756D7973692D31323334");
         workspace.ingest_line(&mut task, line(no_diagnostics));
-        assert!(workspace.latest.is_none() && !workspace.pass_open);
+        assert!(workspace.latest.is_none() && !workspace.result_open);
 
         workspace.ingest_line(&mut task, result);
         assert!(workspace.latest.as_ref().unwrap().passed);
-        assert!(!workspace.pass_open);
+        assert!(!workspace.result_open);
         let saved = workspace
             .save_result
             .take()
@@ -657,7 +694,7 @@ mod tests {
         workspace.finish_save(saved);
         let view = workspace.latest.as_ref().unwrap();
         let saved = fs::read_to_string(view.report.as_ref().unwrap()).unwrap();
-        assert!(workspace.pass_open);
+        assert!(workspace.result_open);
         assert!(!workspace.has_unsaved());
         assert!(view.time.ends_with("+08:00"));
         assert!(saved.contains("QA-WO") && saved.contains("Lumysi-1234"));
@@ -688,8 +725,41 @@ mod tests {
         workspace.finish_save(saved);
         let view = workspace.latest.as_ref().unwrap();
         let saved = fs::read_to_string(view.report.as_ref().unwrap()).unwrap();
-        assert!(!view.passed && !workspace.pass_open);
+        assert!(!view.passed && !workspace.result_open);
         assert!(saved.contains("工装已拔出") && saved.contains("raw fixture log entry"));
+    }
+
+    #[test]
+    fn scan_timeout_prompts_before_csv_and_does_not_prompt_again_after_close() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut task, _sender) = sample_task(root.path());
+        let mut workspace = BleWorkspace::default();
+        workspace.ingest_line(&mut task, line(json!({"event":"ready", "protocol":2})));
+        workspace.ingest_line(&mut task, line(json!({"event":"start", "attempt":1})));
+        workspace.ingest_line(
+            &mut task,
+            line(json!({
+                "event": "result", "attempt": 1, "status": "FAIL",
+                "reason": "scan_timeout:no_lumysi_candidate",
+            })),
+        );
+        let latest = workspace.latest.as_ref().unwrap();
+        assert!(workspace.result_open && latest.timed_out && !latest.passed);
+        assert!(latest.report.is_none());
+        assert!(latest.detail.contains("25 秒") && latest.detail.contains("Lumysi"));
+
+        workspace.result_open = false;
+        let saved = workspace
+            .save_result
+            .take()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        workspace.finish_save(saved);
+        assert!(!workspace.result_open);
+        let report = workspace.latest.as_ref().unwrap().report.as_ref().unwrap();
+        let data = fs::read_to_string(report).unwrap();
+        assert!(data.contains("scan_timeout:no_lumysi_candidate"));
     }
 
     #[test]
@@ -713,7 +783,7 @@ mod tests {
             .unwrap();
         assert!(failure.is_err());
         workspace.finish_save(failure);
-        assert!(!workspace.pass_open && workspace.has_unsaved());
+        assert!(!workspace.result_open && workspace.has_unsaved());
         assert!(workspace.latest.as_ref().unwrap().save_error.is_some());
 
         fs::remove_file(&unavailable).unwrap();
@@ -725,7 +795,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(3))
             .unwrap();
         workspace.finish_save(retry);
-        assert!(workspace.pass_open && !workspace.has_unsaved());
+        assert!(workspace.result_open && !workspace.has_unsaved());
         let report = workspace.latest.as_ref().unwrap().report.as_ref().unwrap();
         assert!(report.starts_with(unavailable.join("2642").join("蓝牙验证")));
     }
@@ -762,10 +832,10 @@ mod tests {
             workspace.finish_save(saved);
         };
         wait_for_save(&mut workspace);
-        assert!(!workspace.pass_open);
+        assert!(!workspace.result_open);
         workspace.save_next();
         wait_for_save(&mut workspace);
-        assert!(workspace.pass_open && !workspace.has_unsaved());
+        assert!(workspace.result_open && !workspace.has_unsaved());
         let report = workspace.latest.as_ref().unwrap().report.as_ref().unwrap();
         assert_eq!(
             report,
