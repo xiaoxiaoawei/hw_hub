@@ -16,9 +16,7 @@ import subprocess
 import tempfile
 import zipfile
 
-VERSION = "0.1.0"
-TAG = "esp32s3-verifier-v" + VERSION
-STEM = "ESP32-S3-Verifier-v" + VERSION
+TAG_PREFIX = "esp32s3-verifier-v"
 SOURCE_ROOT = PurePosixPath("firmware/ble-verifier")
 DEFAULT_OUTPUT = Path(os.environ.get("RUNNER_TEMP", "/workspace/shared")).resolve()
 MAX_BINARY = 64 * 1024 * 1024
@@ -166,7 +164,8 @@ def main():
     parser.add_argument("--repo", type=Path, default=Path("/workspace/hw_hub"))
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--commit", help="Final committed public source; required for --write")
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT / TAG)
+    parser.add_argument("--tag", help="Expected dedicated firmware tag; must match the manifest version")
+    parser.add_argument("--output-dir", type=Path)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="Offline preflight; no output files are written")
     mode.add_argument("--write", action="store_true", help="Create immutable local artifacts, never publish")
@@ -177,7 +176,11 @@ def main():
     build_root = manifest_path.parent
     manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     require(manifest.get("chip", "").lower().replace("-", "") == "esp32s3", "Build target is not ESP32-S3")
-    require(manifest.get("version") == VERSION, "Firmware version is not 0.1.0")
+    version = manifest.get("version")
+    require(isinstance(version, str) and re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version), "Firmware version must be stable MAJOR.MINOR.PATCH")
+    tag = TAG_PREFIX + version
+    stem = "ESP32-S3-Verifier-v" + version
+    require(args.tag is None or args.tag == tag, "Firmware tag differs from the build version")
     idf = manifest.get("idf_version", manifest.get("idf"))
     require(isinstance(idf, str) and idf.removeprefix("v") == "5.3.2", "Build must identify the pinned ESP-IDF 5.3.2")
     settings = manifest.get("flash_settings")
@@ -221,18 +224,19 @@ def main():
         require(re.fullmatch(r"[0-9a-f]{40,64}", commit), "Invalid resolved commit")
     require(not args.write or commit is not None, "--write requires --commit; uncommitted source is preflight-only")
     sources = snapshot(repo, manifest.get("source_files"), commit)
+    require(re.search(r'\bset\s*\(\s*PROJECT_VER\s+"' + re.escape(version) + r'"\s*\)', sources["CMakeLists.txt"].decode("utf-8")), "Tagged CMake project version differs from the build manifest")
     metadata = {
-        "product": "ESP32-S3 Verifier", "firmware_version": VERSION, "release_tag": TAG,
+        "product": "ESP32-S3 Verifier", "firmware_version": version, "release_tag": tag,
         "target": "esp32s3", "idf_version": idf, "source_commit": commit,
         "source_files": manifest["source_files"], "sha256": {name: sha(data) for name, data in sorted(images.items())},
     }
     packaged_manifest = {
-        "chip": "esp32s3", "version": VERSION, "flash_settings": settings,
+        "chip": "esp32s3", "version": version, "flash_settings": settings,
         "flash_files": {f"0x{start:x}": "images/" + name for start, name, _ in segments},
         "merged": {"file": "images/" + merged_name, "offset": f"0x{merged_start:x}", "sha256": sha(merged_data)},
     }
     readme = (
-        f"ESP32-S3 Verifier {VERSION}\n\n"
+        f"ESP32-S3 Verifier {version}\n\n"
         "This package contains newly built firmware, not a device flash dump.\n"
         "Choose ESP32-S3 in FlashTool. Use the actual offsets in flash-manifest.json.\n"
         f"Merged image: images/{merged_name}, offset 0x{merged_start:x}.\n"
@@ -247,17 +251,17 @@ def main():
     source = {"source/" + name: data for name, data in sources.items()}
     source["BUILD-METADATA.json"] = json_bytes(metadata)
     source["SHA256SUMS"] = sums(source)
-    outputs = {STEM + "-firmware.zip": archive(firmware), STEM + "-source.zip": archive(source)}
+    outputs = {stem + "-firmware.zip": archive(firmware), stem + "-source.zip": archive(source)}
     outputs["SHA256SUMS"] = sums(outputs)
     plan = {
-        "tag": TAG, "make_latest": False, "source_commit": commit,
+        "tag": tag, "make_latest": False, "source_commit": commit,
         "publication_ready": commit is not None, "local_mode": "write" if args.write else "check-only",
         "binary_count": len(images), "source_file_count": len(sources),
         "assets": {name: {"bytes": len(data), "sha256": sha(data)} for name, data in sorted(outputs.items())},
     }
     print(json.dumps(plan, ensure_ascii=False, indent=2))
     if args.write:
-        destination = args.output_dir.resolve()
+        destination = (args.output_dir or DEFAULT_OUTPUT / tag).resolve()
         require(not destination.is_relative_to(repo), "Build output must stay outside the source repository")
         destination.mkdir(parents=True, exist_ok=True)
         outputs["release-plan.json"] = json_bytes(plan)

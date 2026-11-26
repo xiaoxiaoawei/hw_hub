@@ -1,104 +1,49 @@
-# ESP32-S3 BLE verifier 0.1.0
+# ESP32-S3 蓝牙验证工装 v0.1.1
 
-This is a separate test-station firmware, not the bracelet firmware. It checks
-one host-selected over-the-air BLE address after a physical button release.
-No customer document, captured packet, or production device ID is bundled.
+将本固件烧录到独立 ESP32-S3 工装板。短按 GPIO7 后，工装主动扫描名称含 Lumysi 的待测设备，并通过串口报告实际观察到的广播数据。FlashTool v0.6.1 可直接监听并复核同一份数据。
 
-## Board and wiring assumptions
+## 接线与运行
 
-- ESP32-S3, at least 4 MiB SPI flash, DIO at 40 MHz, no PSRAM requirement.
-- GPIO7: momentary button to GND, internal pull-up, active low. A debounced
-  40–1000 ms press must begin after the station is armed; release starts scanning.
-  Long presses and presses begun while busy/unconfigured do not start a test.
-- GPIO1: 4 kHz, 50% duty LEDC buzzer output. Use a suitable buzzer/driver circuit;
-  GPIO output is not a high-current speaker power supply.
-- Protocol transports: UART0 TX GPIO43/RX GPIO44 at 115200 8N1, and the native
-  USB Serial/JTAG interface on GPIO20 D+/GPIO19 D-. Use one controlling host.
-  Configure no flow control. Native USB-OTG CDC is a different interface.
-- One short beep: scan started; two beeps: PASS; three beeps: FAIL/unconfigured.
+- 板载 USB 转 TTL 使用 UART0，TX 为 GPIO43，RX 为 GPIO44。串口参数为 **115200 8N1**，流控关闭。
+- GPIO7 为低有效按键，使用内部上拉。短按约 40–1000 毫秒，松开后开始扫描。
+- GPIO1 输出 4 kHz、50% 占空比的蜂鸣器信号。扫描开始一声，通过两声，失败三声。
+- 支持原生 USB Serial/JTAG 作为备用日志通道。带 USB 转 TTL 的开发板使用桥接芯片对应的 COM 即可。
 
-The flash layout is an explicit common-board configuration, not an automatic
-measurement of your board. Do not flash this station image onto ESP32-C3 targets.
-Secure-boot/encrypted stations need a separately provisioned build.
+固件先初始化 UART0 并输出 `BOOT`。随后持续输出状态，让晚打开的串口工具也能看到就绪或初始化失败。就绪状态下直接短按 GPIO7。每次短按对应一轮验证，FlashTool 可以保持连接并连续读取结果。
 
-## Test behavior
+## 广播判定
 
-The station starts unarmed after every reset. Target configuration is held only
-in RAM. Configure it from FlashTool, then press/release the button. An attempt
-actively scans for up to 45 seconds: standard scan requests are necessary because
-the diagnostic fields are in the scan response. The station never pairs,
-connects, accesses GATT, changes the bracelet, or performs OTA.
+每轮最多扫描 45 秒。主广播与扫描响应按实际 MAC 及地址类型归到同一候选。首次收齐通过条件后继续观察约 2 秒。该轮观察到多个 Lumysi 候选时返回失败，现场验证时一次放入一台待测板。
 
-It aggregates main advertisements and scan responses only for the configured
-address and address type. PASS requires the exact 128-bit service UUID
-`4fafc201-1fb5-459e-8fcc-c5c9c331914b` in main ADV; complete printable-ASCII name
-`Lumysi-` plus a non-space suffix; manufacturer payload of exactly 12 bytes:
+通过条件包括以下三项。
 
-```
-FF FF 4C [faults:4 bytes big endian] [major:1] [minor:2 big endian] [battery:2 big endian]
+1. 主广播的 128 位服务 UUID 列表包含 `4fafc201-1fb5-459e-8fcc-c5c9c331914b`。
+2. 同一设备实际扫描响应中的完整名称字段 `0x09` 含 `Lumysi`，匹配时忽略 ASCII 字母大小写。
+3. 同一条扫描响应包含 `0xFF` 厂商数据。公司标识为 `FF FF`，诊断标记为 `4C`，四字节大端故障位全为零，固件版本为 `1.188`。末尾两字节大端电池采样值供记录使用。
+
+带零故障位的诊断字段结构如下，`xx xx` 为实际电池采样值。
+
+```text
+0D FF FF FF 4C 00 00 00 00 01 00 BC xx xx
 ```
 
-All 32 fault bits must be zero, including reserved bits, and version must be
-exactly 1.188. Battery mV is informational, with no voltage threshold. No UID is
-present in this documented payload; the verifier never guesses one from MAC or
-device name. Conflicting faults/version/name, ambiguous address types, malformed
-data and incomplete responses cannot pass. A valid complete result ends scanning
-immediately; otherwise the timeout reports the missing/failed condition.
+## 串口日志协议 v2
 
-Every result consumes the armed target. A fresh host session is required for the
-next board; late retries of the consumed session cannot rearm it. Commands during
-scanning are ignored. If a laptop disconnects mid-scan, wait for completion before
-reconnecting or reset the station. No address is changed silently during a scan.
+普通启动和运行日志为文本行。提取验证记录时读取以 `BLE_VERIFY ` 开头的 UTF-8 JSON 行。
 
-## Serial protocol
+- `ready` 提供 `session` 和 `protocol: 2`。`session` 是每次启动生成的 64 个小写十六进制字符。
+- `start` 提供同一 `session` 与本次编号 `attempt`。
+- `result` 提供当前 `session`、`attempt` 和 `status`。通过状态为 `PASS！`，失败状态为 `FAIL`，原因由 `reason` 提供。可用字段包括实际 `mac`、`name`、`firmware`、`fault_bits`、`battery_mv`、`adv_hex` 与 `scan_rsp_hex`。
 
-Send exactly this ASCII command followed by LF (CRLF is also accepted):
+当前广播规格提供实际 BLE MAC、名称和诊断字段。CSV 中的 UID 保留为空，供未来有 UID 来源的协议版本使用。
 
-```
-BLE_TARGET <64 lowercase hexadecimal session characters> <12 uppercase MAC hex characters>
-```
+## 构建与烧录
 
-The all-zero and all-FF addresses are rejected. Protocol output is UTF-8, one JSON
-object per line, prefixed exactly `BLE_VERIFY `. Events are:
-
-- `ready`: `event`, `session`, `mac`.
-- `start`: those fields plus `attempt` (positive, increasing until reset).
-- `result`: those fields plus `status` (`PASS！`, with U+FF01, or `FAIL`). PASS also
-  contains `observed_mac`, `name`, `firmware`, `fault_bits`, `battery_mv`. FAIL may
-  contain available observations and `reason`. `mac` always remains the requested
-  target; `observed_mac` is emitted only after that address was actually observed.
-
-Ordinary boot/debug lines do not have the protocol prefix. This protocol binds
-records to a selected address/session; BLE advertisements are not authenticated
-proof against another transmitter deliberately cloning an address and payload.
-
-## Build and flash
-
-Install/activate official ESP-IDF **v5.3.2**, with its ESP32-S3 tools, plus host
-`cc`. Run from Linux/macOS with Python and Bash:
+使用官方 ESP-IDF **v5.3.2** 的 ESP32-S3 工具和主机 `cc`。在 Linux 或 macOS 环境执行以下命令。
 
 ```sh
 source /path/to/esp-idf/export.sh
 bash firmware/ble-verifier/scripts/build.sh /tmp/ble-verifier-build /tmp/ble-verifier-export
 ```
 
-All generated files stay outside the repository. The script compiles portable
-parser tests, builds bootloader/partition table/app with the actual SDK, obtains
-offsets from generated `flasher_args.json`, merges with esptool, verifies each
-segment and FF padding, checks bootloader/app image checksums, and emits
-`manifest.json` with binary and public source hashes. SDK central/broadcaster
-roles are compiled to work around an observer-only conditional-build defect in
-5.3.2; the application uses only scan/cancel APIs, never those radio operations.
-
-With FlashTool choose **ESP32-S3**, select the exported merged BIN and address
-**0x0**. Alternatively, with the exported directory as the current directory:
-
-```sh
-python -m esptool --chip esp32s3 --port COMx --baud 460800 write_flash --flash_mode dio --flash_size 4MB --flash_freq 40m 0x0 ESP32S3-BLE-Verifier-v0.1.0-merged.bin
-```
-
-The actual generated segments are bootloader at 0x0, partition table at 0x8000,
-and app at 0x10000. `manifest.json` is authoritative for that build. Compilation
-and parser tests do not establish RF range, button wiring, buzzer current, or
-behavior on a physical board; commission the station with known passing/failing
-targets before production use.
+构建脚本在仓库外生成和校验引导程序、分区表、应用及合并镜像，版本取自 ESP-IDF 的构建元数据。镜像参数为 ESP32-S3、4 MB Flash、DIO 40 MHz。FlashTool 中选择 **ESP32-S3**，读取 `images/ESP32S3-BLE-Verifier-v0.1.1-merged.bin`，烧录地址填 **`0x0`**。分段地址由固件包内的 `flash-manifest.json` 给出。

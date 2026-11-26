@@ -3,6 +3,7 @@
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,10 @@ def main():
         raise ValueError("Usage: export_build.py BUILD_DIRECTORY EXPORT_DIRECTORY")
     build = outside_repository(sys.argv[1])
     output = outside_repository(sys.argv[2])
+    description = json.loads((build / "project_description.json").read_text())
+    version = description["project_version"]
+    if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version):
+        raise ValueError("Build project version is not a stable MAJOR.MINOR.PATCH")
     output.mkdir(parents=True, exist_ok=True)
     args = json.loads((build / "flasher_args.json").read_text())
     if args["extra_esptool_args"]["chip"] != "esp32s3":
@@ -52,7 +57,7 @@ def main():
         flash_files[offset] = relative
         hashes[relative] = digest(destination)
         pairs.extend([offset, str(destination)])
-    merged = output / "ESP32S3-BLE-Verifier-v0.1.0-merged.bin"
+    merged = output / f"ESP32S3-BLE-Verifier-v{version}-merged.bin"
     command = [sys.executable, "-m", "esptool", "--chip", "esp32s3", "merge_bin", "-o", str(merged)]
     for flag, value in settings.items():
         command.extend([f"--{flag}", value])
@@ -76,7 +81,7 @@ def main():
         for path in sorted(PROJECT.rglob("*"))
         if path.is_file() and "__pycache__" not in path.parts
     }
-    manifest = {"chip": "esp32s3", "version": "0.1.0", "idf_version": "5.3.2",
+    manifest = {"chip": "esp32s3", "version": version, "idf_version": "5.3.2",
                 "flash_settings": settings, "flash_files": flash_files, "sha256": hashes,
                 "merged": {"file": merged.name, "offset": "0x0", "sha256": digest(merged)},
                 "source_files": source_files}
