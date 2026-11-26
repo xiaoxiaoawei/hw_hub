@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod batch;
+pub mod ble_verification;
 pub mod chip;
 pub mod cli;
 pub mod device_scan;

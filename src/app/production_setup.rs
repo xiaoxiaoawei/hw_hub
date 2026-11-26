@@ -8,6 +8,12 @@ pub(super) struct ProductionInputs {
     board_date: String,
 }
 
+impl ProductionInputs {
+    pub(super) fn parse(&self) -> anyhow::Result<ProductionBatch> {
+        ProductionBatch::parse(&self.work_order, &self.board_week, &self.board_date)
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct RecordSetup {
     pub(super) settings: TelemetrySettings,
@@ -64,8 +70,7 @@ impl FlashApp {
             .iter()
             .all(|value| value.trim().is_empty());
         let production = if required || !blank {
-            match ProductionBatch::parse(&inputs.work_order, &inputs.board_week, &inputs.board_date)
-            {
+            match inputs.parse() {
                 Ok(production) => Some(production),
                 Err(error) => {
                     self.error = Some(format!("请填写生产信息。{error}"));
@@ -97,12 +102,16 @@ pub(super) fn effective_record_directory(
     operation: RecordOperation,
     production: Option<&ProductionBatch>,
 ) -> anyhow::Result<PathBuf> {
-    let root = settings
-        .csv_directory
-        .clone()
-        .map_or_else(telemetry::default_records_directory, Ok)?;
+    let root = record_root(settings)?;
     Ok(match production {
         Some(production) => production.record_directory(&root, operation),
         None => root.join("验证"),
     })
+}
+
+pub(super) fn record_root(settings: &TelemetrySettings) -> anyhow::Result<PathBuf> {
+    settings
+        .csv_directory
+        .clone()
+        .map_or_else(telemetry::default_records_directory, Ok)
 }

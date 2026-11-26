@@ -1,3 +1,5 @@
+mod ble_station;
+mod ble_verification_ui;
 mod clipboard;
 mod device_read;
 mod firmware_drop;
@@ -17,6 +19,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use ble_station::BleWorkspace;
 use device_read::DeviceReadSetup;
 use eframe::egui::{self, Color32, RichText};
 use esp32c3_flashtool::{
@@ -36,7 +39,7 @@ use esp32c3_flashtool::{
     updater::{self, CheckResult, ReleaseUpdate, UpdateSettings},
 };
 use firmware_drop::FirmwareFileDrop;
-use production_setup::{ProductionInputs, RecordSetup, effective_record_directory};
+use production_setup::{ProductionInputs, RecordSetup, effective_record_directory, record_root};
 use startup_log::StartupLogTask;
 use validation::ValidationWorkspace;
 
@@ -62,6 +65,7 @@ enum FirmwareLayout {
 enum Workspace {
     Flash,
     Validation,
+    Bluetooth,
 }
 
 struct FirmwareRow {
@@ -301,6 +305,7 @@ impl ScanSchedule {
 pub struct FlashApp {
     workspace: Workspace,
     validation: ValidationWorkspace,
+    ble: BleWorkspace,
     production_inputs: ProductionInputs,
     selected_chip: ChipModel,
     pending_chip: ChipModel,
@@ -452,6 +457,7 @@ impl FlashApp {
         let mut app = Self {
             workspace: Workspace::Flash,
             validation: ValidationWorkspace::default(),
+            ble: BleWorkspace::default(),
             production_inputs: ProductionInputs::default(),
             selected_chip: ChipModel::default(),
             pending_chip: ChipModel::default(),
@@ -560,6 +566,8 @@ impl FlashApp {
     fn busy(&self) -> bool {
         self.running()
             || self.validation_running()
+            || self.ble.is_connected()
+            || self.ble.saving()
             || self.startup_log.is_some()
             || self.driver_busy
             || self.installer_preparing
@@ -599,6 +607,7 @@ impl FlashApp {
         if let Some(result) = self.scanner.poll() {
             if let Ok(observed) = &result {
                 self.invalidate_validation_ports(observed);
+                self.invalidate_ble_port(observed);
             }
             if let (Ok(observed), Some(batch)) = (&result, &self.batch) {
                 for (name, identity) in &self.batch_port_identities {
@@ -1251,6 +1260,7 @@ impl FlashApp {
         let mut exit = false;
         let mut retry = false;
         let mut show_validation = false;
+        let mut show_ble = false;
         let response = egui::Modal::new(egui::Id::new("unfinished_record_exit"))
             .frame(
                 egui::Frame::new()
@@ -1279,6 +1289,10 @@ impl FlashApp {
                     ui.label("本批验证结果尚未保存。");
                     show_validation = secondary_button(ui, "返回验证结果", [128.0, 36.0]).clicked();
                 }
+                if self.ble.has_unsaved() {
+                    ui.label("蓝牙验证结果尚未保存。");
+                    show_ble = secondary_button(ui, "返回蓝牙验证", [128.0, 36.0]).clicked();
+                }
                 ui.horizontal(|ui| {
                     if primary_button(ui, "继续等待", [116.0, 38.0]).clicked() {
                         wait = true;
@@ -1300,6 +1314,10 @@ impl FlashApp {
             self.close_confirm_open = false;
             self.workspace = Workspace::Validation;
             self.validation.result_open = true;
+        }
+        if show_ble {
+            self.close_confirm_open = false;
+            self.workspace = Workspace::Bluetooth;
         }
         if wait || response.should_close() {
             self.close_confirm_open = false;
@@ -1479,6 +1497,7 @@ impl FlashApp {
         for (workspace, icon, label) in [
             (Workspace::Flash, Icon::Grid, "批量烧录"),
             (Workspace::Validation, Icon::Shield, "批量验证"),
+            (Workspace::Bluetooth, Icon::Bluetooth, "蓝牙验证"),
         ] {
             if nav_item(
                 ui,
@@ -1504,6 +1523,7 @@ impl FlashApp {
         let (chip, baud) = match self.workspace {
             Workspace::Flash => (self.selected_chip, self.baud_input.as_str()),
             Workspace::Validation => (ChipModel::Esp32c3, self.validation.baud_input.as_str()),
+            Workspace::Bluetooth => (ChipModel::Esp32s3, "115200"),
         };
         ui.label(
             RichText::new(chip.label())
@@ -1512,8 +1532,10 @@ impl FlashApp {
                 .strong()
                 .color(Color32::from_rgb(220, 230, 241)),
         );
-        ui.label(
-            RichText::new(format!(
+        let connection = if self.workspace == Workspace::Bluetooth {
+            "115200 · 串口工装".into()
+        } else {
+            format!(
                 "{} · {} 台并发",
                 parse_baud_input(
                     baud,
@@ -1525,10 +1547,9 @@ impl FlashApp {
                 )
                 .map_or_else(|_| "波特率无效".into(), |rate| rate.to_string()),
                 self.concurrency
-            ))
-            .size(12.0)
-            .color(meta),
-        );
+            )
+        };
+        ui.label(RichText::new(connection).size(12.0).color(meta));
         if self.update_in_progress() {
             ui.add_space(12.0);
             let text = if self.installer_preparing {
@@ -1631,6 +1652,7 @@ impl FlashApp {
                     RichText::new(match self.workspace {
                         Workspace::Flash => "设备烧录工作台",
                         Workspace::Validation => "ESP32-C3 批量验证",
+                        Workspace::Bluetooth => "ESP32-S3 蓝牙验证",
                     })
                     .heading()
                     .size(22.0)
@@ -2481,6 +2503,7 @@ impl eframe::App for FlashApp {
         self.collect_events();
         self.poll_startup_log();
         self.poll_validation();
+        self.poll_ble();
         self.poll_records();
         self.collect_update_events(ctx);
         self.poll_self_update(ctx);
@@ -2490,6 +2513,10 @@ impl eframe::App for FlashApp {
             if self.installer_preparing {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.notice = Some("正在准备更新并检查写入权限，请稍候。".into());
+            } else if self.ble.is_connected() && !self.ble.capturing() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.disconnect_ble();
+                self.notice = Some("正在断开蓝牙工装，请稍候再关闭。".into());
             } else if busy {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.error = Some("任务正在进行，请等待当前任务完成后关闭。".into());
@@ -2500,6 +2527,7 @@ impl eframe::App for FlashApp {
                 || !self.pending_records.is_empty()
                 || !self.failed_records.is_empty()
                 || self.validation.save_error.is_some()
+                || self.ble.has_unsaved()
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.close_confirm_open = true;
@@ -2524,6 +2552,7 @@ impl eframe::App for FlashApp {
             .show(ctx, |ui| match self.workspace {
                 Workspace::Flash => self.actions_panel(ui),
                 Workspace::Validation => self.validation_actions(ui),
+                Workspace::Bluetooth => self.ble_actions(ui),
             });
         egui::CentralPanel::default()
             .frame(
@@ -2538,6 +2567,7 @@ impl eframe::App for FlashApp {
                     .id_salt(match self.workspace {
                         Workspace::Flash => "workspace_flash",
                         Workspace::Validation => "workspace_validation",
+                        Workspace::Bluetooth => "workspace_bluetooth",
                     })
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -2562,6 +2592,7 @@ impl eframe::App for FlashApp {
                                 card(ui, |ui| self.logs_panel(ui));
                             }
                             Workspace::Validation => self.validation_panel(ui),
+                            Workspace::Bluetooth => self.ble_panel(ui),
                         }
                         ui.add_space(8.0);
                     });
@@ -2577,6 +2608,7 @@ impl eframe::App for FlashApp {
             && !self.chip_picker_open
             && !self.device_read_setup.open
             && !self.validation.result_open
+            && !self.ble.pass_open
         {
             self.open_update_dialog();
         }
@@ -2585,6 +2617,9 @@ impl eframe::App for FlashApp {
         self.device_log_windows(ctx);
         if !self.close_confirm_open {
             self.validation_result_dialog(ctx);
+            if !self.validation.result_open && !self.update_dialog_open && !self.settings_open {
+                self.ble_pass_dialog(ctx);
+            }
         }
         self.confirm_record_exit(ctx);
         if self.busy() || self.update_checking || self.scanner.is_scanning() {
@@ -2955,6 +2990,7 @@ fn device_tile(
 
 #[derive(Clone, Copy)]
 enum Icon {
+    Bluetooth,
     Chip,
     Usb,
     File,
@@ -2967,6 +3003,19 @@ fn paint_icon(painter: &egui::Painter, center: egui::Pos2, size: f32, kind: Icon
     let p = |x: f32, y: f32| center + egui::vec2(x * size, y * size);
     let stroke = egui::Stroke::new(1.65_f32, color);
     match kind {
+        Icon::Bluetooth => {
+            painter.add(egui::Shape::line(
+                vec![
+                    p(-0.28, -0.24),
+                    p(0.28, 0.25),
+                    p(0.0, 0.47),
+                    p(0.0, -0.47),
+                    p(0.28, -0.25),
+                    p(-0.28, 0.24),
+                ],
+                stroke,
+            ));
+        }
         Icon::Settings => {
             painter.circle_stroke(center, size * 0.29, stroke);
             painter.circle_stroke(center, size * 0.10, stroke);

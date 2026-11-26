@@ -28,6 +28,7 @@ const HEADER: [&str; 10] = [
 ];
 const PRODUCTION_COLUMNS: [&str; 4] =
     ["生产批次/工单号", "主板年周", "主板生产日期", "startup_log"];
+#[cfg(test)]
 const MAX_COLUMNS: usize = HEADER.len() + PRODUCTION_COLUMNS.len();
 
 #[derive(Clone, Debug)]
@@ -73,40 +74,89 @@ fn append_records(
     name: &str,
     production: Option<&ProductionBatch>,
 ) -> Result<PathBuf> {
-    ensure!(directory.is_absolute(), "验证记录目录必须为绝对路径");
     ensure!(!records.is_empty(), "没有待保存的验证结果");
     let batch = &records[0].batch_id;
     ensure!(!batch.is_empty(), "验证批次标识不能为空");
-    let stored_batch = formula_safe(batch.clone());
     let mut header = HEADER.to_vec();
     if production.is_some() {
         header.extend(PRODUCTION_COLUMNS);
     }
-    let mut expected = BTreeMap::new();
-    let mut incoming = Vec::with_capacity(records.len());
+    let mut rows = Vec::with_capacity(records.len());
     for record in records {
         ensure!(&record.batch_id == batch, "一次只能保存同一验证批次");
         ensure!(!record.port.is_empty(), "验证端口不能为空");
         let mut cells = record_cells(record);
         if let Some(production) = production {
-            cells.extend(
-                [
-                    production.work_order.clone(),
-                    production.board_week.clone(),
-                    production.board_date.to_string(),
-                    record.startup_log.clone(),
-                ]
-                .into_iter()
-                .map(formula_safe),
-            );
+            cells.extend([
+                production.work_order.clone(),
+                production.board_week.clone(),
+                production.board_date.to_string(),
+                record.startup_log.clone(),
+            ]);
+        }
+        rows.push(cells);
+    }
+    // Preserve the original complete batch/COM snapshot contract. BLE history
+    // uses the same storage without this group constraint, one attempt at a time.
+    append_rows(directory, name, &header, &rows, &[0, 1], Some(0))
+}
+
+/// Shared atomic CSV history. `rows` are raw strings; escaping and spreadsheet
+/// protection happen once here. Existing values and headers remain immutable.
+/// A complete group requires every existing key in an incoming group to be
+/// represented in this snapshot (the original device-verification contract).
+pub(crate) fn append_rows(
+    directory: &Path,
+    name: &str,
+    header: &[&str],
+    rows: &[Vec<String>],
+    key_columns: &[usize],
+    complete_group: Option<usize>,
+) -> Result<PathBuf> {
+    ensure!(directory.is_absolute(), "验证记录目录必须为绝对路径");
+    ensure!(!rows.is_empty(), "没有待保存的验证结果");
+    ensure!(
+        Path::new(name)
+            .file_name()
+            .is_some_and(|value| value == name)
+            && !name.contains(['\\', ':'])
+            && name.ends_with(".csv"),
+        "验证记录文件名无效"
+    );
+    ensure!(
+        !header.is_empty()
+            && header.len() <= 64
+            && !key_columns.is_empty()
+            && key_columns.iter().all(|index| *index < header.len())
+            && complete_group.is_none_or(|index| index < header.len()),
+        "验证记录列定义无效"
+    );
+    let key = |cells: &[String]| {
+        key_columns
+            .iter()
+            .map(|index| cells[*index].clone())
+            .collect::<Vec<_>>()
+    };
+    let mut expected = BTreeMap::new();
+    let mut incoming = Vec::with_capacity(rows.len());
+    let mut groups = BTreeSet::new();
+    for raw in rows {
+        ensure!(raw.len() == header.len(), "待保存的验证记录列数不匹配");
+        let cells = raw.iter().cloned().map(formula_safe).collect::<Vec<_>>();
+        let row_key = key(&cells);
+        ensure!(
+            row_key.iter().all(|value| !value.is_empty()),
+            "验证记录键不能为空"
+        );
+        if let Some(index) = complete_group {
+            groups.insert(cells[index].clone());
         }
         let bytes = encode_row(&cells)?;
-        let port = cells[1].clone();
         ensure!(
-            expected.insert(port.clone(), cells).is_none(),
-            "同一批次包含重复验证端口"
+            expected.insert(row_key.clone(), cells).is_none(),
+            "同次保存包含重复验证记录"
         );
-        incoming.push((port, bytes));
+        incoming.push((row_key, bytes));
     }
     fs::create_dir_all(directory).context("无法创建验证记录目录")?;
     let path = directory.join(name);
@@ -140,7 +190,8 @@ fn append_records(
                 .read_exact(&mut bom)
                 .context("验证记录缺少UTF-8 BOM")?;
             ensure!(bom.as_slice() == BOM, "已有验证记录不是带BOM的UTF-8 CSV");
-            let stored_header = read_row(&mut reader)?.context("验证记录缺少表头")?;
+            let stored_header =
+                read_row_with_limit(&mut reader, header.len())?.context("验证记录缺少表头")?;
             ensure!(
                 stored_header
                     .iter()
@@ -148,21 +199,26 @@ fn append_records(
                     .eq(header.iter().copied()),
                 "已有验证记录表头不匹配"
             );
-            while let Some(row) = read_row(&mut reader)? {
+            while let Some(row) = read_row_with_limit(&mut reader, header.len())? {
                 ensure!(row.len() == header.len(), "已有验证记录列数不匹配");
                 ensure!(
                     !row.iter().map(String::as_str).eq(header.iter().copied()),
                     "已有验证记录包含重复表头"
                 );
-                if row[0] == stored_batch {
-                    let wanted = expected
-                        .get(&row[1])
-                        .context("已有批次与待保存的设备列表不一致")?;
-                    ensure!(&row == wanted, "同批次端口已有不同验证结果，未覆盖原文件");
-                    ensure!(seen.insert(row[1].clone()), "已有批次包含重复验证端口");
+                let row_key = key(&row);
+                if let Some(index) = complete_group
+                    && groups.contains(&row[index])
+                {
+                    ensure!(
+                        expected.contains_key(&row_key),
+                        "已有批次与待保存的设备列表不一致"
+                    );
+                }
+                if let Some(wanted) = expected.get(&row_key) {
+                    ensure!(&row == wanted, "同批次记录已有不同验证结果，未覆盖原文件");
+                    ensure!(seen.insert(row_key), "已有批次包含重复验证记录");
                 }
             }
-            // Close the reader before replacement, including its file borrow.
             drop(reader);
             file.seek(SeekFrom::End(-1))?;
             let mut last = [0];
@@ -172,7 +228,7 @@ fn append_records(
     }
     let missing: Vec<_> = incoming
         .iter()
-        .filter(|(port, _)| !seen.contains(port))
+        .filter(|(key, _)| !seen.contains(key))
         .collect();
     if missing.is_empty() {
         OpenOptions::new()
@@ -211,7 +267,6 @@ fn append_records(
         .persist(&path)
         .map_err(|error| error.error)
         .context("无法原子替换验证记录，原文件保持不变")?;
-    // A failure after commit is safe to retry: matching rows are deduplicated.
     committed
         .sync_all()
         .context("验证记录已替换，但同步失败；可重试同一批次")?;
@@ -250,7 +305,6 @@ fn record_cells(record: &VerificationRecord) -> Vec<String> {
         checks.failures.join("\n"),
     ]
     .into_iter()
-    .map(formula_safe)
     .collect()
 }
 
@@ -290,7 +344,15 @@ fn encode_row(cells: &[String]) -> Result<Vec<u8>> {
 }
 
 // Read complete CSV records, including quoted line breaks, with bounded memory.
+#[cfg(test)]
 fn read_row(reader: &mut impl BufRead) -> Result<Option<Vec<String>>> {
+    read_row_with_limit(reader, MAX_COLUMNS)
+}
+
+pub(crate) fn read_row_with_limit(
+    reader: &mut impl BufRead,
+    max_columns: usize,
+) -> Result<Option<Vec<String>>> {
     let mut raw = Vec::new();
     let mut quoted = false;
     loop {
@@ -342,7 +404,7 @@ fn read_row(reader: &mut impl BufRead) -> Result<Option<Vec<String>>> {
                     String::from_utf8(std::mem::take(&mut field))
                         .context("验证CSV包含无效UTF-8")?,
                 );
-                ensure!(cells.len() < MAX_COLUMNS, "已有验证CSV列数过多");
+                ensure!(cells.len() < max_columns, "已有验证CSV列数过多");
                 state = Start;
             }
             (Quoted, _) => field.push(byte),
@@ -547,6 +609,17 @@ mod tests {
         assert!(append_batch(dir.path(), &[first.clone(), first]).is_err());
         assert_eq!(fs::read(&path).unwrap(), before);
         assert_eq!(parsed(&before).len(), 3);
+    }
+
+    #[test]
+    fn shared_writer_preserves_complete_device_batch_snapshot_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = sample("synthetic-complete", "COM1", 2922);
+        let second = sample("synthetic-complete", "COM2", 2922);
+        let path = append_batch(dir.path(), &[first.clone(), second]).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(append_batch(dir.path(), &[first]).is_err());
+        assert_eq!(fs::read(path).unwrap(), before);
     }
 
     #[test]

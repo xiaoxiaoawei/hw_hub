@@ -174,7 +174,11 @@ impl FlashApp {
 
     fn update_wait_reason(&self) -> Option<&'static str> {
         restart_safety_reason(
-            self.running() || self.validation_running() || self.startup_log.is_some(),
+            self.running()
+                || self.validation_running()
+                || self.startup_log.is_some()
+                || self.ble.is_connected()
+                || self.ble.saving(),
             self.driver_busy,
             self.record_service.pending_local_count(),
             self.pending_records.len(),
@@ -187,6 +191,11 @@ impl FlashApp {
                 .then_some("请先重试保存验证结果。")
         })
         .or_else(|| {
+            self.ble
+                .has_unsaved()
+                .then_some("请先重试保存蓝牙验证结果。")
+        })
+        .or_else(|| {
             ((self.settings_open || self.resume_settings_after_update)
                 && self.has_unsaved_settings())
             .then_some("请先返回设置保存改动，或关闭设置放弃改动。")
@@ -195,6 +204,7 @@ impl FlashApp {
         .or_else(|| {
             (self.close_confirm_open
                 || self.validation.result_open
+                || self.ble.pass_open
                 || self.chip_picker_open
                 || self.pending_driver_license.is_some())
             .then_some("等待当前窗口操作结束…")

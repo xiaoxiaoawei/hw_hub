@@ -45,6 +45,17 @@ ESP32-C3 烧录会从 `ESP_EFUSE_OPTIONAL_UNIQUE_ID` 读取 16 字节，按固�
 
 同年周同工单每轮追加到同一份验证报告。每台设备占一行，包含三项生产信息、批次 ID、串口、验证时间、两项传感器状态、MAC、设备 ID、电池电压、结论、失败原因和采集到的完整启动日志。可以从结果弹窗打开 CSV。
 
+## 蓝牙验证
+
+将配套固件烧录到独立 ESP32-S3 工装，再通过原生 USB Serial/JTAG 或 UART0 转 USB 连接电脑。GPIO7 接低有效按键，GPIO1 接蜂鸣器。工装固件与烧录说明单独提供。[下载 ESP32-S3 工装固件](https://github.com/xiaoxiaoawei/hw_hub/releases/tag/esp32s3-verifier-v0.1.0)
+
+1. 打开左侧「蓝牙验证」，填写生产批次/工单号、主板年周和主板生产日期。
+2. 选择工装 COM，填写客户确认的待测设备 **BLE 广播 MAC**，以及对应的 **设备 UID**（32 个十六进制字符）。UID 来自已有设备记录或工单。广播可能使用不同于工厂 MAC 的地址。
+3. 点击「连接工装」，等串口状态显示就绪，短按并松开工装 GPIO7。工装主动扫描最多 45 秒，读取主广播与扫描响应。
+4. 只有目标地址一致，且服务 UUID、设备完整名称及 1.188 自检数据符合要求时，工装才输出 `PASS！`。FlashTool 在保存本次结果后弹窗。每次连接验证一台设备，更换设备后填写新的 MAC 与 UID 并重新连接工装。
+
+蓝牙报告追加到 `记录根目录/主板年周/蓝牙验证` 下对应工单的 CSV，记录通过或失败、配置及观察到的 BLE 地址、UID、北京时间、固件版本、故障位、电池采样与工装日志。扫描不配对，电池采样值用于记录。
+
 ## 自动检查软件更新
 
 默认在每天首次启动时按系统本地日期检查 GitHub 最新正式 Release。可在“软件设置 → 通用设置”中关闭自动检查，也可随时手动检查。检查完成后弹窗显示结果，失败时提供原因和重试入口。
@@ -121,11 +132,11 @@ cargo run --locked
 python3 scripts/bump-version.py --help
 python3 scripts/bump-version.py --check
 # 先为下一版本写好 CHANGELOG，再预演并更新版本：
-python3 scripts/bump-version.py 0.5.9 --dry-run
-python3 scripts/bump-version.py 0.5.9
+python3 scripts/bump-version.py 0.6.1 --dry-run
+python3 scripts/bump-version.py 0.6.1
 ```
 
-提交并验证新版本后创建对应 Git 标签，例如 `git tag -a v0.5.9 -m "FlashTool v0.5.9"`，再推送分支和标签以触发发布。标签必须与 Cargo 版本相同。每次修复使用新版本和标签。
+提交并验证新版本后创建对应 Git 标签，例如 `git tag -a v0.6.1 -m "FlashTool v0.6.1"`，再推送分支和标签以触发发布。标签必须与 Cargo 版本相同。每次修复使用新版本和标签。
 
 GitHub Actions 验证 `vX.Y.Z` 标签与 Cargo 版本一致，通过格式、静态检查和测试后在 Windows 构建。正式 Release 统一使用 `FlashTool vX.Y.Z` 标题，上传版本 ZIP、源码 ZIP 和 SHA256 校验文件，验证成功后才发布并标记 Latest。已发布标签及附件保持不变；可手动选择只构建或发布一个已存在的版本标签。Latest 保持指向较高的正式版本，补发旧版本时保留更新版本的 Latest 标记。
 
