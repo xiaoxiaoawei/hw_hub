@@ -4,8 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define BV_VERSION "0.1.1"
-#define BV_SCAN_MS 45000
+#define BV_SCAN_MS 25000
 #define BV_NAME_SIZE 32
 #define BV_MAX_AD_BYTES 31
 #define BV_MAX_CANDIDATES 32

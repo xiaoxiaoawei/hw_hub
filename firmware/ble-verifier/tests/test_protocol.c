@@ -1,4 +1,5 @@
 #include "ble_protocol.h"
+#include "station_feedback.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -314,8 +315,98 @@ static void all_named_candidates_count_even_with_faults_missing_service_or_diffe
     assert(!strcmp(bv_failure_reason(&short_only->evidence, true), "missing_complete_name"));
 }
 
+static void sound_phases_last_exactly_three_continuous_half_seconds(void) {
+    const uint32_t patterns[3][3] = {{3600,4000,4400}, {4400,4000,4400}, {4400,4000,3600}};
+    const uint64_t offsets[] = {0,499,500,999,1000,1499};
+    assert(BV_SOUND_STEP_MS == 500 && BV_SOUND_TOTAL_MS == 1500);
+    for (unsigned kind = BV_SOUND_START; kind <= BV_SOUND_FAIL; ++kind) {
+        bv_sound_state_t sound = {0};
+        if (kind == BV_SOUND_START) assert(bv_sound_start(&sound, 100));
+        else bv_sound_result(&sound, (bv_sound_kind_t)kind, 100);
+        for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i) {
+            uint64_t now = 100 + offsets[i];
+            assert(bv_sound_tick(&sound, now) == patterns[kind - BV_SOUND_START][offsets[i] / 500]);
+            assert(bv_sound_busy(&sound, now));
+            assert(!bv_sound_start(&sound, now));
+            assert(sound.started_ms == 100 && sound.active == (bv_sound_kind_t)kind);
+            if (kind != BV_SOUND_START) {
+                bv_sound_result(&sound, kind == BV_SOUND_PASS ? BV_SOUND_FAIL : BV_SOUND_PASS, now);
+                assert(sound.active == (bv_sound_kind_t)kind && sound.pending == BV_SOUND_NONE);
+            }
+        }
+        assert(bv_sound_tick(&sound, 1600) == 0);
+        assert(!bv_sound_busy(&sound, 1600));
+        assert(sound.active == BV_SOUND_NONE && sound.pending == BV_SOUND_NONE);
+    }
+}
+
+static void immediate_result_waits_for_full_start_then_plays_full_outcome_without_restart(void) {
+    bv_sound_state_t sound = {0};
+    assert(bv_sound_start(&sound, 100));
+    bv_sound_result(&sound, BV_SOUND_FAIL, 100);
+    bv_sound_result(&sound, BV_SOUND_PASS, 250); /* Repeated result cannot replace FAIL. */
+    assert(sound.active == BV_SOUND_START && sound.pending == BV_SOUND_FAIL && sound.started_ms == 100);
+    assert(bv_sound_tick(&sound, 599) == 3600);
+    assert(bv_sound_tick(&sound, 600) == 4000);
+    assert(bv_sound_tick(&sound, 1100) == 4400);
+    assert(bv_sound_tick(&sound, 1599) == 4400 && sound.active == BV_SOUND_START);
+    assert(bv_sound_tick(&sound, 1600) == 4400 && sound.active == BV_SOUND_FAIL);
+    assert(sound.started_ms == 1600 && sound.pending == BV_SOUND_NONE);
+    assert(!bv_sound_start(&sound, 1600));
+    bv_sound_result(&sound, BV_SOUND_PASS, 1700);
+    assert(sound.active == BV_SOUND_FAIL && sound.started_ms == 1600);
+    assert(bv_sound_tick(&sound, 2099) == 4400);
+    assert(bv_sound_tick(&sound, 2100) == 4000);
+    assert(bv_sound_tick(&sound, 2600) == 3600);
+    assert(bv_sound_tick(&sound, 3099) == 3600 && !bv_sound_start(&sound, 3099));
+    assert(bv_sound_tick(&sound, 3100) == 0 && !bv_sound_busy(&sound, 3100));
+    assert(bv_sound_start(&sound, 3100));
+    assert(bv_sound_tick(&sound, 3100) == 3600 && sound.started_ms == 3100);
+}
+
+static void sound_delayed_poll_uses_scheduled_boundaries_and_idle_results_start_now(void) {
+    bv_sound_state_t sound = {0};
+    assert(!bv_sound_busy(&sound, 0) && bv_sound_tick(&sound, 0) == 0);
+    bv_sound_result(&sound, BV_SOUND_NONE, 0);
+    bv_sound_result(&sound, BV_SOUND_START, 0);
+    assert(!bv_sound_busy(&sound, 0));
+    assert(bv_sound_start(&sound, 10));
+    bv_sound_result(&sound, BV_SOUND_PASS, 11);
+    assert(bv_sound_tick(&sound, 2010) == 4000);
+    assert(sound.active == BV_SOUND_PASS && sound.started_ms == 1510);
+    assert(bv_sound_tick(&sound, 3010) == 0 && !bv_sound_busy(&sound, 3010));
+    assert(bv_sound_start(&sound, 4000));
+    bv_sound_result(&sound, BV_SOUND_FAIL, 4001);
+    assert(bv_sound_tick(&sound, 10000) == 0 && !bv_sound_busy(&sound, 10000));
+    assert(sound.active == BV_SOUND_NONE && sound.pending == BV_SOUND_NONE);
+    bv_sound_result(&sound, BV_SOUND_FAIL, 12345);
+    assert(sound.started_ms == 12345 && bv_sound_tick(&sound, 12345) == 4400);
+    assert(bv_sound_tick(&sound, 13845) == 0);
+    assert(!bv_sound_start(NULL, 0) && !bv_sound_busy(NULL, 0) && bv_sound_tick(NULL, 0) == 0);
+    bv_sound_result(NULL, BV_SOUND_FAIL, 0);
+}
+
+static void timeout_reason_preserves_diagnostic_only_when_complete_buffer_fits(void) {
+    char buffer[128];
+    assert(!strcmp(bv_timeout_reason(NULL, buffer, sizeof(buffer)), "scan_timeout"));
+    assert(!strcmp(bv_timeout_reason("", buffer, sizeof(buffer)), "scan_timeout"));
+    assert(!strcmp(bv_timeout_reason("fault", NULL, 100), "scan_timeout"));
+    const char *expected = "scan_timeout:nonzero_fault_bits";
+    assert(bv_timeout_reason("nonzero_fault_bits", buffer, strlen(expected) + 1) == buffer);
+    assert(!strcmp(buffer, expected));
+    memset(buffer, 'x', sizeof(buffer));
+    assert(!strcmp(bv_timeout_reason("nonzero_fault_bits", buffer, strlen(expected)), "scan_timeout"));
+    for (size_t i = 0; i < sizeof(buffer); ++i) assert(buffer[i] == 'x');
+    assert(!strcmp(bv_timeout_reason("fault", buffer, 0), "scan_timeout"));
+    assert(!strcmp(bv_timeout_reason("fault", buffer, 13), "scan_timeout"));
+    assert(bv_timeout_reason("fault", buffer, sizeof(buffer)) == buffer);
+    assert(!strcmp(buffer, "scan_timeout:fault"));
+    strcpy(buffer, "fault");
+    assert(!strcmp(bv_timeout_reason(buffer, buffer, sizeof(buffer)), "scan_timeout:fault"));
+}
+
 int main(void) {
-    assert(!strcmp(BV_VERSION, "0.1.1"));
+    assert(BV_SCAN_MS == 25000);
     parser_uses_substring_case_insensitive_complete_ascii_names();
     parser_checks_exact_service_full_fault_word_and_version_but_not_battery();
     parser_rejects_every_bad_manufacturer_ad_and_nonzero_after_padding();
@@ -323,6 +414,10 @@ int main(void) {
     candidates_keep_rsp_first_raw_snapshot_and_informational_battery();
     packet_fragments_cannot_fabricate_complete_raw_pair();
     all_named_candidates_count_even_with_faults_missing_service_or_different_address_types();
+    sound_phases_last_exactly_three_continuous_half_seconds();
+    immediate_result_waits_for_full_start_then_plays_full_outcome_without_restart();
+    sound_delayed_poll_uses_scheduled_boundaries_and_idle_results_start_now();
+    timeout_reason_preserves_diagnostic_only_when_complete_buffer_fits();
     puts("ble-verifier portable protocol tests passed");
     return 0;
 }

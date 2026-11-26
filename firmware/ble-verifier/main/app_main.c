@@ -1,4 +1,5 @@
 #include "ble_protocol.h"
+#include "station_feedback.h"
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +9,7 @@
 #include "driver/ledc.h"
 #include "driver/uart.h"
 #include "driver/usb_serial_jtag.h"
+#include "esp_app_desc.h"
 #include "esp_err.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -40,25 +42,26 @@ typedef struct {
 typedef enum { BOOT_SERIAL, BOOT_NVS, BOOT_BLE, BOOT_READY, BOOT_FAILED } boot_phase_t;
 
 static QueueHandle_t reports;
+static QueueHandle_t sound_commands;
 static EventGroupHandle_t events;
 static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t active_attempt, completed_attempt, overflow_attempt, callback_inflight;
 typedef struct { uint8_t address[6], type; } known_key_t;
 static known_key_t known_keys[BV_MAX_CANDIDATES];
 static size_t known_count;
-static bool uart_ready, usb_ready;
+static bool uart_ready, usb_ready, sound_busy;
+static unsigned sound_pending_commands;
 static boot_phase_t boot_phase = BOOT_SERIAL;
 static esp_err_t boot_error;
 static const char *boot_failure = "none";
 static char session[65];
 static uint8_t own_address_type;
-/* Scan/evidence/tone state belongs only to the I/O task. Callbacks only copy
+/* Scan/evidence state belongs only to the I/O task. Callbacks only copy
    bounded packets and update generation-tagged status under state_lock. */
 static bool busy, finished, finishing;
 static uint32_t attempt;
 static bv_scan_t scan;
-static int64_t deadline_us, radio_end_us, first_valid_us;
-static struct { unsigned pulses; bool on; uint32_t on_ms, off_ms; int64_t deadline; } tone;
+static int64_t radio_end_us, first_valid_us;
 
 static void phase(boot_phase_t value, const char *reason, esp_err_t error) {
     portENTER_CRITICAL(&state_lock);
@@ -72,25 +75,52 @@ static bool healthy(void) {
     const EventBits_t required = HOST_READY | HARDWARE_READY | INITIALIZED;
     return !failed && events && (xEventGroupGetBits(events) & required) == required;
 }
-static void tone_level(bool on) {
-    if (!events || !(xEventGroupGetBits(events) & HARDWARE_READY)) return;
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, on ? 128 : 0);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+static bool sound_is_busy(void) {
+    portENTER_CRITICAL(&state_lock); bool value=sound_busy; portEXIT_CRITICAL(&state_lock);
+    return value;
 }
-static void beep(unsigned count, uint32_t on_ms, uint32_t off_ms) {
-    tone.pulses = count; tone.on = true; tone.on_ms = on_ms; tone.off_ms = off_ms;
-    tone.deadline = esp_timer_get_time() + (int64_t)on_ms * 1000;
-    tone_level(true);
+static bool request_sound(bv_sound_kind_t kind) {
+    if (!sound_commands || !events || !(xEventGroupGetBits(events)&HARDWARE_READY)) return false;
+    /* Publish busy before enqueueing so a rapid second button release cannot
+       overwrite a sound which its independent task has not received yet. */
+    portENTER_CRITICAL(&state_lock); ++sound_pending_commands; sound_busy=true; portEXIT_CRITICAL(&state_lock);
+    if (xQueueSend(sound_commands,&kind,0)==pdTRUE) return true;
+    portENTER_CRITICAL(&state_lock); --sound_pending_commands; portEXIT_CRITICAL(&state_lock);
+    phase(BOOT_FAILED,"buzzer_queue_failed",ESP_FAIL); return false;
 }
-static void tick_beep(int64_t now) {
-    if (!tone.pulses || now < tone.deadline) return;
-    if (tone.on) {
-        tone_level(false); tone.on = false;
-        if (!--tone.pulses) return;
-        tone.deadline = now + (int64_t)tone.off_ms * 1000;
-    } else {
-        tone_level(true); tone.on = true;
-        tone.deadline = now + (int64_t)tone.on_ms * 1000;
+static void sound_task(void *unused) {
+    (void)unused;
+    bv_sound_state_t state={0};
+    uint32_t previous_hz=UINT32_MAX;
+    while (true) {
+        bv_sound_kind_t kind;
+        while (xQueueReceive(sound_commands,&kind,0)==pdTRUE) {
+            uint64_t now_ms=(uint64_t)esp_timer_get_time()/1000;
+            portENTER_CRITICAL(&state_lock); --sound_pending_commands; portEXIT_CRITICAL(&state_lock);
+            if (kind==BV_SOUND_START) bv_sound_start(&state,now_ms);
+            else bv_sound_result(&state,kind,now_ms);
+        }
+        uint64_t now_ms=(uint64_t)esp_timer_get_time()/1000;
+        uint32_t hz=bv_sound_tick(&state,now_ms);
+        if (hz!=previous_hz) {
+            esp_err_t rc=ESP_OK;
+            if (hz) rc=ledc_set_freq(LEDC_LOW_SPEED_MODE,LEDC_TIMER_0,hz);
+            if (rc==ESP_OK) rc=ledc_set_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0,hz?128:0);
+            if (rc==ESP_OK) rc=ledc_update_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0);
+            if (rc!=ESP_OK) {
+                ledc_set_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0,0);
+                ledc_update_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0);
+                phase(BOOT_FAILED,"buzzer_output_failed",rc);
+            }
+            previous_hz=hz;
+        }
+        portENTER_CRITICAL(&state_lock);
+        sound_busy=state.active!=BV_SOUND_NONE || sound_pending_commands!=0;
+        portEXIT_CRITICAL(&state_lock);
+        /* Audio never blocks UART/BLE processing or the start of scanning.
+           128/256 is the maximum useful square-wave duty for a passive buzzer;
+           GPIO voltage and drive strength are unchanged. */
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 static void write_line(const char *text) {
@@ -158,7 +188,7 @@ static bool settled_pass(int64_t now) {
     return healthy() && !scan.overflow && candidate && bv_candidate_passes(candidate) && first_valid_us &&
         first_valid_us+BV_SETTLE_US<=radio_end_us && now-first_valid_us>=BV_SETTLE_US;
 }
-static void finish(bool pass, const char *reason) {
+static void finish(bool pass, const char *reason, bool expired) {
     if (finished || finishing) return;
     finishing=true;
     bool stopped=!busy;
@@ -186,15 +216,22 @@ static void finish(bool pass, const char *reason) {
         while (xQueueReceive(reports,&tail,0)==pdTRUE) process_report(&tail);
         bool overflow=report_overflowed(attempt);
         if (overflow) { pass=false; reason="scan_report_overflow"; }
-        else if (pass && !settled_pass(esp_timer_get_time())) { pass=false; reason=scan_reason(); }
+        else if (pass && !settled_pass(esp_timer_get_time())) {
+            pass=false; reason=scan_reason();
+            /* Finishing a settled observation may itself cross the deadline.
+               Preserve timeout status if final tail packets invalidate PASS. */
+            expired=expired || esp_timer_get_time()>=radio_end_us;
+        } else if (!pass && expired && drained) reason=scan_reason();
         clear_active(attempt); busy=false;
     }
     finished=true; finishing=false;
     const bv_candidate_t *candidate=bv_scan_single(&scan);
+    char timeout_reason[128];
+    if (!pass && expired) reason=bv_timeout_reason(reason,timeout_reason,sizeof(timeout_reason));
     if (!emit("result",pass?"PASS！":"FAIL",pass?NULL:reason,candidate)) {
         write_line("[ble-verifier] result serialization failed"); pass=false;
     }
-    beep(pass?2:3,pass?120:180,120);
+    request_sound(pass?BV_SOUND_PASS:BV_SOUND_FAIL);
 }
 
 static const char *scan_reason(void) {
@@ -242,24 +279,23 @@ static int gap_event(struct ble_gap_event *event, void *arg) {
 }
 
 static void start_attempt(void) {
-    if (busy) return;
-    if (!healthy()) { write_line("[ble-verifier] initialization failed/not ready; no scan started"); beep(3,80,80); return; }
+    if (busy || sound_is_busy()) return;
+    if (!healthy()) { write_line("[ble-verifier] initialization failed/not ready; no scan started"); return; }
     if (attempt == UINT32_MAX) { phase(BOOT_FAILED, "attempt_counter_exhausted", ESP_FAIL); return; }
     ++attempt; bv_scan_reset(&scan); finished = false; first_valid_us = 0; busy = true;
     portENTER_CRITICAL(&state_lock); active_attempt = attempt; completed_attempt = overflow_attempt = 0; known_count=0; portEXIT_CRITICAL(&state_lock);
-    if (!emit("start", NULL, NULL, NULL)) { clear_active(attempt); busy = false; finish(false, "start_serialization_failed"); return; }
+    if (!request_sound(BV_SOUND_START)) { clear_active(attempt); busy=false; finish(false,"buzzer_start_failed",false); return; }
+    if (!emit("start", NULL, NULL, NULL)) { clear_active(attempt); busy = false; finish(false, "start_serialization_failed",false); return; }
     const struct ble_gap_disc_params params = {.itvl=160, .window=160, .filter_policy=0, .limited=0, .passive=0, .filter_duplicates=0};
     radio_end_us = esp_timer_get_time() + (int64_t)BV_SCAN_MS * 1000;
     int rc = ble_gap_disc(own_address_type, BV_SCAN_MS, &params, gap_event, (void *)(uintptr_t)attempt);
-    if (rc) { clear_active(attempt); busy = false; finish(false,"scan_start_failed"); return; }
-    deadline_us = radio_end_us + 2000000;
-    beep(1,40,0);
+    if (rc) { clear_active(attempt); busy = false; finish(false,"scan_start_failed",false); return; }
 }
 static void process_report(const report_t *report) {
     if (!busy || finished || report->attempt != attempt) return;
-    if (!finishing && report_overflowed(attempt)) { finish(false,"scan_report_overflow"); return; }
+    if (!finishing && report_overflowed(attempt)) { finish(false,"scan_report_overflow",false); return; }
     bv_scan_observe(&scan, report->address, report->address_type, report->data, report->length, report->response);
-    if (scan.overflow && !finishing) { finish(false,"candidate_capacity_exceeded"); return; }
+    if (scan.overflow && !finishing) { finish(false,"candidate_capacity_exceeded",false); return; }
     /* Once a plausible address is known, preserve even its non-interesting
        later packets for strict raw/conflict diagnostics; unrelated RF is ignored. */
     for (size_t i=0; i<BV_MAX_CANDIDATES; ++i) {
@@ -276,7 +312,7 @@ static void process_report(const report_t *report) {
         break;
     }
     if (finishing) return;
-    if (bv_scan_matching_count(&scan) > 1) { finish(false,"multiple_lumysi_candidates"); return; }
+    if (bv_scan_matching_count(&scan) > 1) { finish(false,"multiple_lumysi_candidates",false); return; }
     const bv_candidate_t *candidate = bv_scan_single(&scan);
     if (!first_valid_us && candidate && bv_candidate_passes(candidate)) first_valid_us = esp_timer_get_time();
 }
@@ -297,7 +333,7 @@ static void heartbeat(void) {
     portEXIT_CRITICAL(&state_lock);
     char line[192];
     snprintf(line,sizeof(line),"[ble-verifier] firmware=%s protocol=2 phase=%u error=0x%X reason=%s uart0=%s usb_jtag=%s busy=%u",
-             BV_VERSION,(unsigned)current,(unsigned)error,failure,uart?"up":"down",usb?"up":"optional-unavailable",busy?1:0);
+             esp_app_get_description()->version,(unsigned)current,(unsigned)error,failure,uart?"up":"down",usb?"up":"optional-unavailable",busy?1:0);
     write_line(line);
     if (healthy()) emit("ready",NULL,NULL,NULL);
 }
@@ -317,30 +353,36 @@ static void io_task(void *unused) {
         if (completed && busy && completed==attempt) {
             /* Preserve the last queued ADV/RSP before handling completion. */
             while (xQueueReceive(reports,&report,0)==pdTRUE) process_report(&report);
-            if (busy && !finished) finish(settled_pass(esp_timer_get_time()),scan_reason());
+            if (busy && !finished) {
+                now=esp_timer_get_time();
+                /* NimBLE's OS tick timer can expire just before our microsecond
+                   deadline. One scheduler tick is rounding, not an early abort. */
+                bool expired=now>=radio_end_us-(int64_t)portTICK_PERIOD_MS*1000;
+                finish(settled_pass(now),expired?scan_reason():"scan_ended_early",expired);
+            }
             else { clear_active(attempt); busy=false; }
         }
         now=esp_timer_get_time();
         if (busy && !finished) {
-            if (report_overflowed(attempt)) finish(false,"scan_report_overflow");
-            else if (!healthy()) finish(false,"station_not_ready");
+            if (report_overflowed(attempt)) finish(false,"scan_report_overflow",false);
+            else if (!healthy()) finish(false,"station_not_ready",false);
             else if (first_valid_us && first_valid_us+BV_SETTLE_US<=radio_end_us && now-first_valid_us>=BV_SETTLE_US) {
                 while (xQueueReceive(reports,&report,0)==pdTRUE) process_report(&report);
                 const bv_candidate_t *candidate=bv_scan_single(&scan);
                 bool pass=candidate && bv_candidate_passes(candidate) && !scan.overflow && !report_overflowed(attempt);
-                if (busy && !finished) finish(pass,pass?NULL:scan_reason());
-            } else if (now>=deadline_us) finish(false,"scan_completion_timeout");
+                if (busy && !finished) finish(pass,pass?NULL:scan_reason(),esp_timer_get_time()>=radio_end_us);
+            } else if (now>=radio_end_us) finish(false,scan_reason(),true);
         }
         if (events && (xEventGroupGetBits(events)&HARDWARE_READY)) {
             int level=gpio_get_level(BUTTON_PIN);
             if (level!=sample) { sample=level; changed=now; }
             if (stable!=sample && now-changed>=30000) {
                 stable=sample;
-                if (!stable) pressed=healthy()&&!busy?now:0;
+                if (!stable) pressed=healthy()&&!busy&&!sound_is_busy()?now:0;
                 else { if (pressed && now-pressed>=40000 && now-pressed<=1000000) start_attempt(); pressed=0; }
             }
         }
-        tick_beep(now); vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -353,7 +395,9 @@ void app_main(void) {
     if (rc==ESP_OK) rc=uart_param_config(UART_NUM_0,&uart);
     if (rc==ESP_OK) rc=uart_set_pin(UART_NUM_0,43,44,UART_PIN_NO_CHANGE,UART_PIN_NO_CHANGE);
     uart_ready=rc==ESP_OK;
-    write_line("[ble-verifier] BOOT 0.1.1 UART0 primary 115200 8N1; no host command required");
+    char boot_line[160];
+    snprintf(boot_line,sizeof(boot_line),"[ble-verifier] BOOT %s UART0 primary 115200 8N1; no host command required",esp_app_get_description()->version);
+    write_line(boot_line);
     reports=xQueueCreate(REPORT_QUEUE_LENGTH,sizeof(report_t)); events=xEventGroupCreate();
     if (!reports || !events) { while (true) { write_line("[ble-verifier] FATAL queue allocation failed"); vTaskDelay(pdMS_TO_TICKS(1000)); } }
     uint8_t nonce[32]; esp_fill_random(nonce,sizeof(nonce));
@@ -368,6 +412,10 @@ void app_main(void) {
     const ledc_channel_config_t buzzer={.gpio_num=BUZZER_PIN,.speed_mode=LEDC_LOW_SPEED_MODE,.channel=LEDC_CHANNEL_0,
         .intr_type=LEDC_INTR_DISABLE,.timer_sel=LEDC_TIMER_0,.duty=0,.hpoint=0};
     if (hardware==ESP_OK) hardware=ledc_channel_config(&buzzer);
+    if (hardware==ESP_OK) {
+        sound_commands=xQueueCreate(4,sizeof(bv_sound_kind_t));
+        if (!sound_commands || xTaskCreate(sound_task,"ble_verifier_sound",3072,NULL,6,NULL)!=pdPASS) hardware=ESP_ERR_NO_MEM;
+    }
     if (hardware==ESP_OK) xEventGroupSetBits(events,HARDWARE_READY);
     if (xTaskCreate(io_task,"ble_verifier_io",8192,NULL,5,NULL)!=pdPASS) { while (true) { write_line("[ble-verifier] FATAL I/O task allocation failed"); vTaskDelay(pdMS_TO_TICKS(1000)); } }
     /* Native USB is optional and its success never gates the onboard bridge. */

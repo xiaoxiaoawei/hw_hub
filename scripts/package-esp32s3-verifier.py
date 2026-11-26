@@ -24,6 +24,7 @@ PUBLIC_SOURCE_NAMES = {
     "CMakeLists.txt", "sdkconfig.defaults", "partitions.csv", "README.md", ".gitignore",
     "LICENSE", "LICENSE.md", "NOTICE", "THIRD_PARTY_NOTICES.md",
     "main/CMakeLists.txt", "main/app_main.c", "main/ble_protocol.c", "main/ble_protocol.h",
+    "main/station_feedback.h",
     "tests/test_protocol.c", "scripts/build.sh", "scripts/export_build.py",
 }
 

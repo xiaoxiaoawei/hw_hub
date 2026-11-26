@@ -1,19 +1,25 @@
-# ESP32-S3 蓝牙验证工装 v0.1.1
+# ESP32-S3 蓝牙验证工装 v0.1.2
 
-将本固件烧录到独立 ESP32-S3 工装板。短按 GPIO7 后，工装主动扫描名称含 Lumysi 的待测设备，并通过串口报告实际观察到的广播数据。FlashTool v0.6.1 可直接监听并复核同一份数据。
+将本固件烧录到独立 ESP32-S3 工装板。短按 GPIO7 后，工装主动扫描名称含 Lumysi 的待测设备，并通过串口报告实际观察到的广播数据。FlashTool v0.6.3 可直接监听并复核同一份数据，扫描超时后显示红色 `FAIL！`。
 
 ## 接线与运行
 
 - 板载 USB 转 TTL 使用 UART0，TX 为 GPIO43，RX 为 GPIO44。串口参数为 **115200 8N1**，流控关闭。
-- GPIO7 为低有效按键，使用内部上拉。短按约 40–1000 毫秒，松开后开始扫描。
-- GPIO1 输出 4 kHz、50% 占空比的蜂鸣器信号。扫描开始一声，通过两声，失败三声。
+- GPIO7 为低有效按键，使用内部上拉。短按约 40–1000 毫秒，松开后同时播放提示音并开始扫描。
+- GPIO1 使用 50% 占空比的满幅方波驱动现有蜂鸣器。启动、通过和失败各有一组 1.5 秒提示音，每组含三个 500 毫秒音段。
 - 支持原生 USB Serial/JTAG 作为备用日志通道。带 USB 转 TTL 的开发板使用桥接芯片对应的 COM 即可。
 
-固件先初始化 UART0 并输出 `BOOT`。随后持续输出状态，让晚打开的串口工具也能看到就绪或初始化失败。就绪状态下直接短按 GPIO7。每次短按对应一轮验证，FlashTool 可以保持连接并连续读取结果。
+固件先初始化 UART0 并输出 `BOOT`。随后持续输出状态，让晚打开的串口工具也能看到就绪或初始化失败。就绪状态下直接短按 GPIO7。提示音播放结束后可开始下一轮，FlashTool 可以保持连接并连续读取结果。
+
+| 提示音 | 三个音段的频率 |
+| --- | --- |
+| 开始扫描 | 3600 → 4000 → 4400 Hz |
+| 验证通过 | 4400 → 4000 → 4400 Hz |
+| 验证失败 | 4400 → 4000 → 3600 Hz |
 
 ## 广播判定
 
-每轮最多扫描 45 秒。主广播与扫描响应按实际 MAC 及地址类型归到同一候选。首次收齐通过条件后继续观察约 2 秒。该轮观察到多个 Lumysi 候选时返回失败，现场验证时一次放入一台待测板。
+每轮最多扫描 25 秒。主广播与扫描响应按实际 MAC 及地址类型归到同一候选。首次收齐通过条件后继续观察约 2 秒。该轮观察到多个 Lumysi 候选时返回失败，现场验证时一次放入一台待测板。
 
 通过条件包括以下三项。
 
@@ -33,9 +39,9 @@
 
 - `ready` 提供 `session` 和 `protocol: 2`。`session` 是每次启动生成的 64 个小写十六进制字符。
 - `start` 提供同一 `session` 与本次编号 `attempt`。
-- `result` 提供当前 `session`、`attempt` 和 `status`。通过状态为 `PASS！`，失败状态为 `FAIL`，原因由 `reason` 提供。可用字段包括实际 `mac`、`name`、`firmware`、`fault_bits`、`battery_mv`、`adv_hex` 与 `scan_rsp_hex`。
+- `result` 提供当前 `session`、`attempt` 和 `status`。通过状态为 `PASS！`，失败状态为 `FAIL`，扫描超时的 `reason` 使用 `scan_timeout` 或 `scan_timeout:<原因码>`。可用字段包括实际 `mac`、`name`、`firmware`、`fault_bits`、`battery_mv`、`adv_hex` 与 `scan_rsp_hex`。
 
-当前广播规格提供实际 BLE MAC、名称和诊断字段。CSV 中的 UID 保留为空，供未来有 UID 来源的协议版本使用。
+当前广播规格提供实际 BLE MAC、服务 UUID、名称和诊断字段。FlashTool 在未取得设备 UID 时，会把本次广播中读到的服务 UUID 去掉连字符写入 CSV 的 `unique_device_id`，并在日志中标记来源 `ble_service_uuid`。同类设备共用服务 UUID，每次扫描观察到的 BLE 地址记录在 `observed_mac`。
 
 ## 构建与烧录
 
@@ -46,4 +52,4 @@ source /path/to/esp-idf/export.sh
 bash firmware/ble-verifier/scripts/build.sh /tmp/ble-verifier-build /tmp/ble-verifier-export
 ```
 
-构建脚本在仓库外生成和校验引导程序、分区表、应用及合并镜像，版本取自 ESP-IDF 的构建元数据。镜像参数为 ESP32-S3、4 MB Flash、DIO 40 MHz。FlashTool 中选择 **ESP32-S3**，读取 `images/ESP32S3-BLE-Verifier-v0.1.1-merged.bin`，烧录地址填 **`0x0`**。分段地址由固件包内的 `flash-manifest.json` 给出。
+构建脚本在仓库外生成和校验引导程序、分区表、应用及合并镜像，版本取自 ESP-IDF 的构建元数据。镜像参数为 ESP32-S3、4 MB Flash、DIO 40 MHz。FlashTool 中选择 **ESP32-S3**，读取 `images/ESP32S3-BLE-Verifier-v0.1.2-merged.bin`，烧录地址填 **`0x0`**。分段地址由固件包内的 `flash-manifest.json` 给出。
